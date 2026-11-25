@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+dist/
+runs/
+agent_work/
+*.env
+*.zip

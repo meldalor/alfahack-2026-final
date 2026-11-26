@@ -655,6 +655,92 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
     return _finish(name, oof, test, plan, spec, y, [1] * len(plan.folds), [], t0, cfg)
 
 
+# ---------------------------------------------------------------- Tabular MLP (обучение с нуля на CPU)
+
+
+def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
+            seed: int = 0, name: str = "mlp") -> FitResult | None:
+    """Табличная нейросеть MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
+    (QuantileTransformer) + OHE категорий, другая индуктивная предвзятость для ансамбля и стекинга."""
+    from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+    from sklearn.impute import SimpleImputer
+    from sklearn.neural_network import MLPClassifier, MLPRegressor
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    t0 = time.time()
+    cols = [c for c in X.columns if c not in set(cfg.drop)]
+    n = len(X)
+    if not cols or n < 100 or n > 120_000:
+        return None
+    cat_cols = [c for c in cols if isinstance(X[c].dtype, pd.CategoricalDtype) or X[c].dtype == object or str(X[c].dtype) == "string"]
+    num_cols = [c for c in cols if c not in cat_cols]
+    X_in = X[cols].copy()
+    Xt_in = Xt[cols].copy() if Xt is not None else None
+    for c in cat_cols:
+        X_in[c] = X_in[c].astype("string").fillna("__missing__").astype(str)
+        if Xt_in is not None:
+            Xt_in[c] = Xt_in[c].astype("string").fillna("__missing__").astype(str)
+    for c in num_cols:
+        X_in[c] = pd.to_numeric(X_in[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if Xt_in is not None:
+            Xt_in[c] = pd.to_numeric(Xt_in[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    n_classes = len(spec.classes) if spec.task_type != "regression" else 1
+    yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
+    y_lo = float(np.nanmin(y)) if spec.task_type == "regression" else None
+    y_hi = float(np.nanmax(y)) if spec.task_type == "regression" else None
+
+    def build_model(n_fit: int):
+        tf = []
+        if num_cols:
+            tf.append(("num", make_pipeline(
+                SimpleImputer(strategy="median", add_indicator=True),
+                StandardScaler(),
+            ), num_cols))
+        if cat_cols:
+            tf.append(("cat", OneHotEncoder(
+                handle_unknown="ignore", min_frequency=10, max_categories=40, sparse_output=False,
+            ), cat_cols))
+        pre = ColumnTransformer(tf, sparse_threshold=0.0)
+        bs = int(min(256, max(32, n_fit // 20)))
+        common = dict(hidden_layer_sizes=(128, 64), activation="relu", alpha=1e-2, batch_size=bs,
+                      learning_rate_init=1e-3, max_iter=80, early_stopping=True, validation_fraction=0.1,
+                      n_iter_no_change=10, random_state=seed)
+        if spec.task_type == "regression":
+            return make_pipeline(pre, TransformedTargetRegressor(regressor=MLPRegressor(**common),
+                                                                 transformer=StandardScaler()))
+        return make_pipeline(pre, MLPClassifier(**common))
+
+    def pred(m, df):
+        if spec.task_type == "regression":
+            return np.clip(inverse_target(m.predict(df), cfg.target_transform), y_lo, y_hi)
+        p = np.zeros((len(df), n_classes))
+        clf = m.steps[-1][1]
+        p[:, clf.classes_.astype(int)] = m.predict_proba(df)
+        return p
+
+    shape = (n, n_classes) if spec.task_type != "regression" else (n,)
+    oof = np.full(shape, np.nan)
+    test, iters = [], []
+    for k, (tr, va) in enumerate(plan.folds):
+        if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
+            return None
+        m = build_model(len(tr)).fit(X_in.iloc[tr], yt[tr])
+        oof[va] = pred(m, X_in.iloc[va])
+        est = m.steps[-1][1]
+        est = getattr(est, "regressor_", est)
+        iters.append(int(getattr(est, "n_iter_", 1)))
+        if plan.mode == "cv" and Xt_in is not None:
+            test.append(pred(m, Xt_in))
+        if k == 0 and _too_slow(t0, plan, time_limit, name):
+            return None
+    if plan.mode == "refit" and Xt_in is not None:
+        m = build_model(n).fit(X_in, yt)
+        test = pred(m, Xt_in)
+    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg)
+
+
 def _too_slow(t0, plan, time_limit, name) -> bool:
     """После первого фолда: успеет ли модель целиком? Если нет — не тратим время впустую."""
     per = time.time() - t0

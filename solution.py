@@ -22,12 +22,13 @@ import threading  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from ag_ensemble import LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification, rank_blend  # noqa: E402
+from ag_ensemble import (LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification,  # noqa: E402
+                         rank_blend, stack_blend)
 from ag_features import cross_impute_outages, detect_time_split, entity_periods, op_entity_history, prepare  # noqa: E402
 from ag_llm import LLM  # noqa: E402
 from ag_metrics import PROBA_METRICS, TUNABLE, better, decide, direction, score  # noqa: E402
-from ag_models import (FitResult, ModelConfig, adversarial_scores, fit_cat, fit_et, fit_lgb, fit_linear, fit_xgb,  # noqa: E402
-                       make_plan, safe_fit)
+from ag_models import (FitResult, ModelConfig, adversarial_scores, fit_cat, fit_et, fit_lgb, fit_linear, fit_mlp,  # noqa: E402
+                       fit_xgb, make_plan, safe_fit)
 from ag_research import Researcher  # noqa: E402
 from ag_task import build_spec, find_files, llm_refine_spec, read_table  # noqa: E402
 from ag_utils import Budget, atomic_write_text, elapsed, log, log_exc, pick_threads, save_json, setup_log, short  # noqa: E402
@@ -226,6 +227,7 @@ def run(task_path: Path):
     # 1. условие и данные
     text = task_path.read_text(encoding="utf-8", errors="replace")
     files = find_files(task_path, text, search_parent=not bool(os.environ.get("PGDATABASE")))
+    db_notes = []
     if os.environ.get("PGDATABASE") or "train" not in files or "test" not in files:
         from ag_database import extract
         from ag_relational import enrich
@@ -235,7 +237,7 @@ def run(task_path: Path):
             raise RuntimeError(f"Database must expose train and test tables (found: {sorted(tables)})")
         log("таблицы БД:", role_map)
         db_train, db_test = enrich(tables[role_map["train"]], tables[role_map["test"]], tables,
-                                   skip_names=role_map.values())
+                                   skip_names=role_map.values(), report=db_notes)
         files = {k: v for k, v in files.items() if k in ("sample", "dictionary")}
         for role, frame in (("train", db_train), ("test", db_test),
                             ("sample", tables.get(role_map.get("sample"))),
@@ -259,6 +261,8 @@ def run(task_path: Path):
     log(f"train {train.shape}, test {test.shape}, sample {None if sample is None else sample.shape}")
 
     spec = build_spec(task_path, train, test, sample, dic, files)
+    if db_notes:
+        spec.notes = list(db_notes[:12]) + list(spec.notes)
     log("спецификация:", short(spec.public(), 1200))
     try:
         # первый страховочный ответ ещё до обращения к LLM
@@ -398,7 +402,7 @@ def model_family(name: str) -> str:
     m = re.fullmatch(r"(lgb_xoffset\d+)_s\d+", name)
     if m:
         return m.group(1)
-    for f in ("xgb", "cat", "et"):
+    for f in ("xgb", "cat", "et", "mlp"):
         if name == f or re.fullmatch(f + r"_s\d+", name):
             return f
     return name
@@ -550,6 +554,12 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         rb = rank_blend(pooled, y, mask, spec)
         if rb is not None:
             add("ранг-смесь", rb["oof"], rb["test"], rb["weights"])
+        try:
+            sb = stack_blend(pooled, y, mask, spec, plan=plan)
+            if sb is not None:
+                add("стекинг", sb["oof"], sb["test"], sb["weights"])
+        except Exception:
+            log_exc("stack_blend")
         # средние k лучших семейств: слабое семейство (например, недоученный CatBoost) не тянет вниз всё среднее
         sign = 1.0 if direction(spec.metric) == "max" else -1.0
         order = sorted([sc for sc in scored if sc[4] in {r.name for r in pooled}], key=lambda sc: -sign * sc[0])
@@ -670,6 +680,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     fit_extra("et", fit_et, {})
     if not late_cat:
         fit_extra("cat", fit_cat, cat_kw)
+    fit_extra("mlp", fit_mlp, {}, min_need=30.0, use_clean=True)
 
     # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
     hist_cols = [c for c in X.columns if c.startswith("hist__last")] if spec.task_type == "regression" else []

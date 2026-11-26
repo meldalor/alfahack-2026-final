@@ -307,4 +307,63 @@ class FinalTests(unittest.TestCase):
         self.assertIsNotNone(rb)
         self.assertTrue(((rb['test']>=0)&(rb['test']<=1)).all())
 
+    def test_causal_rfm_and_db_schema_report(self):
+        tr=pd.DataFrame({'event_id':[1,2],'user_id':['u1','u1'],
+                         'timestamp':['2025-01-02 00:00:00','2025-01-05 00:00:00'],'y':[0,1]})
+        te=pd.DataFrame({'event_id':[3],'user_id':['u1'],'timestamp':['2025-01-06 00:00:00']})
+        tx=pd.DataFrame({'user_id':['u1','u1','u1'],
+                         'timestamp':['2025-01-01 00:00:00','2025-01-03 00:00:00','2025-01-10 00:00:00'],
+                         'amt':[10.,50.,999.]})
+        rep=[]
+        a,b=enrich(tr,te,{'tx':tx},report=rep)
+        self.assertTrue(any('one-to-many causal' in r for r in rep))
+        self.assertAlmostEqual(float(a.tx__hist_recency_days.iloc[0]),1.0,places=3)
+        self.assertAlmostEqual(float(a.tx__hist_recency_days.iloc[1]),2.0,places=3)
+        self.assertAlmostEqual(float(a.tx__amt__hist_trend.iloc[1]),20.0,places=3)  # last 50 - mean 30 = +20
+        self.assertAlmostEqual(float(b.tx__hist_recency_days.iloc[0]),3.0,places=3)  # Jan 06 - Jan 03; Jan 10 ignored!
+
+    def test_fit_mlp_regression_and_binary(self):
+        from ag_models import fit_mlp, ModelConfig
+        rng=np.random.default_rng(1)
+        X=pd.DataFrame({'a':rng.normal(size=240),'b':rng.normal(size=240),
+                        'c':pd.Categorical(rng.choice(['x','y','z'],240))})
+        Xt=X.iloc[:20].copy()
+        y_reg=3.0*X['a'].values - 2.0*X['b'].values + 1.0*(X['a'].values**2)
+        spec_r=TaskSpec('','',id_col='id',target='y',task_type='regression',metric='mae')
+        plan_r=make_plan(X,y_reg,'regression',n_folds=3)
+        rr=fit_mlp(X,y_reg,Xt,plan_r,spec_r,ModelConfig(),n_jobs=2,time_limit=60)
+        self.assertIsNotNone(rr)
+        self.assertLess(rr.score,1.0)
+        self.assertEqual(len(rr.test),len(Xt))
+        y_cls=(y_reg>0.5).astype(int)
+        spec_c=TaskSpec('','',id_col='id',target='y',task_type='binary',metric='roc_auc',classes=[0,1])
+        plan_c=make_plan(X,y_cls,'binary',n_folds=3)
+        rc=fit_mlp(X,y_cls,Xt,plan_c,spec_c,ModelConfig(),n_jobs=2,time_limit=60)
+        self.assertIsNotNone(rc)
+        self.assertGreater(rc.score,0.85)
+        self.assertEqual(rc.test.shape,(len(Xt),2))
+
+    def test_stack_blend_regression_and_binary(self):
+        from ag_ensemble import stack_blend
+        from ag_models import FitResult
+        rng=np.random.default_rng(2)
+        n=400
+        y=rng.normal(10.0,3.0,size=n)
+        m=np.ones(n,bool)
+        rs=[FitResult(f'm{i}',y+rng.normal(0,0.8+0.2*i,size=n),np.full(10,10.0),0.8,[],[],None,1.0) for i in range(3)]
+        spec_r=TaskSpec('','',id_col='id',target='y',task_type='regression',metric='mae')
+        sb=stack_blend(rs,y,m,spec_r)
+        self.assertIsNotNone(sb)
+        self.assertLess(sb['score'],0.75)
+        yc=(y>10.0).astype(int)
+        def mk_p(s):
+            p=1/(1+np.exp(-s))
+            return np.column_stack([1-p,p])
+        rs_c=[FitResult(f'c{i}',mk_p((y-10.0)+rng.normal(0,1.0,size=n)),mk_p(np.linspace(-1,1,10)),0.9,[],[],None,1.0) for i in range(3)]
+        spec_c=TaskSpec('','',id_col='id',target='y',task_type='binary',metric='roc_auc',classes=[0,1])
+        sbc=stack_blend(rs_c,yc,m,spec_c)
+        self.assertIsNotNone(sbc)
+        self.assertEqual(sbc['test'].shape,(10,2))
+        self.assertTrue(np.isfinite(sbc['oof'][m]).all())
+
 if __name__=='__main__': unittest.main()

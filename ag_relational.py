@@ -227,20 +227,36 @@ def _aggregate_child(left, dim, name, targets):
         g = b.groupby(best_key, sort=False)
         cnt = g.cumcount() + 1
         pref[f'{name}__hist_count'] = cnt.astype('float32')
-        for c in num_cols:
+        first_t = g['__t__'].transform('first')
+        pref['__first_t__'] = first_t
+        pref['__last_t__'] = b['__t__']
+        for idx_c, c in enumerate(num_cols):
             v = b[c].astype('float64')
             n_ok = v.notna().groupby(b[best_key], sort=False).cumsum()
             csum = v.fillna(0.0).groupby(b[best_key], sort=False).cumsum()
-            pref[f'{name}__{c}__hist_mean'] = (csum / n_ok.replace(0, np.nan)).astype('float32')
-            pref[f'{name}__{c}__hist_last'] = v.groupby(b[best_key], sort=False).ffill().astype('float32')
+            cmean = csum / n_ok.replace(0, np.nan)
+            clast = v.groupby(b[best_key], sort=False).ffill()
+            pref[f'{name}__{c}__hist_mean'] = cmean.astype('float32')
+            pref[f'{name}__{c}__hist_last'] = clast.astype('float32')
             pref[f'{name}__{c}__hist_max'] = v.groupby(b[best_key], sort=False).cummax().astype('float32')
+            if idx_c < 4:
+                pref[f'{name}__{c}__hist_min'] = v.groupby(b[best_key], sort=False).cummin().astype('float32')
+                pref[f'{name}__{c}__hist_trend'] = (clast - cmean).astype('float32')
         pref = pref.drop_duplicates(subset=[best_key, '__t__'], keep='last').sort_values('__t__')
         a = pd.DataFrame({best_key: left_al[best_key], '__t__': lt, '__row__': np.arange(len(left))})
         valid = a[best_key].notna() & a['__t__'].notna()
         aok = a.loc[valid].sort_values('__t__')
         j = pd.merge_asof(aok, pref, on='__t__', by=best_key, direction='backward', allow_exact_matches=False)
         out = pd.concat([j, a.loc[~valid]], ignore_index=True).sort_values('__row__').reset_index(drop=True)
-        feat_cols = [c for c in pref.columns if c not in (best_key, '__t__')]
+        # Causal RFM recency & activity rate (strictly past: __last_t__ < __t__)
+        rec_days = (out['__t__'] - out['__last_t__']).dt.total_seconds() / 86400.0
+        span_days = (out['__last_t__'] - out['__first_t__']).dt.total_seconds() / 86400.0
+        out[f'{name}__hist_recency_days'] = rec_days.astype('float32')
+        out[f'{name}__hist_span_days'] = span_days.astype('float32')
+        out[f'{name}__hist_rate_per_day'] = (out[f'{name}__hist_count'] / np.maximum(span_days.fillna(0.0), 1.0)).astype('float32')
+        feat_cols = [c for c in pref.columns if c not in (best_key, '__t__', '__first_t__', '__last_t__')] + [
+            f'{name}__hist_recency_days', f'{name}__hist_span_days', f'{name}__hist_rate_per_day'
+        ]
         out[f'{name}__hist_count'] = out[f'{name}__hist_count'].fillna(0).astype('float32')
         if (out[f'{name}__hist_count'] > 0).mean() == 0:
             return None
@@ -264,12 +280,15 @@ def _aggregate_child(left, dim, name, targets):
     return merged[feat_cols].reset_index(drop=True), best_key, 'static'
 
 
-def enrich(train, test, tables, skip_names=()):
+def enrich(train, test, tables, skip_names=(), report=None):
     targets = set(train) - set(test)
     n = len(train)
     combined = pd.concat([train, test], ignore_index=True)
     skip = {'train', 'test', 'sample_submission', 'data_dictionary'} | set(skip_names)
     remaining = {k: v for k, v in tables.items() if k not in skip}
+    def _rec(msg):
+        if isinstance(report, list):
+            report.append(msg)
     for _ in range(4):
         changed = False
         for name, dim in list(remaining.items()):
@@ -291,10 +310,12 @@ def enrich(train, test, tables, skip_names=()):
                 for k in keys:
                     candidate[k] = combined[k].values
                 coverage = candidate[marker].notna().mean()
+                mode_tag = 'many-to-one'
                 if coverage < .95:
                     temporal = _temporal_join(combined, right, keys, marker)
                     if temporal is not None and temporal[0][marker].notna().mean() > coverage:
                         candidate, cadence = temporal
+                        mode_tag = f'temporal-asof(<{cadence})'
                         log(f'join {name}: backward temporal lookup, maximum age < {cadence}')
                 if candidate[marker].notna().mean() == 0:
                     iv = _interval_join(combined, dim_clean, name, targets)
@@ -302,6 +323,7 @@ def enrich(train, test, tables, skip_names=()):
                         combined = pd.concat([combined, iv], axis=1)
                         cov = float((iv[f'{name}__active_count'] > 0).mean())
                         log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
+                        _rec(f'table {name} ({len(dim)} rows): interval join, active={cov:.3f}, +{iv.shape[1]} feats')
                         del remaining[name]; changed = True
                         continue
                     ag = _aggregate_child(combined, dim, name, targets)
@@ -309,6 +331,7 @@ def enrich(train, test, tables, skip_names=()):
                         feats_df, akey, amode = ag
                         combined = pd.concat([combined, feats_df], axis=1)
                         log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
+                        _rec(f'table {name} ({len(dim)} rows): one-to-many {amode} on {akey}, +{feats_df.shape[1]} feats')
                         del remaining[name]; changed = True
                         continue
                     log(f'join skipped {name}: shared names but no matching key values')
@@ -316,7 +339,9 @@ def enrich(train, test, tables, skip_names=()):
                     continue
                 combined = candidate
                 assert len(combined) == before
-                log(f'join {name}: keys={keys}, coverage={combined[marker].notna().mean():.3f}, features={len(rename)}')
+                cov = float(combined[marker].notna().mean())
+                log(f'join {name}: keys={keys}, coverage={cov:.3f}, features={len(rename)}')
+                _rec(f'table {name} ({len(dim)} rows): {mode_tag} on {keys}, cov={cov:.3f}, +{len(rename)} feats')
                 combined[marker] = combined[marker].fillna(0)
                 del remaining[name]; changed = True
             except Exception:
@@ -330,6 +355,7 @@ def enrich(train, test, tables, skip_names=()):
                 combined = pd.concat([combined, iv], axis=1)
                 cov = float((iv[f'{name}__active_count'] > 0).mean())
                 log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
+                _rec(f'table {name} ({len(remaining[name])} rows): interval join, active={cov:.3f}, +{iv.shape[1]} feats')
                 del remaining[name]
         except Exception:
             log_exc(f'interval join {name}')
@@ -340,6 +366,7 @@ def enrich(train, test, tables, skip_names=()):
                 feats_df, akey, amode = ag
                 combined = pd.concat([combined, feats_df], axis=1)
                 log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
+                _rec(f'table {name} ({len(remaining[name])} rows): one-to-many {amode} on {akey}, +{feats_df.shape[1]} feats')
                 del remaining[name]
         except Exception:
             log_exc(f'one-to-many {name}')

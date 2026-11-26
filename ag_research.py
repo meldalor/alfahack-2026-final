@@ -727,7 +727,7 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
 Statement excerpt:
 {short(spec.text, 2500)}
 
-Notes extracted earlier: {short(spec.notes, 800)}
+Notes extracted earlier: {short(spec.notes, 1400)}
 Initial ideas after reading the statement: {short(self.llm_hints.get("hypotheses") or [], 800)}
 Rows: train={len(self.prep.X)}, test={len(self.prep.Xt)}. Validation: {self.plan.desc}.
 {self.shift_note}

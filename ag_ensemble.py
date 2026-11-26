@@ -83,6 +83,91 @@ def rank_blend(results, y, mask, spec, max_steps: int = 30):
     return blend(ranked, y, mask, spec, max_steps=max_steps)
 
 
+def stack_blend(results, y, mask, spec, plan=None):
+    """Честный вложенный OOF-стекинг (RidgeCV для регрессии, LogisticRegression по log-odds для классификации).
+    Оценка meta_oof строго out-of-fold — без переобучения на валидацию."""
+    from sklearn.linear_model import LogisticRegression, RidgeCV
+    from sklearn.model_selection import KFold, StratifiedKFold
+
+    usable = [r for r in results if r is not None and r.test is not None
+              and not np.isnan(r.oof[mask]).any() and np.isfinite(r.score)]
+    idx = np.where(mask)[0]
+    if len(usable) < 3 or len(idx) < 300:
+        return None
+    ym = np.asarray(y)[idx]
+
+    def _build_meta(arrs):
+        if spec.task_type == "regression":
+            return np.column_stack([np.asarray(a, float).reshape(-1) for a in arrs])
+        # Log-odds (clipped) — линейная комбинация логитов калибрует и комбинирует вероятности разных семейств
+        parts = []
+        for a in arrs:
+            p = np.clip(np.asarray(a, float), 1e-6, 1.0 - 1e-6)
+            if p.shape[1] == 2:
+                parts.append(np.log(p[:, 1:2] / (1.0 - p[:, 1:2])))
+            else:
+                parts.append(np.log(p))
+        return np.hstack(parts)
+
+    M_oof = _build_meta([r.oof[idx] for r in usable])
+    M_test = _build_meta([r.test for r in usable])
+    if not (np.isfinite(M_oof).all() and np.isfinite(M_test).all()):
+        return None
+
+    # Строим честные вложенные фолды поверх idx: если в plan >= 3 фолдов (временных или CV), используем их границы!
+    meta_folds = []
+    if plan is not None and len(getattr(plan, "folds", [])) >= 3:
+        pos = {int(g): i for i, g in enumerate(idx)}
+        groups = []
+        for _, va in plan.folds:
+            g = np.array([pos[int(v)] for v in va if int(v) in pos], dtype=int)
+            if len(g):
+                groups.append(g)
+        if len(groups) >= 3:
+            all_i = np.arange(len(idx))
+            for g in groups:
+                va_m = np.zeros(len(idx), bool)
+                va_m[g] = True
+                meta_folds.append((all_i[~va_m], g))
+    if not meta_folds:
+        if spec.task_type != "regression":
+            cnt = np.bincount(ym.astype(int))
+            min_c = int(cnt[cnt > 0].min()) if (cnt > 0).any() else 0
+            if min_c >= 3:
+                meta_folds = list(StratifiedKFold(min(5, min_c), shuffle=True, random_state=42).split(M_oof, ym))
+        if not meta_folds:
+            meta_folds = list(KFold(5, shuffle=True, random_state=42).split(M_oof))
+
+    if spec.task_type == "regression":
+        y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
+        mo = np.full(len(y), np.nan, dtype=float)
+        for tr, va in meta_folds:
+            reg = RidgeCV(alphas=np.logspace(0, 4, 9)).fit(M_oof[tr], ym[tr])
+            mo[idx[va]] = np.clip(reg.predict(M_oof[va]), y_lo, y_hi)
+        reg_full = RidgeCV(alphas=np.logspace(0, 4, 9)).fit(M_oof, ym)
+        mt = np.clip(reg_full.predict(M_test), y_lo, y_hi)
+        coefs = np.asarray(reg_full.coef_, float).reshape(-1)
+        denom = float(np.abs(coefs).sum()) or 1.0
+        weights = {r.name: round(float(c / denom), 3) for r, c in zip(usable, coefs) if abs(c / denom) >= 0.01}
+        return {"weights": weights, "oof": mo, "test": mt,
+                "score": score(spec.metric, spec.task_type, y[mask], mo[mask])}
+
+    n_classes = usable[0].oof.shape[1]
+    mo = np.full((len(y), n_classes), np.nan, dtype=float)
+    for tr, va in meta_folds:
+        if len(np.unique(ym[tr])) < 2:
+            return None
+        clf = LogisticRegression(C=0.2, max_iter=200, solver="lbfgs").fit(M_oof[tr], ym[tr])
+        p = np.zeros((len(va), n_classes))
+        p[:, clf.classes_.astype(int)] = clf.predict_proba(M_oof[va])
+        mo[idx[va]] = p
+    clf_full = LogisticRegression(C=0.2, max_iter=200, solver="lbfgs").fit(M_oof, ym)
+    mt = np.zeros((len(M_test), n_classes))
+    mt[:, clf_full.classes_.astype(int)] = clf_full.predict_proba(M_test)
+    weights = {r.name: round(1.0 / len(usable), 3) for r in usable}
+    return {"weights": weights, "oof": mo, "test": mt, "score": None}
+
+
 def em_test_priors(proba_test, train_priors, iters: int = 200):
     """Оценка априорных вероятностей классов на тесте по EM (Saerens et al., 2002)."""
     p = np.asarray(train_priors, float).copy()

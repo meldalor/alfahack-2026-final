@@ -22,7 +22,7 @@ import threading  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from ag_ensemble import LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification  # noqa: E402
+from ag_ensemble import LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification, rank_blend  # noqa: E402
 from ag_features import cross_impute_outages, detect_time_split, entity_periods, op_entity_history, prepare  # noqa: E402
 from ag_llm import LLM  # noqa: E402
 from ag_metrics import PROBA_METRICS, TUNABLE, better, decide, direction, score  # noqa: E402
@@ -99,8 +99,13 @@ class SubmissionWriter:
             elif spec.output_kind == "proba_multi":
                 values = {}
                 for i, c in enumerate(spec.classes):
+                    cs = str(c).strip().lower()
                     for col in self.cols:
-                        if str(col) == str(c):
+                        if col == self.id_name or col in values:
+                            continue
+                        s = str(col).strip().lower()
+                        if s == cs or any(s.startswith(pfx) and s[len(pfx):] == cs
+                                          for pfx in ("class_", "prob_", "proba_", "pred_", "p_", "target_", "label_")):
                             values[col] = proba[:, i]
             else:
                 idx = decide(proba, spec.metric, decision)
@@ -173,6 +178,34 @@ def start_watchdog(writer_ref: dict, out_path: Path):
     return t
 
 
+def _resolve_db_tables(tables: dict, text: str) -> dict:
+    """Resolve train/test/sample/dictionary table names flexibly (case-insensitive & patterned)."""
+    from ag_task import _role_of
+
+    out = {}
+    by_low = {k.lower(): k for k in tables}
+    for role, exacts in (
+        ("train", ("train", "training")),
+        ("test", ("test", "testing")),
+        ("sample", ("sample_submission", "submission_sample", "sample_sub")),
+        ("dictionary", ("data_dictionary", "dictionary", "metadata")),
+    ):
+        for ex in exacts:
+            if ex in by_low:
+                out[role] = by_low[ex]
+                break
+    # Fallback: match by role pattern (e.g., events_train / train_data / test_events)
+    for role in ("train", "test", "sample", "dictionary"):
+        if role in out:
+            continue
+        cands = [k for k in tables if k not in out.values() and _role_of(k) == role]
+        if cands:
+            low_txt = text.lower()
+            cands.sort(key=lambda k: (k.lower() not in low_txt, len(k), k))
+            out[role] = cands[0]
+    return out
+
+
 def run(task_path: Path):
     base = task_path.parent
     work = base / "agent_work"
@@ -197,13 +230,16 @@ def run(task_path: Path):
         from ag_database import extract
         from ag_relational import enrich
         tables = extract(work)
-        if "train" not in tables or "test" not in tables:
-            raise RuntimeError("Database must expose train and test tables")
-        db_train, db_test = enrich(tables["train"], tables["test"], tables)
+        role_map = _resolve_db_tables(tables, text)
+        if "train" not in role_map or "test" not in role_map:
+            raise RuntimeError(f"Database must expose train and test tables (found: {sorted(tables)})")
+        log("таблицы БД:", role_map)
+        db_train, db_test = enrich(tables[role_map["train"]], tables[role_map["test"]], tables,
+                                   skip_names=role_map.values())
         files = {k: v for k, v in files.items() if k in ("sample", "dictionary")}
         for role, frame in (("train", db_train), ("test", db_test),
-                            ("sample", tables.get("sample_submission")),
-                            ("dictionary", tables.get("data_dictionary"))):
+                            ("sample", tables.get(role_map.get("sample"))),
+                            ("dictionary", tables.get(role_map.get("dictionary")))):
             if frame is not None:
                 path = work / f"db_{role}.parquet"
                 frame.to_parquet(path, index=False)
@@ -511,6 +547,9 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         b = blend(pooled, y, mask, spec)
         if b is not None:
             add("смесь", b["oof"], b["test"], b["weights"])
+        rb = rank_blend(pooled, y, mask, spec)
+        if rb is not None:
+            add("ранг-смесь", rb["oof"], rb["test"], rb["weights"])
         # средние k лучших семейств: слабое семейство (например, недоученный CatBoost) не тянет вниз всё среднее
         sign = 1.0 if direction(spec.metric) == "max" else -1.0
         order = sorted([sc for sc in scored if sc[4] in {r.name for r in pooled}], key=lambda sc: -sign * sc[0])

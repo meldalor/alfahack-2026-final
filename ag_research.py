@@ -76,7 +76,10 @@ class Researcher:
         self.llm_hints = llm_hints or {}
         self.y = prep.y
         self.blocks = {}
-        self.cfg = ModelConfig()
+        self.cfg = ModelConfig(
+            target_transform="log1p" if (spec.task_type == "regression" and spec.metric == "rmsle"
+                                         and len(prep.y) and float(np.nanmin(prep.y)) >= 0) else "none"
+        )
         self.journal = []
         self.best = None
         self.best_score = None

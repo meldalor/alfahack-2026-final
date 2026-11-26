@@ -236,4 +236,75 @@ class FinalTests(unittest.TestCase):
         self.assertGreater(Xt2.a__x.iloc[0],2.5)
         self.assertEqual(Xt2.a__x.iloc[1],0.0)
 
+    def test_resolve_db_tables_nonstandard_names(self):
+        from solution import _resolve_db_tables
+        tables={'events_train':pd.DataFrame(),'events_test':pd.DataFrame(),
+                'sample_sub':pd.DataFrame(),'metadata':pd.DataFrame(),'users':pd.DataFrame()}
+        rm=_resolve_db_tables(tables,'Predict churn on events_train and events_test')
+        self.assertEqual(rm['train'],'events_train')
+        self.assertEqual(rm['test'],'events_test')
+        self.assertEqual(rm['sample'],'sample_sub')
+        self.assertEqual(rm['dictionary'],'metadata')
+
+    def test_join_mismatched_key_dtypes_and_custom_time_names(self):
+        # int64 key in train/test vs padded string key in dimension + custom created_at time column
+        tr=pd.DataFrame({'event_id':[1,2],'user_id':[10,20],'created_at':['2025-01-01 01:30:00','2025-01-01 02:30:00'],'y':[0,1]})
+        te=pd.DataFrame({'event_id':[3],'user_id':[10],'created_at':['2025-01-01 03:30:00']})
+        users=pd.DataFrame({'user_id':[' 10 ','20'],'tier':['gold','silver']})
+        stamps=pd.date_range('2025-01-01',periods=4,freq='h').astype(str).tolist()
+        sensor=pd.DataFrame({'user_id':['10']*4,'created_at':stamps,'val':[1.,2.,3.,4.]})
+        a,b=enrich(tr,te,{'users':users,'sensor':sensor})
+        self.assertEqual(a.users__tier.tolist(),['gold','silver'])
+        self.assertEqual(a.sensor__val.iloc[0],2.)
+        self.assertEqual(b.sensor__val.iloc[0],4.)
+
+    def test_dirty_numeric_strings_and_date_diffs(self):
+        from ag_features import prepare
+        tr=pd.DataFrame({'id':[1,2,3,4,5,6],
+                         'price':['10,5','12,0','N/A','null','15,5','20,0'],
+                         'pct':['10%','20%','-','40%','50%','60%'],
+                         'timestamp':['2025-05-10']*6,
+                         'start_date':['2025-05-01','2025-05-05','2025-05-02','2025-05-03','2025-05-04','2025-05-06'],
+                         'y':[1.,2.,3.,4.,5.,6.]})
+        te=tr.drop(columns=['y']).iloc[:2].copy()
+        spec=TaskSpec('','',id_col='id',target='y',task_type='regression',metric='mae')
+        prep=prepare(tr,te,spec)
+        self.assertTrue(pd.api.types.is_numeric_dtype(prep.X['price']))
+        self.assertTrue(pd.api.types.is_numeric_dtype(prep.X['pct']))
+        self.assertIn('timestamp__minus__start_date',prep.X.columns)
+        self.assertAlmostEqual(float(prep.X['timestamp__minus__start_date'].iloc[0]),9.0,places=3)
+
+    def test_multiclass_prefix_proba_and_rare_class_cv(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'task.md';p.write_text('Multiclass classification, metric: logloss')
+            tr=pd.DataFrame({'id':range(11),'x':range(11),'y':[0,0,0,0,0,1,1,1,1,1,2]})  # class 2 has 1 member!
+            te=pd.DataFrame({'id':[100,101],'x':[1,2]})
+            smp=pd.DataFrame({'id':[101,100],'class_0':[0.,0.],'class_1':[0.,0.],'class_2':[0.,0.]})
+            spec=build_spec(p,tr,te,smp,None,{})
+            self.assertEqual(spec.output_kind,'proba_multi')
+            plan=make_plan(tr[['x']],tr['y'].values,'multiclass',n_folds=3)
+            self.assertEqual(len(plan.folds),3)
+            out_p=Path(d)/'submission.csv'
+            w=SubmissionWriter(out_p,spec,te,smp)
+            w.write(np.array([[0.7,0.2,0.1],[0.1,0.3,0.6]]))
+            res=pd.read_csv(out_p)
+            self.assertEqual(res.id.tolist(),[101,100])
+            self.assertAlmostEqual(float(res.class_2.iloc[0]),0.6)
+
+    def test_auc_pr_parsing_and_rank_blend(self):
+        from ag_ensemble import rank_blend
+        from ag_models import FitResult
+        self.assertEqual(parse_metric('Основная метрика: AUC-PR')[0],'average_precision')
+        self.assertEqual(parse_metric('Metric: precision-recall AUC')[0],'average_precision')
+        y=np.array([0,0,0,0,1,1,1,1])
+        m=np.ones(8,bool)
+        r1=FitResult('m1',np.column_stack([1-np.linspace(0.01,0.09,8),np.linspace(0.01,0.09,8)]),
+                     np.array([[0.9,0.1],[0.2,0.8]]),0.9,[],[],None,1.0)
+        r2=FitResult('m2',np.column_stack([1-np.linspace(0.1,0.9,8),np.linspace(0.1,0.9,8)]),
+                     np.array([[0.8,0.2],[0.1,0.9]]),0.9,[],[],None,1.0)
+        spec=TaskSpec('','','id','y',task_type='binary',metric='average_precision',classes=[0,1])
+        rb=rank_blend([r1,r2],y,m,spec)
+        self.assertIsNotNone(rb)
+        self.assertTrue(((rb['test']>=0)&(rb['test']<=1)).all())
+
 if __name__=='__main__': unittest.main()

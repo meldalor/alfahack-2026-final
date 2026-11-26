@@ -61,9 +61,13 @@ def make_plan(X: pd.DataFrame, y: np.ndarray, task_type: str, time_col=None, n_f
         n_folds = 3
     if task_type != "regression":
         counts = np.bincount(y)
-        k = int(min(n_folds, max(2, counts[counts > 0].min())))
-        splitter = StratifiedKFold(k, shuffle=True, random_state=seed)
-        folds = list(splitter.split(np.zeros(n), y))
+        min_cls = int(counts[counts > 0].min()) if (counts > 0).any() else 0
+        if min_cls >= 2:
+            k = int(min(n_folds, min_cls))
+            splitter = StratifiedKFold(k, shuffle=True, random_state=seed)
+            folds = list(splitter.split(np.zeros(n), y))
+        else:
+            folds = list(KFold(min(n_folds, max(2, n)), shuffle=True, random_state=seed).split(np.zeros(n)))
     else:
         folds = list(KFold(n_folds, shuffle=True, random_state=seed).split(np.zeros(n)))
     return FoldPlan(folds=folds, mode="cv", oof_mask=np.ones(n, bool), desc=f"{len(folds)}-fold CV")
@@ -185,6 +189,25 @@ class _TimeGuard:
 # ---------------------------------------------------------------- LightGBM
 
 
+def _sanitize_tree_frames(X: pd.DataFrame, Xt: pd.DataFrame | None):
+    """Ensure no raw object/string columns remain for LightGBM/XGBoost (cast to shared Categorical)."""
+    bad = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])
+           and not isinstance(X[c].dtype, pd.CategoricalDtype)]
+    if not bad:
+        return X, Xt
+    X = X.copy()
+    Xt = Xt.copy() if Xt is not None else None
+    for c in bad:
+        sa = X[c].astype("string")
+        sb = Xt[c].astype("string") if Xt is not None else None
+        both = pd.concat([sa, sb], ignore_index=True) if sb is not None else sa
+        cats = pd.CategoricalDtype(categories=list(both.dropna().unique()))
+        X[c] = pd.Categorical(sa.astype(object), dtype=cats)
+        if Xt is not None:
+            Xt[c] = pd.Categorical(sb.astype(object), dtype=cats)
+    return X, Xt
+
+
 def _rmse_raw_log1p(preds, data):
     """RMSE на исходной шкале для LightGBM, обученной на log1p(таргета)."""
     err = inverse_target(preds, "log1p") - inverse_target(data.get_label(), "log1p")
@@ -208,7 +231,7 @@ def fit_lgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         params["learning_rate"] = lr
     params.update({"num_threads": n_jobs, "seed": seed, "verbose": -1})
     cols = [c for c in X.columns if c not in set(cfg.drop)]
-    X, Xt = X[cols], (Xt[cols] if Xt is not None else None)
+    X, Xt = _sanitize_tree_frames(X[cols], Xt[cols] if Xt is not None else None)
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     if cfg.objective_variant == "huber" and "alpha" not in (cfg.lgb_params or {}):
         # порог Huber — в шкале, в которой учится модель (после log1p он другой)
@@ -397,7 +420,7 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     guard = _TimeGuard(time_limit)
     n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     cols = [c for c in X.columns if c not in set(cfg.drop)]
-    X, Xt = X[cols], (Xt[cols] if Xt is not None else None)
+    X, Xt = _sanitize_tree_frames(X[cols], Xt[cols] if Xt is not None else None)
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)

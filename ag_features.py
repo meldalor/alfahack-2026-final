@@ -102,11 +102,25 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                     T_parts.append(pd.to_numeric(b, errors="coerce").astype("float32").rename(name).to_frame())
                 continue
             sa, sb = a.astype("string"), b.astype("string")
-            na = pd.to_numeric(sa, errors="coerce")
-            nn = sa.notna().sum()
-            if nn > 0 and na.notna().sum() >= 0.97 * nn and (name not in cat_hint or not _codes_seen(name, sa, sb)):
+            _NA_TOKS = {"", "na", "n/a", "nan", "null", "none", "nil", "-", "--", "?", "unknown", "missing", "inf", "-inf"}
+            def _try_num(s: pd.Series):
+                st = s.str.strip()
+                clean = st.mask(st.str.lower().isin(_NA_TOKS))
+                num = pd.to_numeric(clean, errors="coerce")
+                nn_c = int(clean.notna().sum())
+                if nn_c > 0 and num.notna().sum() >= 0.95 * nn_c:
+                    return num, nn_c
+                # European decimal comma ("12,5") or trailing "%" ("45.2%")
+                alt = clean.str.replace(r"%$", "", regex=True).str.strip()
+                if alt.dropna().str.match(r"^-?\d+,\d+$").mean() > 0.5 if nn_c > 0 else False:
+                    alt = alt.str.replace(",", ".", regex=False)
+                num2 = pd.to_numeric(alt, errors="coerce")
+                return num2, nn_c
+            na, nn = _try_num(sa)
+            if nn > 0 and na.notna().sum() >= 0.95 * nn and (name not in cat_hint or not _codes_seen(name, sa, sb)):
+                nb, _ = _try_num(sb)
                 X_parts.append(na.astype("float32").rename(name).to_frame())
-                T_parts.append(pd.to_numeric(sb, errors="coerce").astype("float32").rename(name).to_frame())
+                T_parts.append(nb.astype("float32").rename(name).to_frame())
                 continue
             if _is_datetime_series(sa):
                 xa, xb = _expand_datetime(name, sa, sb)
@@ -140,6 +154,18 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
     Xt = pd.concat(T_parts, axis=1) if T_parts else pd.DataFrame(index=test.index)
     X.columns = [str(c) for c in X.columns]
     Xt.columns = [str(c) for c in Xt.columns]
+
+    # Разности между парами дат (например, возраст аккаунта, дней с начала кампании / до окончания)
+    ord_cols = [c for c in X.columns if c.endswith("__ord")]
+    if len(ord_cols) >= 2:
+        main_ord = next((c for c in ord_cols if "__" not in c[:-5]), ord_cols[0])
+        for oc in ord_cols:
+            if oc == main_ord:
+                continue
+            dname = f"{main_ord[:-5]}__minus__{oc[:-5]}"
+            if dname not in X.columns and len(X.columns) < 500:
+                X[dname] = (X[main_ord] - X[oc]).astype("float32")
+                Xt[dname] = (Xt[main_ord] - Xt[oc]).astype("float32")
 
     # категориальные: единый словарь train+test; очень высокая кардинальность -> числовой код по частоте
     final_cats = []
@@ -310,13 +336,18 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
     return res.iloc[:n].reset_index(drop=True), res.iloc[n:].reset_index(drop=True)
 
 
+_DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__ord", "__cnt", "__freq",
+                "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag")
+
+
 def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_corr: float = 0.15):
     """Числовые признаки, изменение которых у объекта между его периодами связано с изменением таргета
     (|corr(Δx, Δy)| по соседним наблюдениям одного объекта в train). Берутся только сильные: не слабее
     min_corr и половины лучшего. На WiDS: рейтинг ENERGY STAR (0.42) — да, погода (~0.1, 50 похожих колонок) —
     нет: с ней RMSE 34.90 против 34.67 без неё."""
     skip = set(key_cols) | set(exclude)
-    cols = [c for c in X.columns if c not in skip and "__" not in c and pd.api.types.is_numeric_dtype(X[c])
+    cols = [c for c in X.columns if c not in skip and not str(c).endswith(_DERIVED_SFX)
+            and "__minus__" not in str(c) and pd.api.types.is_numeric_dtype(X[c])
             and X[c].nunique() > 2]
     if not cols:
         return []
@@ -380,7 +411,7 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
     pairs = list(zip(periods[:-1], periods[1:]))[-6:]
     stats = {}
     for c in X.columns:
-        if c == time_col or "__" in c:
+        if c == time_col or str(c).endswith(_DERIVED_SFX) or "__minus__" in str(c):
             continue
         s = X[c]
         pers = []

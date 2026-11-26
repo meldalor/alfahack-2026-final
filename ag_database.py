@@ -46,7 +46,7 @@ class _PsycopgDatabase:
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
         buf = io.BytesIO()
         with self.conn.cursor() as cur:
-            with cur.copy(f'COPY {quote(schema)}.{quote(name)} TO STDOUT WITH CSV HEADER') as copy:
+            with cur.copy(f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER') as copy:
                 for chunk in copy:
                     buf.write(chunk)
         buf.seek(0)
@@ -113,7 +113,7 @@ class _LibpqDatabase:
                            + literal(schema) + " AND table_name=" + literal(name))
         text_types = {'text', 'character varying', 'character', 'uuid'}
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
-        res = self.lib.PQexec(self.conn, f'COPY {quote(schema)}.{quote(name)} TO STDOUT WITH CSV HEADER'.encode())
+        res = self.lib.PQexec(self.conn, f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER'.encode())
         ok = res and self.lib.PQresultStatus(res) == 3
         if res: self.lib.PQclear(res)
         if not ok: raise RuntimeError('PostgreSQL table export failed')
@@ -149,12 +149,19 @@ def extract(work: Path):
         raise RuntimeError('No train/test files; set PGDATABASE and PostgreSQL connection variables')
     db = Database()
     try:
-        schema = db.query("SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema,table_name")
+        schema = db.query(
+            "SELECT table_schema,table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
+            "UNION SELECT schemaname AS table_schema, matviewname AS table_name FROM pg_matviews "
+            "WHERE schemaname NOT IN ('pg_catalog','information_schema') "
+            "ORDER BY table_schema,table_name"
+        )
         tables = {}
         for row in schema.itertuples(index=False):
-            if row.table_name in tables:
-                raise ValueError('Ambiguous table names across schemas')
-            tables[row.table_name] = db.table(row.table_schema, row.table_name)
+            key = row.table_name
+            if key in tables:
+                key = f"{row.table_schema}__{row.table_name}"
+            tables[key] = db.table(row.table_schema, row.table_name)
         return tables
     finally:
         db.close()

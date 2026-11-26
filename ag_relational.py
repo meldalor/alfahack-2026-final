@@ -1,10 +1,72 @@
-"""Schema-driven joins: unique dimensions and backward, bounded temporal lookup."""
+"""Schema-driven joins: unique dimensions, bounded temporal lookup, intervals, and causal one-to-many."""
 import itertools
 import numpy as np
 import pandas as pd
-from ag_utils import log
+from ag_utils import log, log_exc
 
-TIME_NAMES = {'timestamp', 'date', 'datetime'}
+TIME_NAMES = {'timestamp', 'date', 'datetime', 'time', 'event_time', 'created_at', 'updated_at', 'recorded_at', 'ts', 'dt'}
+
+
+def _is_time_col(name: str, series: pd.Series | None = None) -> bool:
+    low = str(name).lower()
+    if low.startswith(('start_', 'end_')):
+        return False
+    name_ok = (low in TIME_NAMES or low.endswith(('_time', '_timestamp', '_date', '_datetime', '_at', '_ts', '_dt'))
+               or low.startswith(('timestamp_', 'datetime_', 'event_time')))
+    if not name_ok:
+        return False
+    if series is None:
+        return True
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    if pd.api.types.is_numeric_dtype(series):
+        return False
+    sample = series.dropna().head(200)
+    if len(sample) < 3:
+        return False
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        parsed = pd.to_datetime(sample, errors='coerce', utc=True)
+    return float(parsed.notna().mean()) >= 0.9
+
+
+def _norm_key_series(s: pd.Series) -> pd.Series:
+    """Canonical string representation for mismatched key dtypes (e.g., int 10 vs float 10.0 vs str ' 10 ')."""
+    if pd.api.types.is_float_dtype(s):
+        vals = s.values
+        finite = np.isfinite(vals)
+        if finite.any() and np.all(np.isclose(vals[finite], np.round(vals[finite]))):
+            out = pd.Series(pd.NA, index=s.index, dtype='string')
+            out.loc[finite] = pd.Series(np.round(vals[finite]).astype(np.int64), index=s.index[finite]).astype('string')
+            return out
+    return s.astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
+
+
+def _align_key_dtypes(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]):
+    """Align join key dtypes safely without crashing on int/str/float mismatches."""
+    l_out, r_out = left, right
+    changed = False
+    for k in keys:
+        if k not in l_out.columns or k not in r_out.columns:
+            continue
+        a, b = l_out[k], r_out[k]
+        if a.dtype == b.dtype:
+            if pd.api.types.is_object_dtype(a) or pd.api.types.is_string_dtype(a):
+                sa = a.astype('string').str.strip()
+                sb = b.astype('string').str.strip()
+                if not sa.equals(a.astype('string')) or not sb.equals(b.astype('string')):
+                    if not changed:
+                        l_out, r_out, changed = l_out.copy(), r_out.copy(), True
+                    l_out[k], r_out[k] = sa, sb
+            continue
+        if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+            continue
+        if not changed:
+            l_out, r_out, changed = l_out.copy(), r_out.copy(), True
+        l_out[k] = _norm_key_series(a)
+        r_out[k] = _norm_key_series(b)
+    return l_out, r_out
 
 
 def _keys(dim, common):
@@ -22,11 +84,12 @@ def _keys(dim, common):
 
 
 def _temporal_join(left, right, keys, marker):
-    times = [c for c in keys if c.lower() in TIME_NAMES]
+    times = [c for c in keys if _is_time_col(c, right[c])]
     if len(times) != 1:
         return None
     tc = times[0]
     groups = [c for c in keys if c != tc]
+    left, right = _align_key_dtypes(left, right, groups)
     rt = pd.to_datetime(right[tc], errors='coerce', utc=True)
     lt = pd.to_datetime(left[tc], errors='coerce', utc=True)
     if rt.notna().mean() < .99 or lt.notna().mean() < .9:
@@ -72,12 +135,12 @@ def _temporal_join(left, right, keys, marker):
 
 def _interval_join(left, dim, name, targets):
     """Generic interval join for tables with (start_*, end_*) timestamps and shared group keys."""
-    l_times = [c for c in left.columns if c.lower() in TIME_NAMES]
+    l_times = [c for c in left.columns if _is_time_col(c, left[c])]
     if len(l_times) != 1:
         return None
     ltc = l_times[0]
-    starts = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date'))]
-    ends = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date'))]
+    starts = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+    ends = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
     if len(starts) != 1 or len(ends) != 1:
         return None
     sc, ec = starts[0], ends[0]
@@ -95,6 +158,7 @@ def _interval_join(left, dim, name, targets):
     keep_cols = [c for c in dim.columns if c not in groups and c not in (sc, ec) and c not in targets
                  and not c.lower().endswith('_id') and c.lower() != 'id']
     b = dim[groups + keep_cols].copy(); b['__s__'] = st; b['__e__'] = et
+    a, b = _align_key_dtypes(a, b, groups)
     b = b.dropna(subset=['__s__', '__e__'] + groups)
     if b.empty:
         return None
@@ -127,31 +191,34 @@ def _aggregate_child(left, dim, name, targets):
     # Pick the shared ID column with highest non-zero overlap and reasonable cardinality.
     best_key, best_cov = None, 0.0
     for c in l_id_cols:
-        lvals = set(left[c].dropna().unique())
+        ls = _norm_key_series(left[c]) if left[c].dtype != dim[c].dtype else left[c]
+        ds = _norm_key_series(dim[c]) if left[c].dtype != dim[c].dtype else dim[c]
+        lvals = set(ls.dropna().unique())
         if not lvals:
             continue
-        cov = float(dim[c].isin(lvals).mean())
+        cov = float(ds.isin(lvals).mean())
         if cov > best_cov and cov >= 0.05:
             best_key, best_cov = c, cov
     if best_key is None:
         return None
-    d_times = [c for c in dim.columns if c.lower() in TIME_NAMES]
-    l_times = [c for c in left.columns if c.lower() in TIME_NAMES]
-    num_cols = [c for c in dim.columns if c != best_key and c not in targets and c not in d_times
+    left_al, dim_al = _align_key_dtypes(left[[best_key]], dim, [best_key])
+    d_times = [c for c in dim_al.columns if _is_time_col(c, dim_al[c])]
+    l_times = [c for c in left.columns if _is_time_col(c, left[c])]
+    num_cols = [c for c in dim_al.columns if c != best_key and c not in targets and c not in d_times
                 and not c.lower().endswith('_id') and c.lower() != 'id'
-                and pd.api.types.is_numeric_dtype(dim[c])][:8]
-    cat_cols = [c for c in dim.columns if c != best_key and c not in targets and c not in d_times
+                and pd.api.types.is_numeric_dtype(dim_al[c])][:8]
+    cat_cols = [c for c in dim_al.columns if c != best_key and c not in targets and c not in d_times
                 and c not in num_cols and not c.lower().endswith('_id') and c.lower() != 'id'
-                and 2 <= dim[c].nunique(dropna=True) <= 200][:4]
+                and 2 <= dim_al[c].nunique(dropna=True) <= 200][:4]
     if d_times:
         if len(d_times) != 1 or len(l_times) != 1:
             return None  # Timed child table without matching event clock: skip to prevent future leakage.
         dtc, ltc = d_times[0], l_times[0]
-        dt = pd.to_datetime(dim[dtc], errors='coerce', utc=True)
+        dt = pd.to_datetime(dim_al[dtc], errors='coerce', utc=True)
         lt = pd.to_datetime(left[ltc], errors='coerce', utc=True)
         if dt.notna().mean() < 0.9 or lt.notna().mean() < 0.9:
             return None
-        b = dim[[best_key] + num_cols].copy()
+        b = dim_al[[best_key] + num_cols].copy()
         b['__t__'] = dt
         b = b.dropna(subset=[best_key, '__t__']).sort_values([best_key, '__t__']).reset_index(drop=True)
         if b.empty:
@@ -167,9 +234,8 @@ def _aggregate_child(left, dim, name, targets):
             pref[f'{name}__{c}__hist_mean'] = (csum / n_ok.replace(0, np.nan)).astype('float32')
             pref[f'{name}__{c}__hist_last'] = v.groupby(b[best_key], sort=False).ffill().astype('float32')
             pref[f'{name}__{c}__hist_max'] = v.groupby(b[best_key], sort=False).cummax().astype('float32')
-        # Keep latest state per (key, timestamp) so merge_asof is unambiguous.
         pref = pref.drop_duplicates(subset=[best_key, '__t__'], keep='last').sort_values('__t__')
-        a = pd.DataFrame({best_key: left[best_key], '__t__': lt, '__row__': np.arange(len(left))})
+        a = pd.DataFrame({best_key: left_al[best_key], '__t__': lt, '__row__': np.arange(len(left))})
         valid = a[best_key].notna() & a['__t__'].notna()
         aok = a.loc[valid].sort_values('__t__')
         j = pd.merge_asof(aok, pref, on='__t__', by=best_key, direction='backward', allow_exact_matches=False)
@@ -180,7 +246,7 @@ def _aggregate_child(left, dim, name, targets):
             return None
         return out[feat_cols], best_key, 'causal'
     # Static one-to-many table (no timestamps): safe groupby aggregation.
-    g = dim.dropna(subset=[best_key]).groupby(best_key, sort=False)
+    g = dim_al.dropna(subset=[best_key]).groupby(best_key, sort=False)
     agg = pd.DataFrame(index=g.size().index)
     agg[f'{name}__count'] = g.size().astype('float32')
     for c in num_cols:
@@ -190,7 +256,7 @@ def _aggregate_child(left, dim, name, targets):
         agg[f'{name}__{c}__max'] = g[c].max().astype('float32')
     for c in cat_cols:
         agg[f'{name}__{c}__nunique'] = g[c].nunique().astype('float32')
-    merged = left[[best_key]].merge(agg, left_on=best_key, right_index=True, how='left', sort=False)
+    merged = left_al[[best_key]].merge(agg, left_on=best_key, right_index=True, how='left', sort=False)
     feat_cols = list(agg.columns)
     if merged[f'{name}__count'].notna().mean() == 0:
         return None
@@ -198,72 +264,85 @@ def _aggregate_child(left, dim, name, targets):
     return merged[feat_cols].reset_index(drop=True), best_key, 'static'
 
 
-def enrich(train, test, tables):
+def enrich(train, test, tables, skip_names=()):
     targets = set(train) - set(test)
     n = len(train)
     combined = pd.concat([train, test], ignore_index=True)
-    remaining = {k: v for k, v in tables.items()
-                 if k not in ('train', 'test', 'sample_submission', 'data_dictionary')}
+    skip = {'train', 'test', 'sample_submission', 'data_dictionary'} | set(skip_names)
+    remaining = {k: v for k, v in tables.items() if k not in skip}
     for _ in range(4):
         changed = False
         for name, dim in list(remaining.items()):
-            common = [c for c in dim if c in combined and c not in targets and
-                      (c.lower().endswith('_id') or c.lower() == 'id' or c.lower() in TIME_NAMES)]
-            keys, dim, excluded = _keys(dim, common)
-            if not keys:
-                continue
-            if excluded:
-                log(f'join {name}: excluded {excluded} ambiguous/missing-key rows')
-            rename = {c: (c if c not in combined and c.endswith('_id') else f'{name}__{c}')
-                      for c in dim if c not in keys and c not in targets}
-            right = dim[keys + list(rename)].rename(columns=rename)
-            marker = f'{name}__matched'; right[marker] = 1.0
-            before = len(combined)
-            candidate = combined.merge(right, on=keys, how='left', sort=False, validate='many_to_one')
-            coverage = candidate[marker].notna().mean()
-            if coverage < .95:
-                temporal = _temporal_join(combined, right, keys, marker)
-                if temporal is not None and temporal[0][marker].notna().mean() > coverage:
-                    candidate, cadence = temporal
-                    log(f'join {name}: backward temporal lookup, maximum age < {cadence}')
-            if candidate[marker].notna().mean() == 0:
-                iv = _interval_join(combined, dim, name, targets)
-                if iv is not None:
-                    combined = pd.concat([combined, iv], axis=1)
-                    cov = float((iv[f'{name}__active_count'] > 0).mean())
-                    log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
-                    del remaining[name]; changed = True
+            try:
+                common = [c for c in dim if c in combined and c not in targets and
+                          (c.lower().endswith('_id') or c.lower() == 'id' or c.lower() in TIME_NAMES or _is_time_col(c, dim[c]))]
+                keys, dim_clean, excluded = _keys(dim, common)
+                if not keys:
                     continue
-                ag = _aggregate_child(combined, dim, name, targets)
-                if ag is not None:
-                    feats_df, akey, amode = ag
-                    combined = pd.concat([combined, feats_df], axis=1)
-                    log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
-                    del remaining[name]; changed = True
+                if excluded:
+                    log(f'join {name}: excluded {excluded} ambiguous/missing-key rows')
+                rename = {c: (c if c not in combined and c.endswith('_id') else f'{name}__{c}')
+                          for c in dim_clean if c not in keys and c not in targets}
+                right = dim_clean[keys + list(rename)].rename(columns=rename)
+                marker = f'{name}__matched'; right[marker] = 1.0
+                before = len(combined)
+                left_m, right_m = _align_key_dtypes(combined, right, keys)
+                candidate = left_m.merge(right_m, on=keys, how='left', sort=False, validate='many_to_one')
+                for k in keys:
+                    candidate[k] = combined[k].values
+                coverage = candidate[marker].notna().mean()
+                if coverage < .95:
+                    temporal = _temporal_join(combined, right, keys, marker)
+                    if temporal is not None and temporal[0][marker].notna().mean() > coverage:
+                        candidate, cadence = temporal
+                        log(f'join {name}: backward temporal lookup, maximum age < {cadence}')
+                if candidate[marker].notna().mean() == 0:
+                    iv = _interval_join(combined, dim_clean, name, targets)
+                    if iv is not None:
+                        combined = pd.concat([combined, iv], axis=1)
+                        cov = float((iv[f'{name}__active_count'] > 0).mean())
+                        log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
+                        del remaining[name]; changed = True
+                        continue
+                    ag = _aggregate_child(combined, dim, name, targets)
+                    if ag is not None:
+                        feats_df, akey, amode = ag
+                        combined = pd.concat([combined, feats_df], axis=1)
+                        log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
+                        del remaining[name]; changed = True
+                        continue
+                    log(f'join skipped {name}: shared names but no matching key values')
+                    del remaining[name]
                     continue
-                log(f'join skipped {name}: shared names but no matching key values')
+                combined = candidate
+                assert len(combined) == before
+                log(f'join {name}: keys={keys}, coverage={combined[marker].notna().mean():.3f}, features={len(rename)}')
+                combined[marker] = combined[marker].fillna(0)
+                del remaining[name]; changed = True
+            except Exception:
+                log_exc(f'join {name}')
                 del remaining[name]
-                continue
-            combined = candidate
-            assert len(combined) == before
-            log(f'join {name}: keys={keys}, coverage={combined[marker].notna().mean():.3f}, features={len(rename)}')
-            combined[marker] = combined[marker].fillna(0)
-            del remaining[name]; changed = True
         if not changed: break
     for name in list(remaining):
-        iv = _interval_join(combined, remaining[name], name, targets)
-        if iv is not None:
-            combined = pd.concat([combined, iv], axis=1)
-            cov = float((iv[f'{name}__active_count'] > 0).mean())
-            log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
-            del remaining[name]
+        try:
+            iv = _interval_join(combined, remaining[name], name, targets)
+            if iv is not None:
+                combined = pd.concat([combined, iv], axis=1)
+                cov = float((iv[f'{name}__active_count'] > 0).mean())
+                log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
+                del remaining[name]
+        except Exception:
+            log_exc(f'interval join {name}')
     for name in list(remaining):
-        ag = _aggregate_child(combined, remaining[name], name, targets)
-        if ag is not None:
-            feats_df, akey, amode = ag
-            combined = pd.concat([combined, feats_df], axis=1)
-            log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
-            del remaining[name]
+        try:
+            ag = _aggregate_child(combined, remaining[name], name, targets)
+            if ag is not None:
+                feats_df, akey, amode = ag
+                combined = pd.concat([combined, feats_df], axis=1)
+                log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
+                del remaining[name]
+        except Exception:
+            log_exc(f'one-to-many {name}')
     for name in remaining:
         log(f'join skipped {name}: no unambiguous unique shared key')
     return combined.iloc[:n].reset_index(drop=True), combined.iloc[n:].drop(columns=list(targets)).reset_index(drop=True)

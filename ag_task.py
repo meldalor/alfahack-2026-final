@@ -173,9 +173,9 @@ METRIC_PATTERNS = [
     ("balanced_accuracy", r"balanced[\s\-_]*accuracy|сбалансированн\w* точност"),
     ("mcc", r"\bmcc\b|matthews"),
     ("qwk", r"quadratic weighted kappa|\bqwk\b|cohen.{0,10}kappa|каппа"),
+    ("average_precision", r"pr[\s\-_]*auc|auc[\s\-_]*pr|average[\s\-_]*precision|precision[\s\-_]*recall[\s\-_]*auc"),
     ("roc_auc", r"roc[\s\-_]*auc|\bauc[\s\-_]*roc|\bauc\b|\bgini\b|джини"),
-    ("average_precision", r"pr[\s\-_]*auc|average[\s\-_]*precision"),
-    ("logloss", r"log[\s\-_]*loss|cross[\s\-_]*entropy|кросс[\s\-]*энтропи|логлосс"),
+    ("logloss", r"log[\s\-_]*loss|cross[\s\-_]*entropy|кросс[\s\-]*энтропи|логлосс|brier"),
     ("f1", r"\bf1\b|f1[\s\-_]*score|f-?мера"),
     ("accuracy", r"\baccuracy\b|доля верных|точность классификации"),
 ]
@@ -363,7 +363,16 @@ def build_spec(task_path: Path, train: pd.DataFrame, test: pd.DataFrame, sample,
     if spec.task_type == "regression":
         spec.output_kind = "value"
     else:
-        class_cols = [c for c in sample_cols if c != id_col and str(c) in {str(k) for k in spec.classes}]
+        class_strs = {str(k).strip().lower() for k in spec.classes}
+        def _matches_class_col(col):
+            s = str(col).strip().lower()
+            if s in class_strs:
+                return True
+            for pfx in ("class_", "prob_", "proba_", "pred_", "p_", "target_", "label_"):
+                if s.startswith(pfx) and s[len(pfx):] in class_strs:
+                    return True
+            return False
+        class_cols = [c for c in sample_cols if c != id_col and _matches_class_col(c)]
         if len(class_cols) >= 2:
             spec.output_kind = "proba_multi"
         elif spec.metric in PROBA_METRICS:

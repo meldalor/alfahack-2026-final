@@ -55,6 +55,34 @@ def blend(results, y, mask, spec, max_steps: int = 30):
             else None}
 
 
+def rank_blend(results, y, mask, spec, max_steps: int = 30):
+    """Ранговое смешивание для ранжирующих метрик (ROC-AUC, PR-AUC): выравнивает масштаб вероятностей разных семейств."""
+    from scipy.stats import rankdata
+
+    if spec.task_type != "binary" or spec.metric not in ("roc_auc", "average_precision"):
+        return None
+    usable = [r for r in results if r is not None and r.test is not None
+              and not np.isnan(r.oof[mask]).any() and np.isfinite(r.score)]
+    if len(usable) < 2:
+        return None
+
+    def to_rank_proba(oof, test):
+        ro = np.full_like(oof, np.nan, dtype=float)
+        p1 = rankdata(oof[mask, 1]) / (int(mask.sum()) + 1.0)
+        ro[mask, 1] = p1
+        ro[mask, 0] = 1.0 - p1
+        t1 = rankdata(test[:, 1]) / (len(test) + 1.0)
+        rt = np.column_stack([1.0 - t1, t1])
+        return ro, rt
+
+    ranked = []
+    for r in usable:
+        ro, rt = to_rank_proba(r.oof, r.test)
+        ranked.append(type(r)(name=r.name, oof=ro, test=rt, score=r.score, fold_scores=r.fold_scores,
+                              iters=r.iters, importance=r.importance, seconds=r.seconds, config=r.config))
+    return blend(ranked, y, mask, spec, max_steps=max_steps)
+
+
 def em_test_priors(proba_test, train_priors, iters: int = 200):
     """Оценка априорных вероятностей классов на тесте по EM (Saerens et al., 2002)."""
     p = np.asarray(train_priors, float).copy()

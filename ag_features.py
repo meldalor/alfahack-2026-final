@@ -41,7 +41,16 @@ def _codes_seen(name: str, a: pd.Series, b: pd.Series) -> bool:
 
 
 def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
-    both = pd.to_datetime(pd.concat([a, b], ignore_index=True), errors="coerce")
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pa = pd.to_datetime(a, errors="coerce", utc=True)
+        pb = pd.to_datetime(b, errors="coerce", utc=True)
+        if pa.notna().mean() < 0.5 and a.notna().any():
+            pa = pd.to_datetime(a, errors="coerce", format="mixed", utc=True)
+            pb = pd.to_datetime(b, errors="coerce", format="mixed", utc=True)
+    both = pd.concat([pa, pb], ignore_index=True)
     out = pd.DataFrame(index=both.index)
     out[f"{name}__year"] = both.dt.year
     out[f"{name}__month"] = both.dt.month
@@ -52,9 +61,18 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
         out[f"{name}__hour"] = both.dt.hour
     if (both.dt.minute.fillna(0) != 0).mean() > 0.05:
         out[f"{name}__minute"] = both.dt.minute
-    out[f"{name}__ord"] = (both - pd.Timestamp("1970-01-01")).dt.total_seconds() / 86400.0
+    # Origin strictly from train min timestamp: keeps float32 second-level precision and zero test dependence.
+    origin = pa.min()
+    if pd.isna(origin):
+        origin = pb.min()
+    if pd.isna(origin):
+        origin = pd.Timestamp("1970-01-01", tz="UTC")
+    out[f"{name}__ord"] = (both - origin).dt.total_seconds() / 86400.0
     out = out.astype("float32")
-    return out.iloc[: len(a)].reset_index(drop=True), out.iloc[len(a):].reset_index(drop=True)
+    a_out = out.iloc[: len(a)].reset_index(drop=True)
+    b_out = out.iloc[len(a):].reset_index(drop=True)
+    a_out.attrs["origin"] = origin
+    return a_out, b_out
 
 
 def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
@@ -76,6 +94,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
 
     X_parts, T_parts = [], []
     cat_cols, text_cols, raw_text, dropped = [], [], {}, []
+    date_origins = {}
     cat_hint = set(spec.cat_hint or [])
     for c in feats:
         a, b = train[c], test[c]
@@ -87,11 +106,14 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 continue
             if pd.api.types.is_datetime64_any_dtype(a):
                 xa, xb = _expand_datetime(name, a, b)
+                date_origins[f"{name}__ord"] = xa.attrs.get("origin")
                 X_parts.append(xa)
                 T_parts.append(xb)
                 continue
             if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
-                if name in cat_hint and pd.concat([a, b]).nunique() <= 1000 and _codes_seen(name, a, b):
+                nu_a = a.nunique(dropna=True)
+                is_bin01 = nu_a <= 2 and set(np.round(a.dropna().astype(float).unique(), 6)) <= {0.0, 1.0}
+                if name in cat_hint and not is_bin01 and pd.concat([a, b]).nunique() <= 1000 and _codes_seen(name, a, b):
                     cat_cols.append(name)
 
                     def fmt(s):
@@ -126,6 +148,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 continue
             if _is_datetime_series(sa):
                 xa, xb = _expand_datetime(name, sa, sb)
+                date_origins[f"{name}__ord"] = xa.attrs.get("origin")
                 X_parts.append(xa)
                 T_parts.append(xb)
                 continue
@@ -157,35 +180,94 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
     X.columns = [str(c) for c in X.columns]
     Xt.columns = [str(c) for c in Xt.columns]
 
-    # Разности между парами дат (например, возраст аккаунта, дней с начала кампании / до окончания)
+    # Разности между парами дат с точным учётом origin каждой колонки (возраст аккаунта, дней с начала кампании)
     ord_cols = [c for c in X.columns if c.endswith("__ord")]
     if len(ord_cols) >= 2:
         main_ord = next((c for c in ord_cols if "__" not in c[:-5]), ord_cols[0])
+        main_o = date_origins.get(main_ord)
         for oc in ord_cols:
             if oc == main_ord:
                 continue
             dname = f"{main_ord[:-5]}__minus__{oc[:-5]}"
-            if dname not in X.columns and len(X.columns) < 500:
-                X[dname] = (X[main_ord] - X[oc]).astype("float32")
-                Xt[dname] = (Xt[main_ord] - Xt[oc]).astype("float32")
+            if dname not in X.columns and len(X.columns) < 600:
+                other_o = date_origins.get(oc)
+                shift_days = ((main_o - other_o).total_seconds() / 86400.0) if (main_o is not None and other_o is not None) else 0.0
+                X[dname] = ((X[main_ord].astype("float64") - X[oc].astype("float64")) + shift_days).astype("float32")
+                Xt[dname] = ((Xt[main_ord].astype("float64") - Xt[oc].astype("float64")) + shift_days).astype("float32")
 
-    # категориальные: единый словарь train+test; очень высокая кардинальность -> числовой код по частоте
+    # Кросс-табличный матчинг многозначных тег-колонок (списки через запятую): число тегов, пересечение и Жаккар
+    tag_vocab = {}
+    for c in cat_cols:
+        sample_s = X[c].dropna().astype(str).head(2000)
+        if len(sample_s) < 20 or (sample_s.str.contains(",", regex=False)).mean() < 0.15:
+            continue
+        tok_lists = [[t.strip().lower() for t in s.split(",") if t.strip()] for s in sample_s]
+        avg_len = float(np.mean([len(tl) for tl in tok_lists]))
+        vocab = {t for tl in tok_lists for t in tl}
+        if 1.1 <= avg_len <= 10.0 and 3 <= len(vocab) <= 200:
+            tag_vocab[c] = vocab
+            for df_t in (X, Xt):
+                s = df_t[c].astype("string")
+                cnt = s.str.count(",").astype("float32") + 1.0
+                cnt = cnt.where(s.notna() & (s.str.strip() != ""), 0.0)
+                df_t[f"{c}__n_tags"] = cnt.astype("float32")
+    tag_cols = list(tag_vocab)
+    for i, c1 in enumerate(tag_cols):
+        for c2 in tag_cols[i + 1:]:
+            v1, v2 = tag_vocab[c1], tag_vocab[c2]
+            if len(v1 & v2) < max(2, int(0.3 * min(len(v1), len(v2)))):
+                continue
+
+            def _tag_pair(sa: pd.Series, sb: pd.Series):
+                u1 = {str(u): frozenset(t.strip().lower() for t in str(u).split(",") if t.strip())
+                      for u in sa.dropna().unique()}
+                u2 = {str(u): frozenset(t.strip().lower() for t in str(u).split(",") if t.strip())
+                      for u in sb.dropna().unique()}
+                cache = {}
+                ov = np.full(len(sa), np.nan, dtype=np.float32)
+                jac = np.full(len(sa), np.nan, dtype=np.float32)
+                for idx_r, (va, vb) in enumerate(zip(sa.astype(object).tolist(), sb.astype(object).tolist())):
+                    if va is None or vb is None or va is pd.NA or vb is pd.NA:
+                        continue
+                    if (isinstance(va, float) and np.isnan(va)) or (isinstance(vb, float) and np.isnan(vb)):
+                        continue
+                    key = (va, vb)
+                    res = cache.get(key)
+                    if res is None:
+                        s1, s2 = u1.get(str(va)), u2.get(str(vb))
+                        if not s1 or not s2:
+                            res = (np.nan, np.nan)
+                        else:
+                            k = len(s1 & s2)
+                            res = (float(k), float(k) / float(len(s1 | s2)))
+                        cache[key] = res
+                    ov[idx_r], jac[idx_r] = res
+                return ov, jac
+
+            ov_a, jac_a = _tag_pair(X[c1], X[c2])
+            ov_b, jac_b = _tag_pair(Xt[c1], Xt[c2])
+            X[f"{c1}__ov__{c2}"], Xt[f"{c1}__ov__{c2}"] = ov_a, ov_b
+            X[f"{c1}__jac__{c2}"], Xt[f"{c1}__jac__{c2}"] = jac_a, jac_b
+
+    # категориальные: частоты/ранги высокой кардинальности строго по train (без утечки частот из test)
     final_cats = []
     for c in cat_cols:
-        both = pd.concat([X[c], Xt[c]], ignore_index=True).astype("string")
-        vc = both.value_counts(dropna=True)
-        if len(vc) > 1000:
-            rank = {v: i for i, v in enumerate(vc.index)}
-            freq = both.map(vc).astype("float32")
-            code = both.map(rank).astype("float32")
-            X[c] = code.iloc[: len(X)].values
-            Xt[c] = code.iloc[len(X):].values
-            X[c + "__freq"] = freq.iloc[: len(X)].values
-            Xt[c + "__freq"] = freq.iloc[len(X):].values
+        sa = X[c].astype("string")
+        sb = Xt[c].astype("string")
+        vc_tr = sa.value_counts(dropna=True)
+        if len(vc_tr) > 1000:
+            rank = {v: i for i, v in enumerate(vc_tr.index)}
+            tr_n = max(len(X), 1)
+            X[c] = sa.map(rank).fillna(-1.0).astype("float32").values
+            Xt[c] = sb.map(rank).fillna(-1.0).astype("float32").values
+            X[c + "__freq"] = (sa.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
+            Xt[c + "__freq"] = (sb.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
         else:
-            cats = pd.CategoricalDtype(categories=list(vc.index))
-            X[c] = pd.Categorical(X[c].astype("string").astype(object), dtype=cats)
-            Xt[c] = pd.Categorical(Xt[c].astype("string").astype(object), dtype=cats)
+            seen = set(vc_tr.index)
+            extra_te = [v for v in sb.dropna().unique() if v not in seen]
+            cats = pd.CategoricalDtype(categories=list(vc_tr.index) + extra_te)
+            X[c] = pd.Categorical(sa.astype(object), dtype=cats)
+            Xt[c] = pd.Categorical(sb.astype(object), dtype=cats)
             final_cats.append(c)
 
     # константы и полностью пустые колонки
@@ -247,14 +329,21 @@ def time_periods(values: pd.Series, max_periods: int = 60):
 # ---------------------------------------------------------------- признаки-преобразования
 
 
-def op_freq(X, Xt, cols):
+def op_freq(X, Xt, cols, train_only: bool = False):
     out_a, out_b = {}, {}
+    n_tr = max(len(X), 1)
     for c in cols:
-        both = pd.concat([X[c], Xt[c]], ignore_index=True)
-        vc = both.astype("string").value_counts(dropna=False)
-        f = both.astype("string").map(vc).astype("float32").values
-        out_a[f"{c}__cnt"] = f[: len(X)]
-        out_b[f"{c}__cnt"] = f[len(X):]
+        if train_only:
+            sa, sb = X[c].astype("string"), Xt[c].astype("string")
+            vc = sa.value_counts(dropna=False) / n_tr
+            out_a[f"{c}__cnt"] = sa.map(vc).fillna(0.0).astype("float32").values
+            out_b[f"{c}__cnt"] = sb.map(vc).fillna(0.0).astype("float32").values
+        else:
+            both = pd.concat([X[c], Xt[c]], ignore_index=True)
+            vc = both.astype("string").value_counts(dropna=False)
+            f = both.astype("string").map(vc).astype("float32").values
+            out_a[f"{c}__cnt"] = f[: len(X)]
+            out_b[f"{c}__cnt"] = f[len(X):]
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
 
 
@@ -264,24 +353,40 @@ def op_nan_count(X, Xt):
             pd.DataFrame({"row__nan": Xt.isna().sum(1).astype("float32").values}))
 
 
-def op_dup_count(X, Xt):
+def op_dup_count(X, Xt, train_only: bool = False):
+    if train_only:
+        ha = pd.util.hash_pandas_object(X.astype("string"), index=False)
+        hb = pd.util.hash_pandas_object(Xt.astype("string"), index=False)
+        vc = ha.value_counts()
+        return (pd.DataFrame({"row__dup": ha.map(vc).fillna(0.0).astype("float32").values}),
+                pd.DataFrame({"row__dup": hb.map(vc).fillna(0.0).astype("float32").values}))
     both = pd.concat([X, Xt], ignore_index=True)
     h = pd.util.hash_pandas_object(both.astype("string"), index=False)
     cnt = h.map(h.value_counts()).astype("float32").values
     return pd.DataFrame({"row__dup": cnt[: len(X)]}), pd.DataFrame({"row__dup": cnt[len(X):]})
 
 
-def op_group_dev(X, Xt, pairs):
+def op_group_dev(X, Xt, pairs, train_only: bool = False):
     out_a, out_b = {}, {}
     for cat, num in pairs:
-        both = pd.concat([X[[cat, num]], Xt[[cat, num]]], ignore_index=True)
-        g = both.groupby(both[cat].astype("string"), dropna=False)[num]
-        mean = g.transform("mean")
-        std = g.transform("std")
-        dev = ((both[num] - mean) / (std + 1e-9)).astype("float32").values
-        rat = (both[num] / (mean.abs() + 1e-9)).astype("float32").values
-        out_a[f"{num}__z_by_{cat}"], out_b[f"{num}__z_by_{cat}"] = dev[: len(X)], dev[len(X):]
-        out_a[f"{num}__r_by_{cat}"], out_b[f"{num}__r_by_{cat}"] = rat[: len(X)], rat[len(X):]
+        if train_only:
+            ca, cb = X[cat].astype("string"), Xt[cat].astype("string")
+            g = X.groupby(ca, dropna=False)[num].agg(["mean", "std"])
+            ma, sa = ca.map(g["mean"]), ca.map(g["std"])
+            mb, sb = cb.map(g["mean"]), cb.map(g["std"])
+            out_a[f"{num}__z_by_{cat}"] = ((X[num] - ma) / (sa + 1e-9)).astype("float32").values
+            out_b[f"{num}__z_by_{cat}"] = ((Xt[num] - mb) / (sb + 1e-9)).astype("float32").values
+            out_a[f"{num}__r_by_{cat}"] = (X[num] / (ma.abs() + 1e-9)).astype("float32").values
+            out_b[f"{num}__r_by_{cat}"] = (Xt[num] / (mb.abs() + 1e-9)).astype("float32").values
+        else:
+            both = pd.concat([X[[cat, num]], Xt[[cat, num]]], ignore_index=True)
+            g = both.groupby(both[cat].astype("string"), dropna=False)[num]
+            mean = g.transform("mean")
+            std = g.transform("std")
+            dev = ((both[num] - mean) / (std + 1e-9)).astype("float32").values
+            rat = (both[num] / (mean.abs() + 1e-9)).astype("float32").values
+            out_a[f"{num}__z_by_{cat}"], out_b[f"{num}__z_by_{cat}"] = dev[: len(X)], dev[len(X):]
+            out_a[f"{num}__r_by_{cat}"], out_b[f"{num}__r_by_{cat}"] = rat[: len(X)], rat[len(X):]
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
 
 
@@ -340,7 +445,9 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
 
 _DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__minute", "__ord", "__cnt", "__freq",
                 "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag",
-                "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen")
+                "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen",
+                "__sys_mean", "__sys_dev", "__n_tags")
+_DERIVED_PFX = ("stream__", "stream_grp__", "nc__", "nc_d1__", "nc_prof__", "nc_gb__", "nc_gbd__")
 
 
 def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_corr: float = 0.15):
@@ -350,8 +457,9 @@ def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_
     нет: с ней RMSE 34.90 против 34.67 без неё."""
     skip = set(key_cols) | set(exclude)
     cols = [c for c in X.columns if c not in skip and not str(c).endswith(_DERIVED_SFX)
-            and not str(c).startswith("stream__")
-            and "__minus__" not in str(c) and pd.api.types.is_numeric_dtype(X[c])
+            and not str(c).startswith(_DERIVED_PFX)
+            and "__minus__" not in str(c) and "__ov__" not in str(c) and "__jac__" not in str(c)
+            and pd.api.types.is_numeric_dtype(X[c])
             and X[c].nunique() > 2]
     if not cols:
         return []
@@ -415,7 +523,12 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
     pairs = list(zip(periods[:-1], periods[1:]))[-6:]
     stats = {}
     for c in X.columns:
-        if c == time_col or str(c).endswith(_DERIVED_SFX) or str(c).startswith("stream__") or "__minus__" in str(c):
+        cs = str(c)
+        if (c == time_col or cs.endswith(_DERIVED_SFX) or cs.startswith(_DERIVED_PFX)
+                or "__minus__" in cs or "__ov__" in cs or "__jac__" in cs):
+            continue
+        # Joined continuous numeric telemetry columns are never entity keys
+        if "__" in cs and pd.api.types.is_numeric_dtype(X[c]) and X[c].nunique() > 30:
             continue
         s = X[c]
         pers = []
@@ -494,19 +607,33 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
     out_a, out_b = {}, {}
     y = np.asarray(y)
     for name, (sa, sb) in raw_text.items():
-        both = pd.concat([sa, sb], ignore_index=True).astype(str)
+        sa_s = sa.astype(str)
+        sb_s = sb.astype(str)
+        both = pd.concat([sa_s, sb_s], ignore_index=True)
         total_chars = float(both.str.len().sum())
         big = len(both) > 150_000 or total_chars > 1.5e8
         word = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
                                max_features=200_000 if not big else 100_000, sublinear_tf=True, dtype=np.float32)
-        mats = [word.fit_transform(both)]
-        if not big:
-            # символьные n-граммы ловят опечатки и морфологию, но дороги на больших корпусах
-            char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
-                                   sublinear_tf=True, dtype=np.float32)
-            mats.append(char.fit_transform(both))
-        M = sparse.hstack(mats).tocsr()
-        A, B = M[: len(sa)], M[len(sa):]
+        if periods is not None:
+            # On temporal splits fit TF-IDF vocabulary/IDF strictly on train (zero test leakage)
+            a_mats = [word.fit_transform(sa_s)]
+            b_mats = [word.transform(sb_s)]
+            if not big:
+                char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
+                                       sublinear_tf=True, dtype=np.float32)
+                a_mats.append(char.fit_transform(sa_s))
+                b_mats.append(char.transform(sb_s))
+            A = sparse.hstack(a_mats).tocsr()
+            B = sparse.hstack(b_mats).tocsr()
+        else:
+            mats = [word.fit_transform(both)]
+            if not big:
+                # символьные n-граммы ловят опечатки и морфологию, но дороги на больших корпусах
+                char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
+                                       sublinear_tf=True, dtype=np.float32)
+                mats.append(char.fit_transform(both))
+            M = sparse.hstack(mats).tocsr()
+            A, B = M[: len(sa)], M[len(sa):]
         if task_type == "regression":
             mk = lambda: Ridge(alpha=3.0)  # noqa: E731
             folds = KFold(5, shuffle=True, random_state=seed).split(A)
@@ -612,12 +739,12 @@ def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> t
         X_str[c] = X_str[c].astype("string").fillna("__missing__").astype(str)
         Xt_str[c] = Xt_str[c].astype("string").fillna("__missing__").astype(str)
     reconstructed = 0
-    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen")
+    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen", "__sys_mean", "__sys_dev")
     for nm in null_markers:
         prefix = nm[:-len("__raw_nulls")] + "__"
         t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"
                   and not c.endswith(_lag_sfx)]
-        other_num = [c for c in num_all if not c.startswith(prefix) and not c.startswith("stream__")
+        other_num = [c for c in num_all if not c.startswith(prefix) and not c.startswith(_DERIVED_PFX)
                      and not c.endswith(_lag_sfx)]
         other_cat = [c for c in cat_all if not c.startswith(prefix)]
         if not t_cols or (not other_num and not other_cat):
@@ -768,11 +895,11 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
     out["stream__burst_vs_24h"] = _scatter(rate_cur / (cnt_24h / 24.0 + 0.25))
     out["stream__burst_60m_vs_24h"] = _scatter(cnt_60m / (cnt_24h / 24.0 + 0.25))
 
-    # Strictly-past rolling sums, rates, and recency for raw binary (0/1) event flags
+    # Strictly-past rolling sums, rates, and recency for raw binary (0/1) event flags (detected strictly on train)
     bin_cols = [c for c in raw_cols if c != tc and not str(c).lower().endswith("_id") and str(c).lower() != "id"
-                and (pd.api.types.is_numeric_dtype(comb[c]) or pd.api.types.is_bool_dtype(comb[c]))
-                and comb[c].dropna().nunique() == 2
-                and set(pd.to_numeric(comb[c].dropna(), errors="coerce").unique()).issubset({0, 1, 0.0, 1.0})][:8]
+                and (pd.api.types.is_numeric_dtype(train[c]) or pd.api.types.is_bool_dtype(train[c]))
+                and train[c].dropna().nunique() == 2
+                and set(pd.to_numeric(train[c].dropna(), errors="coerce").unique()).issubset({0, 1, 0.0, 1.0})][:8]
     for c in bin_cols:
         vals = pd.to_numeric(comb[c], errors="coerce").fillna(0.0).values[orig_pos].astype("float64")
         csum = np.concatenate([[0.0], np.cumsum(vals)])
@@ -782,7 +909,7 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
         lp = np.where(j_end > 0, last_pos_le[np.maximum(j_end - 1, 0)], -1)
         gap_pos = np.where(lp >= 0, (ts_s - ts_s[np.maximum(lp, 0)]) / 60.0, np.nan)
         out[f"stream__{c}_gap_pos_min"] = _scatter(gap_pos)
-        out[f"stream__{c}_pos_in_cur_hr"] = _scatter((gap_pos < min_in_hr).astype("float32"))
+        out[f"stream__{c}_pos_in_cur_hr"] = _scatter((lp >= j_hr).astype("float32"))
         for w_min in (30, 60, 180):
             j_beg = np.searchsorted(ts_ns, ts_ns - int(w_min * 60 * 1e9), side="left")
             s_w = csum[j_end] - csum[j_beg]
@@ -795,7 +922,7 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
     # Strictly-past rolling composition for low-cardinality raw categoricals (2..8 unique values)
     cat_cands = [c for c in raw_cols if c != tc and c not in bin_cols
                  and not str(c).lower().endswith("_id") and str(c).lower() != "id"
-                 and not pd.api.types.is_numeric_dtype(comb[c]) and not pd.api.types.is_bool_dtype(comb[c])
+                 and not pd.api.types.is_numeric_dtype(train[c]) and not pd.api.types.is_bool_dtype(train[c])
                  and 2 <= train[c].dropna().nunique() <= 8][:3]
     j_60 = np.searchsorted(ts_ns, ts_ns - int(60 * 60 * 1e9), side="left")
     for c in cat_cands:
@@ -808,6 +935,58 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
             tag = re.sub(r"[^\w]+", "_", str(v)).strip("_")[:12] or f"v{idx_v}"
             out[f"stream__{c}_{tag}_cur_hr"] = _scatter(csum[j_end] - csum[j_hr])
             out[f"stream__{c}_{tag}_60m"] = _scatter(csum[j_end] - csum[j_60])
+
+    # Strictly-past per-group event intensity (< t) for up to 3 raw entity/high-card columns (avoid duplicating cat_cands)
+    cat_set_done = set(cat_cands)
+    grp_cands = []
+    for c in raw_cols:
+        if c == tc or c in bin_cols or c in cat_set_done:
+            continue
+        is_id = str(c).lower().endswith("_id")
+        is_cat = not pd.api.types.is_numeric_dtype(train[c]) and not pd.api.types.is_bool_dtype(train[c])
+        if not (is_id or is_cat):
+            continue
+        nu = int(train[c].nunique(dropna=True))
+        if (is_id and 2 <= nu <= 50_000) or (not is_id and 9 <= nu <= 50_000):
+            grp_cands.append((1 if is_id else 0, -abs(np.log1p(nu) - np.log1p(50.0)), c))
+    grp_cands.sort(reverse=True)
+    ts_rel_v = np.round((ts_v.values.astype("int64") - ts_ns[0]) / 1e9).astype(np.int64)
+    span_pad = int(ts_rel_v.max()) + 2 * 86400 * 7 + 10_000 if len(ts_rel_v) else 1_000_000
+    hr_rel_v = np.round((ts_v.dt.floor("h").values.astype("int64") - ts_ns[0]) / 1e9).astype(np.int64)
+    for _, _, gc in grp_cands[:3]:
+        g_vals = comb[gc].iloc[v_idx].astype("string")
+        codes_v, _ = pd.factorize(g_vals, sort=False)
+        codes_v = codes_v.astype(np.int64)
+        ok_g = codes_v >= 0
+        if int(ok_g.sum()) < 50:
+            continue
+        g_idx = np.flatnonzero(ok_g)
+        keys = (codes_v[g_idx] + 1) * span_pad + ts_rel_v[g_idx]
+        g_ord = np.argsort(keys, kind="mergesort")
+        ks = keys[g_ord]
+        g_pos = v_idx[g_idx[g_ord]]
+        gj_cur = np.searchsorted(ks, ks, side="left")
+        gj_1h = np.searchsorted(ks, ks - 3600, side="left")
+        gj_24h = np.searchsorted(ks, ks - 86400, side="left")
+        gj_7d = np.searchsorted(ks, ks - 7 * 86400, side="left")
+        g_base = (codes_v[g_idx[g_ord]] + 1) * span_pad
+        gh_key = g_base + hr_rel_v[g_idx[g_ord]]
+        gj_h0 = np.searchsorted(ks, gh_key, side="left")
+        g_start = np.searchsorted(ks, g_base, side="left")
+        g_gap = np.full(len(ks), np.nan, dtype=np.float32)
+        has_gp = gj_cur > g_start
+        g_gap[has_gp] = (ks[has_gp] - ks[gj_cur[has_gp] - 1]) / 3600.0
+
+        def _scatter_g(arr_gs):
+            arr = np.full(n_tot, np.nan, dtype="float32")
+            arr[g_pos] = arr_gs.astype("float32")
+            return arr
+
+        out[f"stream_grp__{gc}__cnt_1h"] = _scatter_g(gj_cur - gj_1h)
+        out[f"stream_grp__{gc}__cnt_since_h"] = _scatter_g(gj_cur - gj_h0)
+        out[f"stream_grp__{gc}__cnt_24h"] = _scatter_g(gj_cur - gj_24h)
+        out[f"stream_grp__{gc}__cnt_7d"] = _scatter_g(gj_cur - gj_7d)
+        out[f"stream_grp__{gc}__gap_h"] = _scatter_g(g_gap)
 
     df = pd.DataFrame(out)
     log(f"строго причинный поток событий ({tc}, строго < t): +{df.shape[1]} признаков")

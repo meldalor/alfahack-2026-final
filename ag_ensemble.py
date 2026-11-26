@@ -3,7 +3,8 @@
 import numpy as np
 import pandas as pd
 
-from ag_metrics import PROBA_METRICS, TUNABLE, decide, direction, label_score, optimize_decision, proba_score, score
+from ag_metrics import (PROBA_METRICS, RANK_METRICS, TUNABLE, decide, direction, label_score, oof_score,
+                        optimize_decision, proba_score, score)
 from ag_utils import log
 
 
@@ -14,48 +15,107 @@ def _blend_metric(spec):
     return "logloss"
 
 
-def _eval(spec, metric, y, p):
+def _eval(spec, metric, y, p, plan=None, mask=None):
     if spec.task_type == "regression":
-        return score(metric, "regression", y, p)
-    return proba_score(metric, y, p) if metric in PROBA_METRICS else score(metric, spec.task_type, y, p)
+        return score(metric, "regression", y[mask] if mask is not None else y, p[mask] if mask is not None else p)
+    if plan is not None and metric in RANK_METRICS and mask is not None:
+        return oof_score(metric, spec.task_type, y, p, plan=plan, mask=mask)
+    yy = y[mask] if mask is not None else y
+    pp = p[mask] if mask is not None else p
+    return proba_score(metric, yy, pp) if metric in PROBA_METRICS else score(metric, spec.task_type, yy, pp)
 
 
-def blend(results, y, mask, spec, max_steps: int = 30):
-    """Жадный отбор с возвращением (Caruana): веса = доли вхождений модели в смесь."""
+def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None) -> np.ndarray:
+    """Оптимизация весов на неотрицательном симплексе (w >= 0, sum(w) = 1) напрямую под целевую метрику регрессии."""
+    from scipy.optimize import minimize
+
+    k = M.shape[1]
+    if k == 1:
+        return np.ones(1, dtype=float)
+    sign = 1.0 if direction(metric) == "max" else -1.0
+
+    def _softmax(z):
+        z = np.asarray(z, dtype=float)
+        z = z - np.max(z)
+        e = np.exp(np.clip(z, -40.0, 0.0))
+        return e / np.sum(e)
+
+    def _loss(z):
+        w = _softmax(z)
+        return -sign * score(metric, "regression", y, M @ w)
+
+    starts = [np.zeros(k)]
+    if init_w is not None and len(init_w) == k:
+        starts.append(np.log(np.clip(np.asarray(init_w, dtype=float), 1e-3, 1.0)))
+    indiv = [sign * score(metric, "regression", y, M[:, j]) for j in range(k)]
+    best_j = int(np.argmax(indiv))
+    z_best = np.full(k, -2.5)
+    z_best[best_j] = 1.5
+    starts.append(z_best)
+
+    best_w = np.asarray(init_w, dtype=float) if init_w is not None else np.full(k, 1.0 / k)
+    best_w = np.clip(best_w, 0.0, None)
+    best_w = best_w / max(best_w.sum(), 1e-12)
+    best_val = -sign * score(metric, "regression", y, M @ best_w)
+
+    for z0 in starts:
+        for meth, maxit in (("Powell", 600), ("Nelder-Mead", 1200)):
+            try:
+                res = minimize(_loss, z0, method=meth, options={"maxiter": maxit})
+                if np.isfinite(res.fun) and res.fun < best_val - 1e-12:
+                    best_val = float(res.fun)
+                    best_w = _softmax(res.x)
+                    z0 = res.x
+            except Exception:
+                continue
+    best_w = np.where(best_w < 1e-3, 0.0, best_w)
+    s = best_w.sum()
+    return (best_w / s) if s > 0 else np.full(k, 1.0 / k)
+
+
+def blend(results, y, mask, spec, max_steps: int = 30, plan=None):
+    """Жадный отбор с возвращением (Caruana) + для регрессии доуточнение на неотрицательном симплексе."""
     usable = [r for r in results if r is not None and r.test is not None
               and not np.isnan(r.oof[mask]).any() and np.isfinite(r.score)]
     if not usable:
         return None
     metric = _blend_metric(spec)
     sign = 1 if direction(metric) == "max" else -1
-    scores = [sign * _eval(spec, metric, y[mask], r.oof[mask]) for r in usable]
+    use_plan = plan if (plan is not None and metric in RANK_METRICS and len(getattr(plan, "folds", [])) >= 2) else None
+    scores = [sign * _eval(spec, metric, y, r.oof, plan=use_plan, mask=mask) for r in usable]
     order = np.argsort(scores)[::-1]
     counts = np.zeros(len(usable))
     counts[order[0]] = 1
-    cur = usable[order[0]].oof[mask].copy()
+    cur_full = usable[order[0]].oof.copy()
     cur_s = scores[order[0]]
-    for step in range(1, max_steps):
+    for _ in range(1, max_steps):
         best_j, best_s, best_p = None, cur_s, None
         n = counts.sum()
         for j, r in enumerate(usable):
-            p = (cur * n + r.oof[mask]) / (n + 1)
-            s = sign * _eval(spec, metric, y[mask], p)
+            p = (cur_full * n + r.oof) / (n + 1)
+            s = sign * _eval(spec, metric, y, p, plan=use_plan, mask=mask)
             if s > best_s + 1e-12:
                 best_j, best_s, best_p = j, s, p
         if best_j is None:
             break
         counts[best_j] += 1
-        cur, cur_s = best_p, best_s
+        cur_full, cur_s = best_p, best_s
     w = counts / counts.sum()
+    if spec.task_type == "regression" and len(usable) >= 2:
+        M = np.column_stack([np.asarray(r.oof[mask], dtype=float).reshape(-1) for r in usable])
+        w_sx = _simplex_reg_weights(M, np.asarray(y)[mask], metric, init_w=w)
+        s_sx = sign * score(metric, "regression", np.asarray(y)[mask], M @ w_sx)
+        if s_sx > cur_s + 1e-12:
+            w = w_sx
     oof = sum(wi * r.oof for wi, r in zip(w, usable) if wi > 0)
     test = sum(wi * r.test for wi, r in zip(w, usable) if wi > 0)
-    weights = {r.name: round(float(wi), 3) for wi, r in zip(w, usable) if wi > 0}
+    weights = {r.name: round(float(wi), 3) for wi, r in zip(w, usable) if wi >= 0.005}
     return {"weights": weights, "oof": oof, "test": test,
             "score": score(spec.metric, spec.task_type, y[mask], oof[mask]) if spec.task_type == "regression"
             else None}
 
 
-def rank_blend(results, y, mask, spec, max_steps: int = 30):
+def rank_blend(results, y, mask, spec, max_steps: int = 30, plan=None):
     """Ранговое смешивание для ранжирующих метрик (ROC-AUC, PR-AUC): выравнивает масштаб вероятностей разных семейств."""
     from scipy.stats import rankdata
 
@@ -68,9 +128,17 @@ def rank_blend(results, y, mask, spec, max_steps: int = 30):
 
     def to_rank_proba(oof, test):
         ro = np.full_like(oof, np.nan, dtype=float)
-        p1 = rankdata(oof[mask, 1]) / (int(mask.sum()) + 1.0)
-        ro[mask, 1] = p1
-        ro[mask, 0] = 1.0 - p1
+        if plan is not None and len(getattr(plan, "folds", [])) >= 2:
+            for _, va in plan.folds:
+                va_m = va[mask[va]]
+                if len(va_m):
+                    p1 = rankdata(oof[va_m, 1]) / (len(va_m) + 1.0)
+                    ro[va_m, 1] = p1
+                    ro[va_m, 0] = 1.0 - p1
+        else:
+            p1 = rankdata(oof[mask, 1]) / (int(mask.sum()) + 1.0)
+            ro[mask, 1] = p1
+            ro[mask, 0] = 1.0 - p1
         t1 = rankdata(test[:, 1]) / (len(test) + 1.0)
         rt = np.column_stack([1.0 - t1, t1])
         return ro, rt
@@ -80,7 +148,7 @@ def rank_blend(results, y, mask, spec, max_steps: int = 30):
         ro, rt = to_rank_proba(r.oof, r.test)
         ranked.append(type(r)(name=r.name, oof=ro, test=rt, score=r.score, fold_scores=r.fold_scores,
                               iters=r.iters, importance=r.importance, seconds=r.seconds, config=r.config))
-    return blend(ranked, y, mask, spec, max_steps=max_steps)
+    return blend(ranked, y, mask, spec, max_steps=max_steps, plan=plan)
 
 
 def stack_blend(results, y, mask, spec, plan=None):
@@ -139,28 +207,14 @@ def stack_blend(results, y, mask, spec, plan=None):
             meta_folds = list(KFold(5, shuffle=True, random_state=42).split(M_oof))
 
     if spec.task_type == "regression":
-        from sklearn.linear_model import HuberRegressor
-
         y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
-        use_l1 = spec.metric in ("mae", "medae")
-
-        def _fit_meta_reg(A, b):
-            if use_l1:
-                try:
-                    return HuberRegressor(epsilon=1.15, alpha=1.0, max_iter=500).fit(A, b)
-                except Exception:
-                    pass
-            return RidgeCV(alphas=np.logspace(0, 4, 9)).fit(A, b)
-
         mo = np.full(len(y), np.nan, dtype=float)
         for tr, va in meta_folds:
-            reg = _fit_meta_reg(M_oof[tr], ym[tr])
-            mo[idx[va]] = np.clip(reg.predict(M_oof[va]), y_lo, y_hi)
-        reg_full = _fit_meta_reg(M_oof, ym)
-        mt = np.clip(reg_full.predict(M_test), y_lo, y_hi)
-        coefs = np.asarray(reg_full.coef_, float).reshape(-1)
-        denom = float(np.abs(coefs).sum()) or 1.0
-        weights = {r.name: round(float(c / denom), 3) for r, c in zip(usable, coefs) if abs(c / denom) >= 0.01}
+            w_f = _simplex_reg_weights(M_oof[tr], ym[tr], spec.metric)
+            mo[idx[va]] = np.clip(M_oof[va] @ w_f, y_lo, y_hi)
+        w_full = _simplex_reg_weights(M_oof, ym, spec.metric)
+        mt = np.clip(M_test @ w_full, y_lo, y_hi)
+        weights = {r.name: round(float(c), 3) for r, c in zip(usable, w_full) if c >= 0.01}
         return {"weights": weights, "oof": mo, "test": mt,
                 "score": score(spec.metric, spec.task_type, y[mask], mo[mask])}
 

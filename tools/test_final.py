@@ -430,4 +430,140 @@ class FinalTests(unittest.TestCase):
         st_a,st_b=causal_stream_features(tr,te_sp,exclude={'y','event_id'})
         self.assertEqual(st_a.shape[1],0); self.assertEqual(st_b.shape[1],0)
 
+    def test_cross_group_sys_mean_and_nowcast_zero_future_leak(self):
+        from ag_features import detect_time_split, prepare
+        from ag_nowcast import build_nowcast_features
+        rng=np.random.default_rng(7)
+        n_hr=24*30  # 30 days hourly x 6 districts = 4320 rows
+        stamps=pd.date_range('2025-01-01 00:00:00',periods=n_hr,freq='h')
+        dists=[f'D{i}' for i in range(6)]
+        rows=[]
+        for d_i,d in enumerate(dists):
+            hr=stamps.hour.values
+            sig=10.0 + 3.0*np.sin(2*np.pi*hr/24.0) + d_i + rng.normal(0,0.3,n_hr)
+            rows.append(pd.DataFrame({'district_id':d,'timestamp':stamps.astype(str),'spd':sig,'vol':sig*2.0+1.0}))
+        panel=pd.concat(rows,ignore_index=True)
+        # Events in days 10..27 (train, 600 rows -> >=50 rows/period for temporal folds) and days 28..30 (test)
+        ev_tr_ts=pd.date_range('2025-01-10 00:30:00',periods=600,freq='40min')
+        ev_te_ts=pd.date_range('2025-01-28 00:30:00',periods=40,freq='1h')
+        tr=pd.DataFrame({'event_id':range(600),'district_id':[dists[i%6] for i in range(600)],
+                         'timestamp':ev_tr_ts.astype(str),'y':rng.normal(20,3,600)})
+        te=pd.DataFrame({'event_id':range(600,640),'district_id':[dists[i%6] for i in range(40)],
+                         'timestamp':ev_te_ts.astype(str)})
+        meta1={}
+        a1,b1=enrich(tr,te,{'traffic':panel},meta=meta1)
+        self.assertIn('traffic__spd__sys_mean',a1.columns)
+        self.assertIn('traffic__spd__sys_dev',a1.columns)
+        self.assertEqual(len(meta1['panels']),1)
+        spec=TaskSpec('','',id_col='event_id',target='y',task_type='regression',metric='mae')
+        prep=prepare(a1,b1,spec)
+        tcol=detect_time_split(prep.X,prep.Xt,prep.cat_cols)
+        plan=make_plan(prep.X,prep.y,'regression',time_col=tcol)
+        nc_tr1,nc_te1=build_nowcast_features(meta1,prep.y,plan,'regression',n_jobs=2,use_lgb_top=False,max_seconds=30.0)
+        self.assertIsNotNone(nc_tr1)
+        self.assertIn('nc__traffic__spd',nc_tr1.columns)
+        self.assertEqual(int(nc_te1.isna().sum().sum()),0)
+        # Poison panel at and after test row 20 hour -> test row 20 nowcast & sys_mean MUST NOT change!
+        probe_hr=pd.Timestamp(ev_te_ts[20]).floor('h')
+        panel_p=panel.copy()
+        panel_p.loc[pd.to_datetime(panel_p['timestamp'])>=probe_hr,['spd','vol']]=99999.0
+        meta2={}
+        a2,b2=enrich(tr,te,{'traffic':panel_p},meta=meta2)
+        nc_tr2,nc_te2=build_nowcast_features(meta2,prep.y,plan,'regression',n_jobs=2,use_lgb_top=False,max_seconds=30.0)
+        self.assertAlmostEqual(float(b1.loc[20,'traffic__spd__sys_mean']),float(b2.loc[20,'traffic__spd__sys_mean']),places=5)
+        self.assertAlmostEqual(float(nc_te1.loc[20,'nc__traffic__spd']),float(nc_te2.loc[20,'nc__traffic__spd']),places=5)
+
+    def test_temporal_autoresearch_operators_zero_test_leak(self):
+        from ag_features import op_freq, op_group_dev
+        rng=np.random.default_rng(19)
+        X=pd.DataFrame({'cat':pd.Categorical(rng.choice(['a','b','c'],200)),'num':rng.normal(10,2,200)})
+        Xt=pd.DataFrame({'cat':pd.Categorical(rng.choice(['a','b','c'],60)),'num':rng.normal(10,2,60)})
+        Xt_p=Xt.copy(); Xt_p.loc[10:,'num']=999999.0; Xt_p.loc[10:,'cat']='c'
+        fa1,fb1=op_freq(X,Xt,['cat'],train_only=True)
+        fa2,fb2=op_freq(X,Xt_p,['cat'],train_only=True)
+        pd.testing.assert_frame_equal(fa1,fa2)
+        pd.testing.assert_frame_equal(fb1.iloc[:10],fb2.iloc[:10])
+        ga1,gb1=op_group_dev(X,Xt,[('cat','num')],train_only=True)
+        ga2,gb2=op_group_dev(X,Xt_p,[('cat','num')],train_only=True)
+        pd.testing.assert_frame_equal(ga1,ga2)
+        pd.testing.assert_frame_equal(gb1.iloc[:10],gb2.iloc[:10])
+
+    def test_binary_flags_stay_numeric_tag_matching_and_exact_date_diffs(self):
+        from ag_features import prepare
+        ts_s=pd.date_range('2025-03-01',periods=40,freq='D')
+        cr_s=[t - pd.Timedelta(days=31 + (i % 5)) for i, t in enumerate(ts_s)]
+        tr=pd.DataFrame({
+            'id':range(40),
+            'ts':ts_s.astype(str),
+            'created':[str(t) for t in cr_s],
+            'flag01':[i%2 for i in range(40)],
+            'ad_tags':['sport, music, tech' if i%2==0 else 'travel, food, art' for i in range(40)],
+            'user_tags':['music, tech' if i%2==0 else 'sport, art' for i in range(40)],
+            'y':np.linspace(1,40,40),
+        })
+        te=tr.drop(columns=['y']).iloc[:10].copy()
+        spec=TaskSpec('','',id_col='id',target='y',task_type='regression',metric='mae',cat_hint=['flag01'])
+        prep=prepare(tr,te,spec)
+        self.assertNotIn('flag01',prep.cat_cols)
+        self.assertTrue(pd.api.types.is_numeric_dtype(prep.X['flag01']))
+        self.assertAlmostEqual(float(prep.X['ts__minus__created'].iloc[0]),31.0,places=3)
+        self.assertIn('ad_tags__ov__user_tags',prep.X.columns)
+        self.assertAlmostEqual(float(prep.X['ad_tags__ov__user_tags'].iloc[0]),2.0,places=4)
+        self.assertAlmostEqual(float(prep.X['ad_tags__jac__user_tags'].iloc[0]),2.0/3.0,places=4)
+
+    def test_group_stream_and_cur_hr_boundary_zero_leak(self):
+        from ag_features import causal_stream_features
+        rng=np.random.default_rng(23)
+        ts_tr=pd.date_range('2025-01-01 00:00:00',periods=400,freq='20min')
+        ts_te=pd.date_range('2025-01-06 14:00:00',periods=120,freq='20min')
+        tr=pd.DataFrame({'event_id':range(400),'timestamp':ts_tr.astype(str),
+                         'district_id':[f'D{i%5}' for i in range(400)],'flag':[1 if i%3==0 else 0 for i in range(400)],
+                         'y':rng.normal(size=400)})
+        te=pd.DataFrame({'event_id':range(400,520),'timestamp':ts_te.astype(str),
+                         'district_id':[f'D{i%5}' for i in range(120)],'flag':[1 if i%3==0 else 0 for i in range(120)]})
+        # Row 0 of test is at 14:00:00 with flag=1; row 1 is at 14:20:00 -> pos_in_cur_hr MUST be 1.0!
+        s_tr1,s_te1=causal_stream_features(tr,te,exclude={'y','event_id'})
+        self.assertIn('stream_grp__district_id__cnt_24h',s_tr1.columns)
+        self.assertEqual(float(s_te1.loc[1,'stream__flag_pos_in_cur_hr']),1.0)
+        # Poison test rows strictly > 40 -> rows <= 40 must not change at all
+        te_p=te.copy(); te_p.loc[41:,'district_id']='D9'; te_p.loc[41:,'flag']=1-te_p.loc[41:,'flag']
+        s_tr2,s_te2=causal_stream_features(tr,te_p,exclude={'y','event_id'})
+        pd.testing.assert_frame_equal(s_tr1,s_tr2)
+        pd.testing.assert_frame_equal(s_te1.iloc[:41],s_te2.iloc[:41])
+
+    def test_simplex_stack_nonnegative_hgb_and_xgb_pseudohuber(self):
+        from ag_ensemble import stack_blend
+        from ag_models import FitResult, ModelConfig, fit_hgb, fit_xgb
+        rng=np.random.default_rng(31)
+        n=450
+        X=pd.DataFrame({'a':rng.normal(size=n),'b':rng.normal(size=n),'c':pd.Categorical(rng.choice(['x','y','z'],n))})
+        Xt=X.iloc[:30].copy()
+        y=22.0 + 4.0*X['a'].values - 2.5*X['b'].values + rng.normal(0,0.8,n)
+        spec=TaskSpec('','',id_col='id',target='y',task_type='regression',metric='mae')
+        plan=make_plan(X,y,'regression',n_folds=3)
+        r_xgb=fit_xgb(X,y,Xt,plan,spec,ModelConfig(),n_jobs=2,time_limit=60,lr=0.1,depth=4,rounds=120,
+                      objective_override='pseudohuber',name='xgb_ph')
+        self.assertIsNotNone(r_xgb)
+        self.assertLess(r_xgb.score,2.0)  # must not explode with calibrated base_score & huber_slope
+        r_hgb=fit_hgb(X,y,Xt,plan,spec,ModelConfig(),n_jobs=2,time_limit=60,max_iter=120,name='hgb')
+        self.assertIsNotNone(r_hgb)
+        self.assertLess(r_hgb.score,2.0)
+        # Non-negative simplex stack weights (even when a noisy weak model is included)
+        r_bad=FitResult('weak',y+rng.normal(0,8.0,n),np.full(30,22.0),6.0,[],[],None,1.0)
+        sb=stack_blend([r_xgb,r_hgb,r_bad],y,plan.oof_mask,spec,plan=plan)
+        self.assertIsNotNone(sb)
+        self.assertTrue(all(w>=0.0 for w in sb['weights'].values()),f'Negative weight found: {sb["weights"]}')
+        self.assertAlmostEqual(sum(sb['weights'].values()),1.0,places=2)
+
+    def test_interval_join_drops_all_post_factum_columns(self):
+        tr=pd.DataFrame({'event_id':[1,2],'district_id':['d1','d1'],
+                         'timestamp':['2025-01-01 10:30:00','2025-01-01 15:00:00'],'y':[1.,2.]})
+        te=pd.DataFrame({'event_id':[3],'district_id':['d1'],'timestamp':['2025-01-01 11:00:00']})
+        ev=pd.DataFrame({'district_id':['d1'],'start_timestamp':['2025-01-01 10:00:00'],'end_timestamp':['2025-01-01 12:00:00'],
+                         'expected_attendance':[5000],'actual_duration':[125],'final_cost':[999],'outcome_code':[1]})
+        a,_=enrich(tr,te,{'city_events':ev})
+        self.assertIn('city_events__expected_attendance',a.columns)
+        for bad in ('city_events__actual_duration','city_events__final_cost','city_events__outcome_code'):
+            self.assertNotIn(bad,a.columns)
+
 if __name__=='__main__': unittest.main()

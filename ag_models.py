@@ -8,7 +8,7 @@ import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from ag_features import time_periods
-from ag_metrics import fold_scores, score
+from ag_metrics import fold_scores, oof_score, score
 from ag_utils import log, log_exc
 
 
@@ -81,10 +81,13 @@ def lgb_objective(task_type, metric, n_classes, variant=None):
         return {"objective": "binary", "metric": {"roc_auc": "auc", "average_precision": "average_precision"}.get(metric, "binary_logloss")}
     if task_type == "multiclass":
         return {"objective": "multiclass", "num_class": n_classes, "metric": "multi_logloss"}
+    eval_m = "l1" if metric in ("mae", "medae", "smape") else ("mape" if metric == "mape" else "rmse")
     if variant == "huber":
-        return {"objective": "huber", "metric": "rmse"}
+        return {"objective": "huber", "metric": eval_m}
     if variant == "fair":
-        return {"objective": "fair", "metric": "rmse"}
+        return {"objective": "fair", "metric": eval_m}
+    if variant == "l2":
+        return {"objective": "regression", "metric": eval_m}
     if metric in ("mae", "medae", "smape"):
         return {"objective": "l1", "metric": "l1"}
     if metric == "mape":
@@ -284,7 +287,7 @@ def fit_lgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             log(f"{name}: время вышло на фолде {k + 1}/{len(plan.folds)}")
             break
     if predict_test and plan.mode == "refit" and Xt is not None:
-        n_round = refit_rounds(iters[0], plan, len(X))
+        n_round = refit_rounds(iters, plan, len(X))
         guard.deadline = max(guard.deadline, time.time() + max(30.0, 0.3 * time_limit))
         fill = float(np.median(yt)) if use_offset else None
         m = lgb.train(params, lgb.Dataset(X, yt, weight=w, init_score=offset(raw_off, fill) if use_offset else None),
@@ -294,18 +297,23 @@ def fit_lgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     return _finish(name, oof, test, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
 
 
-def refit_rounds(best_iter: int, plan: FoldPlan, n_total: int) -> int:
-    """Итерации модели, дообучаемой на всех периодах (валидация по времени): лучшая итерация последнего фолда,
-    умноженная на рост обучающей выборки (у фолда train — все периоды, кроме последнего). На WiDS с тестом
-    «год 5» и «год 4» множитель-рост лучше прежнего ×1.1: Huber-LightGBM −0.2…−1.0 RMSE."""
+def refit_rounds(best_iters, plan: FoldPlan, n_total: int) -> int:
+    """Итерации модели, дообучаемой на всех периодах: медиана по фолдам, умноженная на рост выборки.
+    На слабосигнальных задачах (медиана <= 5) не раздуваем число деревьев искусственным минимумом 20."""
+    if isinstance(best_iters, (list, tuple, np.ndarray)):
+        vals = [int(v) for v in best_iters if v is not None and v > 0]
+        med = float(np.median(vals)) if vals else 20.0
+    else:
+        med = float(best_iters or 20)
     growth = n_total / max(1, len(plan.folds[0][0]))
-    return int(max(best_iter, 20) * float(np.clip(growth, 1.1, 1.8)))
+    base = med if med <= 5 else max(med, 20.0)
+    return max(1, int(round(base * float(np.clip(growth, 1.1, 1.8)))))
 
 
 def _finish(name, oof, test_parts, plan, spec, y, iters, imps, t0, cfg, cut: bool = False):
     done = ~np.isnan(oof).reshape(len(oof), -1).any(1)
     mask = plan.oof_mask & done
-    s = score(spec.metric, spec.task_type, y[mask], oof[mask]) if mask.any() else float("nan")
+    s = oof_score(spec.metric, spec.task_type, y, oof, plan=plan, mask=mask) if mask.any() else float("nan")
     fs = fold_scores(spec.metric, spec.task_type, y, oof, [f for f in plan.folds if done[f[1]].all()])
     imp = sum(imps) / len(imps) if imps else None
     if isinstance(test_parts, list):
@@ -324,7 +332,8 @@ def _finish(name, oof, test_parts, plan, spec, y, iters, imps, t0, cfg, cut: boo
 
 def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: int, time_limit: float,
             lr: float = 0.06, depth: int = 6, rounds: int = 4000, es: int = 150, seed: int = 0,
-            name: str = "cat", abort_if_slow: bool = True) -> FitResult | None:
+            name: str = "cat", abort_if_slow: bool = True, loss_override: str | None = None,
+            l2_leaf_reg: float | None = None) -> FitResult | None:
     from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 
     t0 = time.time()
@@ -344,14 +353,16 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
     if spec.task_type == "regression":
-        loss = {"mae": "MAE", "medae": "MAE", "smape": "MAE", "mape": "MAPE"}.get(spec.metric, "RMSE")
-        # Huber в CatBoost/XGBoost сходится плохо: для разнообразия смеси они учатся на основной потере
-        model_cls, extra = CatBoostRegressor, {"loss_function": loss, "eval_metric": loss}
+        eval_m = {"mae": "MAE", "medae": "MAE", "smape": "MAE", "mape": "MAPE"}.get(spec.metric, "RMSE")
+        loss = loss_override or eval_m
+        model_cls, extra = CatBoostRegressor, {"loss_function": loss, "eval_metric": eval_m}
     elif spec.task_type == "binary":
         ev = {"roc_auc": "AUC", "average_precision": "PRAUC"}.get(spec.metric, "Logloss")
         model_cls, extra = CatBoostClassifier, {"loss_function": "Logloss", "eval_metric": ev}
     else:
         model_cls, extra = CatBoostClassifier, {"loss_function": "MultiClass", "eval_metric": "MultiClass"}
+    if l2_leaf_reg is not None:
+        extra["l2_leaf_reg"] = float(l2_leaf_reg)
 
     n_parts = len(plan.folds) + (1 if plan.mode == "refit" else 0)
     fold0 = {"deadline": None, "cut": False}
@@ -368,6 +379,8 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
                  verbose=False, allow_writing_files=False, **extra)
         if len(cols) > 100 and spec.task_type != "multiclass":
             p["rsm"] = 0.75
+        if len(cols) > 200 and spec.task_type != "multiclass":
+            p["border_count"] = 128
         if use_es:
             p.update(od_type="Iter", od_wait=es, use_best_model=True)
         return model_cls(**p)
@@ -404,7 +417,7 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
             if k < len(plan.folds) - 1:
                 return _finish(name, oof, None, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
     if plan.mode == "refit" and Xtc is not None:
-        m = make(refit_rounds(iters[0], plan, len(X)), False)
+        m = make(refit_rounds(iters, plan, len(X)), False)
         m.fit(Pool(Xc, yt, cat_features=cats, weight=w))
         test = pred(m, Xtc)
     return _finish(name, oof, test, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
@@ -415,7 +428,7 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
 
 def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
             lr: float = 0.05, depth: int = 7, rounds: int = 5000, es: int = 150, seed: int = 0,
-            name: str = "xgb", abort_if_slow: bool = True) -> FitResult | None:
+            name: str = "xgb", abort_if_slow: bool = True, objective_override: str | None = None) -> FitResult | None:
     import xgboost as xgb
 
     t0 = time.time()
@@ -432,7 +445,15 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
               "lambda": 3.0 if wide else 1.0, "nthread": n_jobs, "seed": seed, "max_cat_to_onehot": 1,
               "max_bin": 256}
     if spec.task_type == "regression":
-        if spec.metric in ("mae", "medae", "smape"):
+        eval_m = "mae" if spec.metric in ("mae", "medae", "smape") else "rmse"
+        if objective_override == "pseudohuber":
+            slope = float(np.std(yt) * 0.5)
+            if not np.isfinite(slope) or slope <= 1e-6:
+                slope = 1.0
+            params.update(objective="reg:pseudohubererror", eval_metric=eval_m, huber_slope=slope)
+        elif objective_override == "l2":
+            params.update(objective="reg:squarederror", eval_metric=eval_m)
+        elif spec.metric in ("mae", "medae", "smape"):
             params.update(objective="reg:absoluteerror", eval_metric="mae")
         else:
             params.update(objective="reg:squarederror", eval_metric="rmse")
@@ -468,8 +489,13 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     iters, imps = [], []
     for k, (tr, va) in enumerate(plan.folds):
         fold0["deadline"] = time.time() + 1.3 * time_limit / n_parts if (abort_if_slow and k == 0) else None
+        p_fold = dict(params)
+        if spec.task_type == "binary":
+            p_fold["base_score"] = float(np.clip(np.average(yt[tr], weights=w[tr]), 1e-4, 1.0 - 1e-4))
+        elif spec.task_type == "regression" and (objective_override == "pseudohuber" or spec.metric in ("mae", "medae", "smape")):
+            p_fold["base_score"] = float(np.median(yt[tr]))
         dtr, dva = dm(X.iloc[tr], yt[tr], w[tr]), dm(X.iloc[va], yt[va], w[va])
-        b = xgb.train(params, dtr, rounds, evals=[(dva, "valid")], early_stopping_rounds=es, verbose_eval=False,
+        b = xgb.train(p_fold, dtr, rounds, evals=[(dva, "valid")], early_stopping_rounds=es, verbose_eval=False,
                       callbacks=[Stopper()])
         if fold0["cut"]:
             log(f"{name}: первый фолд не уложился в {1.3 * time_limit / n_parts:.0f}s — модель пропущена")
@@ -488,8 +514,13 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             if k < len(plan.folds) - 1:
                 return _finish(name, oof, None, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
     if plan.mode == "refit" and dtest is not None:
-        n_round = refit_rounds(iters[0], plan, len(X))
-        b = xgb.train(params, dm(X, yt, w), n_round)
+        n_round = refit_rounds(iters, plan, len(X))
+        p_refit = dict(params)
+        if spec.task_type == "binary":
+            p_refit["base_score"] = float(np.clip(np.average(yt, weights=w), 1e-4, 1.0 - 1e-4))
+        elif spec.task_type == "regression" and (objective_override == "pseudohuber" or spec.metric in ("mae", "medae", "smape")):
+            p_refit["base_score"] = float(np.median(yt))
+        b = xgb.train(p_refit, dm(X, yt, w), n_round)
         test = pred(b, dtest, n_round)
     return _finish(name, oof, test, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
 
@@ -564,7 +595,8 @@ def fit_et(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_l
 
 
 def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
-               kind: str = "ridge", seed: int = 0, name: str | None = None) -> FitResult | None:
+               kind: str = "ridge", seed: int = 0, name: str | None = None,
+               top_cols: list | None = None, max_cols: int = 90) -> FitResult | None:
     """Линейная/аддитивная модель (RidgeCV / LassoCV / HuberRegressor / LogisticRegression):
     быстрое и сильное дополнение к деревьям на гладких зависимостях и в ансамбле."""
     from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
@@ -576,6 +608,15 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
     t0 = time.time()
     name = name or kind
     cols = [c for c in X.columns if c not in set(cfg.drop)]
+    if plan.time_col is not None and spec.task_type == "regression":
+        # Исключаем монотонные координаты времени: линейная модель иначе экстраполирует тренд на будущие периоды
+        non_mono = [c for c in cols if c != plan.time_col and not str(c).endswith(("__ord", "__year"))]
+        if len(non_mono) >= 5:
+            cols = non_mono
+    if top_cols and len(cols) > max_cols:
+        chosen = [c for c in top_cols if c in cols][:max_cols]
+        if len(chosen) >= 10:
+            cols = chosen
     if not cols:
         return None
     n = len(X)
@@ -659,21 +700,130 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
     return _finish(name, oof, test, plan, spec, y, [1] * len(plan.folds), [], t0, cfg)
 
 
-# ---------------------------------------------------------------- Tabular MLP (обучение с нуля на CPU)
+# ---------------------------------------------------------------- HistGradientBoosting & Tabular MLP
+
+
+def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
+            lr: float = 0.05, max_leaf_nodes: int = 31, max_iter: int = 450, seed: int = 0,
+            name: str = "hgb", top_cols: list | None = None, max_cols: int = 160) -> FitResult | None:
+    """HistGradientBoosting (sklearn): быстрый независимый бустинг на CPU, нативная поддержка категорий и L1."""
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+    from ag_metrics import better
+
+    t0 = time.time()
+    cols = [c for c in X.columns if c not in set(cfg.drop)]
+    if top_cols and len(cols) > max_cols:
+        chosen = [c for c in top_cols if c in cols][:max_cols]
+        if len(chosen) >= 15:
+            cols = chosen
+    if not cols:
+        return None
+    X_in = X[cols].copy()
+    Xt_in = Xt[cols].copy() if Xt is not None else None
+    cat_mask = []
+    for c in cols:
+        if isinstance(X_in[c].dtype, pd.CategoricalDtype):
+            if X_in[c].cat.categories.size > 255:
+                X_in[c] = X_in[c].cat.codes.astype("float32")
+                if Xt_in is not None:
+                    Xt_in[c] = Xt_in[c].cat.codes.astype("float32")
+                cat_mask.append(False)
+            else:
+                cat_mask.append(True)
+        elif pd.api.types.is_numeric_dtype(X_in[c]):
+            cat_mask.append(False)
+        else:
+            X_in[c] = pd.factorize(X_in[c])[0].astype("float32")
+            if Xt_in is not None:
+                Xt_in[c] = pd.factorize(Xt_in[c])[0].astype("float32")
+            cat_mask.append(False)
+    n = len(X_in)
+    if n > 100_000:
+        max_iter = min(max_iter, 300)
+    n_classes = len(spec.classes) if spec.task_type != "regression" else 1
+    yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
+    tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
+    w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
+    cats_arg = cat_mask if any(cat_mask) else None
+
+    def make(iters):
+        common = dict(learning_rate=lr, max_leaf_nodes=max_leaf_nodes, max_iter=iters,
+                      min_samples_leaf=30 if n < 100_000 else 80, l2_regularization=1.0,
+                      categorical_features=cats_arg, early_stopping=False, random_state=seed)
+        if spec.task_type == "regression":
+            loss = "absolute_error" if spec.metric in ("mae", "medae", "smape") else "squared_error"
+            return HistGradientBoostingRegressor(loss=loss, **common)
+        return HistGradientBoostingClassifier(**common)
+
+    def pred(m, df):
+        if spec.task_type == "regression":
+            return inverse_target(m.predict(df), cfg.target_transform)
+        p = np.zeros((len(df), n_classes))
+        p[:, m.classes_.astype(int)] = m.predict_proba(df)
+        return p
+
+    shape = (n, n_classes) if spec.task_type != "regression" else (n,)
+    oof = np.full(shape, np.nan)
+    test, iters = [], []
+    for k, (tr, va) in enumerate(plan.folds):
+        if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
+            return None
+        m = make(max_iter)
+        m.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
+        best_it, best_sc, best_p = m.n_iter_, None, None
+        step = max(5, m.n_iter_ // 25)
+        staged = m.staged_predict(X_in.iloc[va]) if spec.task_type == "regression" else m.staged_predict_proba(X_in.iloc[va])
+        for idx_it, sp in enumerate(staged, 1):
+            if idx_it % step != 0 and idx_it != m.n_iter_:
+                continue
+            if spec.task_type == "regression":
+                cand = inverse_target(sp, cfg.target_transform)
+            else:
+                cand = np.zeros((len(va), n_classes))
+                cand[:, m.classes_.astype(int)] = sp
+            sc = score(spec.metric, spec.task_type, y[va], cand)
+            if best_sc is None or better(sc, best_sc, spec.metric):
+                best_sc, best_it, best_p = sc, idx_it, cand
+        iters.append(best_it)
+        oof[va] = best_p if best_p is not None else pred(m, X_in.iloc[va])
+        if plan.mode == "cv" and Xt_in is not None:
+            if best_it >= m.n_iter_:
+                test.append(pred(m, Xt_in))
+            else:
+                m_cv = make(best_it)
+                m_cv.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
+                test.append(pred(m_cv, Xt_in))
+        if k == 0 and _too_slow(t0, plan, time_limit, name):
+            return None
+    if plan.mode == "refit" and Xt_in is not None:
+        n_round = refit_rounds(iters, plan, len(X))
+        m = make(min(max_iter, n_round))
+        m.fit(X_in, yt, sample_weight=w)
+        test = pred(m, Xt_in)
+    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg)
 
 
 def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
-            seed: int = 0, name: str = "mlp") -> FitResult | None:
+            seed: int = 0, name: str = "mlp", top_cols: list | None = None,
+            max_cols: int = 80) -> FitResult | None:
     """Табличная нейросеть MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
     (QuantileTransformer) + OHE категорий, другая индуктивная предвзятость для ансамбля и стекинга."""
     from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
     from sklearn.impute import SimpleImputer
     from sklearn.neural_network import MLPClassifier, MLPRegressor
     from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    from sklearn.preprocessing import OneHotEncoder, QuantileTransformer, StandardScaler
 
     t0 = time.time()
     cols = [c for c in X.columns if c not in set(cfg.drop)]
+    if plan.time_col is not None and spec.task_type == "regression":
+        non_mono = [c for c in cols if c != plan.time_col and not str(c).endswith(("__ord", "__year"))]
+        if len(non_mono) >= 5:
+            cols = non_mono
+    if top_cols and len(cols) > max_cols:
+        chosen = [c for c in top_cols if c in cols][:max_cols]
+        if len(chosen) >= 10:
+            cols = chosen
     n = len(X)
     if not cols or n < 100 or n > 120_000:
         return None
@@ -700,7 +850,8 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         if num_cols:
             tf.append(("num", make_pipeline(
                 SimpleImputer(strategy="median", add_indicator=True),
-                StandardScaler(),
+                QuantileTransformer(n_quantiles=min(500, max(50, n_fit // 10)),
+                                    output_distribution="normal", random_state=seed),
             ), num_cols))
         if cat_cols:
             tf.append(("cat", OneHotEncoder(

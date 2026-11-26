@@ -3,8 +3,8 @@ Connection comes from standard PG* environment variables (never logged).
 """
 import ctypes as C
 import ctypes.util
-import io
 import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -44,13 +44,13 @@ class _PsycopgDatabase:
         )
         text_types = {'text', 'character varying', 'character', 'uuid'}
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
-        buf = io.BytesIO()
-        with self.conn.cursor() as cur:
-            with cur.copy(f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER') as copy:
-                for chunk in copy:
-                    buf.write(chunk)
-        buf.seek(0)
-        return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as buf:
+            with self.conn.cursor() as cur:
+                with cur.copy(f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER') as copy:
+                    for chunk in copy:
+                        buf.write(chunk)
+            buf.seek(0)
+            return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
 
 
 class _LibpqDatabase:
@@ -117,23 +117,23 @@ class _LibpqDatabase:
         ok = res and self.lib.PQresultStatus(res) == 3
         if res: self.lib.PQclear(res)
         if not ok: raise RuntimeError('PostgreSQL table export failed')
-        buf = io.BytesIO()
-        while True:
-            ptr = C.c_void_p()
-            size = self.lib.PQgetCopyData(self.conn, C.byref(ptr), 0)
-            if size == -1: break
-            if size < 0: raise RuntimeError('PostgreSQL export interrupted')
-            try: buf.write(C.string_at(ptr, size))
-            finally: self.lib.PQfreemem(ptr)
-        self.lib.PQgetResult.restype = C.c_void_p
-        self.lib.PQgetResult.argtypes = [C.c_void_p]
-        while True:
-            res = self.lib.PQgetResult(self.conn)
-            if not res: break
-            status = self.lib.PQresultStatus(res); self.lib.PQclear(res)
-            if status != 1: raise RuntimeError('PostgreSQL export did not complete')
-        buf.seek(0)
-        return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as buf:
+            while True:
+                ptr = C.c_void_p()
+                size = self.lib.PQgetCopyData(self.conn, C.byref(ptr), 0)
+                if size == -1: break
+                if size < 0: raise RuntimeError('PostgreSQL export interrupted')
+                try: buf.write(C.string_at(ptr, size))
+                finally: self.lib.PQfreemem(ptr)
+            self.lib.PQgetResult.restype = C.c_void_p
+            self.lib.PQgetResult.argtypes = [C.c_void_p]
+            while True:
+                res = self.lib.PQgetResult(self.conn)
+                if not res: break
+                status = self.lib.PQresultStatus(res); self.lib.PQclear(res)
+                if status != 1: raise RuntimeError('PostgreSQL export did not complete')
+            buf.seek(0)
+            return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
 
 
 def Database():

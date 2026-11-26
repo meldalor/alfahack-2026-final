@@ -27,6 +27,7 @@ METRICS = {
 }
 
 PROBA_METRICS = {m for m, v in METRICS.items() if v[2]}
+RANK_METRICS = {"roc_auc", "average_precision"}
 # метрики по меткам, для которых веса классов/порог подбираются на OOF
 TUNABLE = {"f1_macro", "f1_weighted", "balanced_accuracy", "f1", "mcc", "qwk", "accuracy", "f1_micro"}
 
@@ -194,3 +195,22 @@ def fold_scores(metric, task_type, y, pred, folds, decision=None, sample_weight=
         except Exception:
             out.append(float("nan"))
     return out
+
+
+def oof_score(metric: str, task_type: str, y, pred, plan=None, mask=None, decision=None, sample_weight=None) -> float:
+    """Честная OOF-оценка: для ранжирующих метрик (PR-AUC, ROC-AUC) на нескольких фолдах усредняет пофолдовые
+    оценки, чтобы межфолдовый сдвиг калибровки (особенно на временных сплитах) не искажал рейтинг моделей."""
+    arr = np.asarray(pred, dtype=float)
+    done = ~np.isnan(arr).reshape(len(arr), -1).any(1)
+    if plan is not None and metric in RANK_METRICS and len(getattr(plan, "folds", [])) >= 2:
+        valid_folds = [f for f in plan.folds if done[f[1]].all()]
+        if valid_folds:
+            fs = fold_scores(metric, task_type, y, arr, valid_folds, decision, sample_weight)
+            fin = [v for v in fs if np.isfinite(v)]
+            if fin:
+                return float(np.mean(fin))
+    m = done if mask is None else (np.asarray(mask, bool) & done)
+    if not m.any():
+        return float("nan")
+    sw = None if sample_weight is None else sample_weight[m]
+    return score(metric, task_type, np.asarray(y)[m], arr[m], decision, sw)

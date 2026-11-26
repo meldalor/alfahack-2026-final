@@ -230,6 +230,7 @@ def op_freq(X, Xt, cols):
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
 
 
+
 def op_nan_count(X, Xt):
     return (pd.DataFrame({"row__nan": X.isna().sum(1).astype("float32").values}),
             pd.DataFrame({"row__nan": Xt.isna().sum(1).astype("float32").values}))
@@ -254,6 +255,7 @@ def op_group_dev(X, Xt, pairs):
         out_a[f"{num}__z_by_{cat}"], out_b[f"{num}__z_by_{cat}"] = dev[: len(X)], dev[len(X):]
         out_a[f"{num}__r_by_{cat}"], out_b[f"{num}__r_by_{cat}"] = rat[: len(X)], rat[len(X):]
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
+
 
 
 def _key_hash(df: pd.DataFrame, cols):
@@ -509,6 +511,7 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
 
 
+
 def op_pairwise(X, Xt, cols):
     """Отношения и разности пар важных числовых признаков (часто несут смысл: доли, нормировки)."""
     out_a, out_b = {}, {}
@@ -550,3 +553,70 @@ def op_target_oof(X, Xt, y, cols, folds, n_classes: int = 1, smooth: float = 20.
             out_b[f"{c}__{nm}"] = pd.Series(kb).map(enc).fillna(prior).values.astype("float32")
     return pd.DataFrame(out_a), pd.DataFrame(out_b)
 
+def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generic cross-table sensor outage reconstruction using concurrent non-outage features.
+    Triggered only when temporal joins emitted *__raw_nulls markers. Fit strictly on train non-outage rows (no y).
+    """
+    null_markers = [c for c in X.columns if str(c).endswith("__raw_nulls")]
+    if not null_markers or len(X) < 300 or len(X) > 100_000:
+        return X, Xt
+    try:
+        from sklearn.compose import ColumnTransformer
+        from sklearn.impute import SimpleImputer
+        from sklearn.linear_model import RidgeCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    except Exception:
+        return X, Xt
+    X_out, Xt_out = X.copy(), Xt.copy()
+    cat_set = set(cat_cols)
+    num_all = [c for c in X_out.columns if c not in cat_set and pd.api.types.is_numeric_dtype(X_out[c])]
+    cat_all = [c for c in cat_cols if c in X_out.columns]
+    X_str, Xt_str = X_out.copy(), Xt_out.copy()
+    for c in cat_all:
+        X_str[c] = X_str[c].astype("string").fillna("__missing__").astype(str)
+        Xt_str[c] = Xt_str[c].astype("string").fillna("__missing__").astype(str)
+    reconstructed = 0
+    for nm in null_markers:
+        prefix = nm[:-len("__raw_nulls")] + "__"
+        t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"]
+        other_num = [c for c in num_all if not c.startswith(prefix)]
+        other_cat = [c for c in cat_all if not c.startswith(prefix)]
+        if not t_cols or (not other_num and not other_cat):
+            continue
+        ok_tr = X_out[nm].fillna(0).values == 0
+        bad_tr = ~ok_tr
+        bad_te = Xt_out[nm].fillna(0).values > 0
+        if ok_tr.sum() < 200 or (not bad_tr.any() and not bad_te.any()):
+            continue
+        try:
+            tf = []
+            if other_num:
+                tf.append(("n", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), other_num))
+            if other_cat:
+                tf.append(("c", OneHotEncoder(handle_unknown="ignore", min_frequency=10, max_categories=40, sparse_output=False), other_cat))
+            pre = ColumnTransformer(tf)
+            Z_ok = pre.fit_transform(X_str.loc[ok_tr])
+            Z_btr = pre.transform(X_str.loc[bad_tr]) if bad_tr.any() else None
+            Z_bte = pre.transform(Xt_str.loc[bad_te]) if bad_te.any() else None
+            for tc in t_cols:
+                y_ok = pd.to_numeric(X_out.loc[ok_tr, tc], errors="coerce").values
+                fin = np.isfinite(y_ok)
+                if fin.sum() < 200 or np.nanstd(y_ok[fin]) < 1e-8:
+                    continue
+                reg = RidgeCV(alphas=np.logspace(0, 4, 9)).fit(Z_ok[fin], y_ok[fin])
+                lo, hi = float(np.nanmin(y_ok[fin])), float(np.nanmax(y_ok[fin]))
+                if bad_tr.any():
+                    p = np.clip(reg.predict(Z_btr), lo, hi)
+                    cur = pd.to_numeric(X_out.loc[bad_tr, tc], errors="coerce").values
+                    X_out.loc[bad_tr, tc] = np.where(np.isfinite(cur), 0.7 * p + 0.3 * cur, p).astype("float32")
+                if bad_te.any():
+                    p = np.clip(reg.predict(Z_bte), lo, hi)
+                    cur = pd.to_numeric(Xt_out.loc[bad_te, tc], errors="coerce").values
+                    Xt_out.loc[bad_te, tc] = np.where(np.isfinite(cur), 0.7 * p + 0.3 * cur, p).astype("float32")
+                reconstructed += 1
+        except Exception:
+            log_exc(f"cross_impute {nm}")
+    if reconstructed:
+        log(f"кросс-сенсорная реконструкция сбоев: обновлено {reconstructed} колонок")
+    return X_out, Xt_out

@@ -188,7 +188,7 @@ class FinalTests(unittest.TestCase):
         y_reg=2.5*X['a'].values - 1.5*X['b'].values + 5.0
         spec_r=TaskSpec('','','id','y',task_type='regression',metric='mae')
         plan_r=make_plan(X,y_reg,'regression',n_folds=3)
-        for kind in ('ridge','huber'):
+        for kind in ('ridge','lasso','huber'):
             res=fit_linear(X,y_reg,Xt,plan_r,spec_r,ModelConfig(),n_jobs=2,time_limit=60,kind=kind)
             self.assertIsNotNone(res)
             self.assertLess(res.score,0.2)
@@ -200,5 +200,40 @@ class FinalTests(unittest.TestCase):
         self.assertIsNotNone(res_c)
         self.assertGreater(res_c.score,0.95)
         self.assertEqual(res_c.test.shape,(len(Xt),2))
+
+    def test_one_to_many_static_and_causal_aggregation(self):
+        # Static one-to-many child table (no timestamps)
+        tr=pd.DataFrame({'event_id':[1,2],'user_id':['u1','u2'],'y':[0,1]})
+        te=pd.DataFrame({'event_id':[3],'user_id':['u1']})
+        hist=pd.DataFrame({'user_id':['u1','u1','u2'],'amount':[10.,30.,5.]})
+        a,b=enrich(tr,te,{'orders':hist})
+        self.assertEqual(a.orders__count.tolist(),[2.,1.])
+        self.assertEqual(a.orders__amount__mean.tolist(),[20.,5.])
+        self.assertEqual(b.orders__amount__max.iloc[0],30.)
+        # Causal temporal one-to-many: strictly child_time < event_time (no future leakage)
+        tr2=pd.DataFrame({'event_id':[1,2],'user_id':['u1','u1'],
+                          'timestamp':['2025-01-02 00:00:00','2025-01-04 00:00:00'],'y':[0,1]})
+        te2=pd.DataFrame({'event_id':[3],'user_id':['u1'],'timestamp':['2025-01-05 00:00:00']})
+        tx=pd.DataFrame({'user_id':['u1','u1','u1'],
+                         'timestamp':['2025-01-01 00:00:00','2025-01-03 00:00:00','2025-01-06 00:00:00'],
+                         'amt':[10.,50.,999.]})
+        a2,b2=enrich(tr2,te2,{'tx':tx})
+        self.assertEqual(a2.tx__hist_count.tolist(),[1.,2.])
+        self.assertEqual(a2.tx__amt__hist_mean.tolist(),[10.,30.])
+        self.assertEqual(b2.tx__amt__hist_max.iloc[0],50.)  # future 999.0 at Jan 06 excluded!
+
+    def test_cross_impute_outages(self):
+        from ag_features import cross_impute_outages
+        rng=np.random.default_rng(7)
+        n=400
+        z=rng.normal(size=n)
+        X=pd.DataFrame({'a__x':(2.0*z+1.0).astype('float32'),'a__raw_nulls':np.zeros(n,dtype='float32'),
+                        'b__z':z.astype('float32')})
+        Xt=pd.DataFrame({'a__x':np.array([0.0,0.0],dtype='float32'),'a__raw_nulls':np.array([1.0,0.0],dtype='float32'),
+                         'b__z':np.array([1.5,1.5],dtype='float32')})
+        X2,Xt2=cross_impute_outages(X,Xt,[])
+        # Row 0 in Xt has raw_nulls=1 -> reconstructed toward 0.7*(2*1.5+1)+0.3*0 = 2.8; row 1 untouched (0.0)
+        self.assertGreater(Xt2.a__x.iloc[0],2.5)
+        self.assertEqual(Xt2.a__x.iloc[1],0.0)
 
 if __name__=='__main__': unittest.main()

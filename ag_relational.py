@@ -115,6 +115,89 @@ def _interval_join(left, dim, name, targets):
     return out
 
 
+def _aggregate_child(left, dim, name, targets):
+    """Generic one-to-many child table aggregation (causal prefix-sum if timed, static groupby otherwise)."""
+    if len(dim) == 0 or len(dim) > 2_000_000:
+        return None
+    l_id_cols = [c for c in left.columns if c in dim.columns and c not in targets
+                 and (c.lower().endswith('_id') or c.lower() == 'id')
+                 and not (c.lower() == 'event_id' and left[c].nunique() > 0.9 * len(left))]
+    if not l_id_cols:
+        return None
+    # Pick the shared ID column with highest non-zero overlap and reasonable cardinality.
+    best_key, best_cov = None, 0.0
+    for c in l_id_cols:
+        lvals = set(left[c].dropna().unique())
+        if not lvals:
+            continue
+        cov = float(dim[c].isin(lvals).mean())
+        if cov > best_cov and cov >= 0.05:
+            best_key, best_cov = c, cov
+    if best_key is None:
+        return None
+    d_times = [c for c in dim.columns if c.lower() in TIME_NAMES]
+    l_times = [c for c in left.columns if c.lower() in TIME_NAMES]
+    num_cols = [c for c in dim.columns if c != best_key and c not in targets and c not in d_times
+                and not c.lower().endswith('_id') and c.lower() != 'id'
+                and pd.api.types.is_numeric_dtype(dim[c])][:8]
+    cat_cols = [c for c in dim.columns if c != best_key and c not in targets and c not in d_times
+                and c not in num_cols and not c.lower().endswith('_id') and c.lower() != 'id'
+                and 2 <= dim[c].nunique(dropna=True) <= 200][:4]
+    if d_times:
+        if len(d_times) != 1 or len(l_times) != 1:
+            return None  # Timed child table without matching event clock: skip to prevent future leakage.
+        dtc, ltc = d_times[0], l_times[0]
+        dt = pd.to_datetime(dim[dtc], errors='coerce', utc=True)
+        lt = pd.to_datetime(left[ltc], errors='coerce', utc=True)
+        if dt.notna().mean() < 0.9 or lt.notna().mean() < 0.9:
+            return None
+        b = dim[[best_key] + num_cols].copy()
+        b['__t__'] = dt
+        b = b.dropna(subset=[best_key, '__t__']).sort_values([best_key, '__t__']).reset_index(drop=True)
+        if b.empty:
+            return None
+        pref = pd.DataFrame({best_key: b[best_key], '__t__': b['__t__']})
+        g = b.groupby(best_key, sort=False)
+        cnt = g.cumcount() + 1
+        pref[f'{name}__hist_count'] = cnt.astype('float32')
+        for c in num_cols:
+            v = b[c].astype('float64')
+            n_ok = v.notna().groupby(b[best_key], sort=False).cumsum()
+            csum = v.fillna(0.0).groupby(b[best_key], sort=False).cumsum()
+            pref[f'{name}__{c}__hist_mean'] = (csum / n_ok.replace(0, np.nan)).astype('float32')
+            pref[f'{name}__{c}__hist_last'] = v.groupby(b[best_key], sort=False).ffill().astype('float32')
+            pref[f'{name}__{c}__hist_max'] = v.groupby(b[best_key], sort=False).cummax().astype('float32')
+        # Keep latest state per (key, timestamp) so merge_asof is unambiguous.
+        pref = pref.drop_duplicates(subset=[best_key, '__t__'], keep='last').sort_values('__t__')
+        a = pd.DataFrame({best_key: left[best_key], '__t__': lt, '__row__': np.arange(len(left))})
+        valid = a[best_key].notna() & a['__t__'].notna()
+        aok = a.loc[valid].sort_values('__t__')
+        j = pd.merge_asof(aok, pref, on='__t__', by=best_key, direction='backward', allow_exact_matches=False)
+        out = pd.concat([j, a.loc[~valid]], ignore_index=True).sort_values('__row__').reset_index(drop=True)
+        feat_cols = [c for c in pref.columns if c not in (best_key, '__t__')]
+        out[f'{name}__hist_count'] = out[f'{name}__hist_count'].fillna(0).astype('float32')
+        if (out[f'{name}__hist_count'] > 0).mean() == 0:
+            return None
+        return out[feat_cols], best_key, 'causal'
+    # Static one-to-many table (no timestamps): safe groupby aggregation.
+    g = dim.dropna(subset=[best_key]).groupby(best_key, sort=False)
+    agg = pd.DataFrame(index=g.size().index)
+    agg[f'{name}__count'] = g.size().astype('float32')
+    for c in num_cols:
+        agg[f'{name}__{c}__mean'] = g[c].mean().astype('float32')
+        agg[f'{name}__{c}__std'] = g[c].std().astype('float32')
+        agg[f'{name}__{c}__min'] = g[c].min().astype('float32')
+        agg[f'{name}__{c}__max'] = g[c].max().astype('float32')
+    for c in cat_cols:
+        agg[f'{name}__{c}__nunique'] = g[c].nunique().astype('float32')
+    merged = left[[best_key]].merge(agg, left_on=best_key, right_index=True, how='left', sort=False)
+    feat_cols = list(agg.columns)
+    if merged[f'{name}__count'].notna().mean() == 0:
+        return None
+    merged[f'{name}__count'] = merged[f'{name}__count'].fillna(0).astype('float32')
+    return merged[feat_cols].reset_index(drop=True), best_key, 'static'
+
+
 def enrich(train, test, tables):
     targets = set(train) - set(test)
     n = len(train)
@@ -151,6 +234,13 @@ def enrich(train, test, tables):
                     log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
                     del remaining[name]; changed = True
                     continue
+                ag = _aggregate_child(combined, dim, name, targets)
+                if ag is not None:
+                    feats_df, akey, amode = ag
+                    combined = pd.concat([combined, feats_df], axis=1)
+                    log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
+                    del remaining[name]; changed = True
+                    continue
                 log(f'join skipped {name}: shared names but no matching key values')
                 del remaining[name]
                 continue
@@ -166,6 +256,13 @@ def enrich(train, test, tables):
             combined = pd.concat([combined, iv], axis=1)
             cov = float((iv[f'{name}__active_count'] > 0).mean())
             log(f'join {name}: interval lookup, active_rate={cov:.4f}, features={iv.shape[1]}')
+            del remaining[name]
+    for name in list(remaining):
+        ag = _aggregate_child(combined, remaining[name], name, targets)
+        if ag is not None:
+            feats_df, akey, amode = ag
+            combined = pd.concat([combined, feats_df], axis=1)
+            log(f'join {name}: one-to-many ({amode}) on {akey}, features={feats_df.shape[1]}')
             del remaining[name]
     for name in remaining:
         log(f'join skipped {name}: no unambiguous unique shared key')

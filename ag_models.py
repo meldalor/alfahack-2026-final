@@ -40,13 +40,14 @@ def make_plan(X: pd.DataFrame, y: np.ndarray, task_type: str, time_col=None, n_f
         per = time_periods(X[time_col])
         uniq = np.sort(per.dropna().unique())
         folds = []
+        max_time_folds = 3 if n <= 50_000 else 2
         for p in uniq[::-1]:
             tr = np.where(per.values < p)[0]
             va = np.where(per.values == p)[0]
             if len(tr) < 0.25 * n or len(va) < 50:
                 continue
             folds.append((tr, va))
-            if len(folds) == 2:
+            if len(folds) == max_time_folds:
                 break
         if folds:
             mask = np.zeros(n, bool)
@@ -537,11 +538,11 @@ def fit_et(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_l
 
 def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
                kind: str = "ridge", seed: int = 0, name: str | None = None) -> FitResult | None:
-    """Линейная/аддитивная модель (RidgeCV / HuberRegressor / LogisticRegression):
+    """Линейная/аддитивная модель (RidgeCV / LassoCV / HuberRegressor / LogisticRegression):
     быстрое и сильное дополнение к деревьям на гладких зависимостях и в ансамбле."""
     from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
     from sklearn.impute import SimpleImputer
-    from sklearn.linear_model import HuberRegressor, LogisticRegression, RidgeCV
+    from sklearn.linear_model import HuberRegressor, LassoCV, LogisticRegression, RidgeCV
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -551,8 +552,8 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
     if not cols:
         return None
     n = len(X)
-    if kind == "huber" and n > 100_000:
-        return None  # плотный L-BFGS Huber на >100k строк медленный
+    if kind in ("huber", "lasso") and n > 100_000:
+        return None  # плотный L-BFGS / coordinate descent на >100k строк медленный
     cat_cols = [c for c in cols if isinstance(X[c].dtype, pd.CategoricalDtype) or X[c].dtype == object or str(X[c].dtype) == "string"]
     num_cols = [c for c in cols if c not in cat_cols]
     X_in = X[cols].copy()
@@ -570,7 +571,9 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
-    dense = (kind == "huber")
+    dense = kind in ("huber", "lasso")
+    y_lo = float(np.nanmin(y)) if spec.task_type == "regression" else None
+    y_hi = float(np.nanmax(y)) if spec.task_type == "regression" else None
 
     def build_model():
         transformers = []
@@ -586,11 +589,13 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
         pre = ColumnTransformer(transformers, sparse_threshold=0.0 if dense else 0.3)
         if spec.task_type == "regression":
             if kind == "huber":
-                reg = HuberRegressor(alpha=1.0, epsilon=1.35, max_iter=1500, tol=1e-4)
+                reg = HuberRegressor(alpha=10.0, epsilon=1.2, max_iter=1500, tol=1e-4)
+            elif kind == "lasso":
+                reg = LassoCV(cv=5, max_iter=3000, random_state=seed, n_jobs=min(n_jobs, 4))
             else:
                 reg = RidgeCV(alphas=np.logspace(-1, 4, 11))
             return make_pipeline(pre, TransformedTargetRegressor(regressor=reg, transformer=StandardScaler()))
-        clf = LogisticRegression(C=0.2, max_iter=300, solver="lbfgs")
+        clf = LogisticRegression(C=0.1, max_iter=120, tol=1e-3, solver="lbfgs")
         return make_pipeline(pre, clf)
 
     def fit_one(df_tr, y_tr, w_tr):
@@ -604,7 +609,8 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
 
     def pred(m, df):
         if spec.task_type == "regression":
-            return inverse_target(m.predict(df), cfg.target_transform)
+            p = inverse_target(m.predict(df), cfg.target_transform)
+            return np.clip(p, y_lo, y_hi)
         p = np.zeros((len(df), n_classes))
         clf = m.steps[-1][1]
         p[:, clf.classes_.astype(int)] = m.predict_proba(df)

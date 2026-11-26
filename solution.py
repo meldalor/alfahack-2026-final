@@ -23,7 +23,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from ag_ensemble import LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification  # noqa: E402
-from ag_features import detect_time_split, entity_periods, op_entity_history, prepare  # noqa: E402
+from ag_features import cross_impute_outages, detect_time_split, entity_periods, op_entity_history, prepare  # noqa: E402
 from ag_llm import LLM  # noqa: E402
 from ag_metrics import PROBA_METRICS, TUNABLE, better, decide, direction, score  # noqa: E402
 from ag_models import (FitResult, ModelConfig, adversarial_scores, fit_cat, fit_et, fit_lgb, fit_linear, fit_xgb,  # noqa: E402
@@ -278,6 +278,7 @@ def solve_target(spec, train, test, llm, hints, budget, writer, work):
 
     # 2. признаки и схема валидации
     prep = prepare(train, test, spec)
+    prep.X, prep.Xt = cross_impute_outages(prep.X, prep.Xt, prep.cat_cols)
     y = prep.y
     log(f"признаков {prep.X.shape[1]}, категориальных {len(prep.cat_cols)}, текстовых {len(prep.text_cols)}")
     time_col = detect_time_split(prep.X, prep.Xt, prep.cat_cols)
@@ -592,13 +593,49 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             log(f"lgb_fast: {spec.metric}={r.score:.5f} за {r.seconds:.0f}s")
             results.append(r)
             publish("lgb_fast")
-    # 4.1в регрессия с историей объекта: модель-поправка к прошлому значению (ошибается иначе — полезна в смеси)
+
+    # 4.2 Разнообразие семейств: сначала быстрые линейные (на чистых признаках), затем XGBoost, ExtraTrees, CatBoost
+    rich_cats = [c for c in prep.cat_cols if c in X.columns and X[c].nunique() >= 30]  # флаги и короткие списки не в счёт
+    late_cat = spec.task_type == "multiclass" and len(spec.classes) > 3 and len(rich_cats) < 3
+    cat_kw = {"cat_cols": prep.cat_cols, "depth": 6,
+              "lr": 0.12 if (big or (spec.task_type == "multiclass" and len(spec.classes) > 3)) else 0.06}
+    cfg_x = cfg
+    if spec.task_type == "regression" and cfg.target_transform == "log1p" and spec.metric in ("rmse", "mse", "r2"):
+        cfg_x = ModelConfig(**{**cfg.to_dict(), "target_transform": "none"})
+
+    def fit_extra(name, fn, kw, min_need=None, use_clean=False):
+        need = (eval_t * 3 + 60) if min_need is None else min_need
+        if left() < need:
+            log(f"{name}: пропуск, мало времени ({left():.0f}s)")
+            return
+        lim = max(30.0 if min_need is not None else 60.0, left() * 0.45)
+        kwargs = dict(kw)
+        Xf, Xtf = (prep.X, prep.Xt) if use_clean else (X, Xt)
+        cf = ModelConfig(**{**cfg_x.to_dict(), "drop": []}) if use_clean else cfg_x
+        if name == "cat":
+            r = safe_fit(fn, Xf, y, Xtf, plan, spec, cf, kwargs.pop("cat_cols"), N_JOBS, lim, name=name, **kwargs)
+        else:
+            r = safe_fit(fn, Xf, y, Xtf, plan, spec, cf, N_JOBS, lim, name=name, **kwargs)
+        if r is not None and r.test is not None:
+            log(f"{name}: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
+            results.append(r)
+            publish(name)
+
+    if spec.task_type == "regression":
+        fit_extra("ridge", fit_linear, {"kind": "ridge"}, min_need=20.0, use_clean=True)
+        fit_extra("lasso", fit_linear, {"kind": "lasso"}, min_need=25.0, use_clean=True)
+        fit_extra("huber", fit_linear, {"kind": "huber"}, min_need=25.0, use_clean=True)
+    else:
+        fit_extra("logreg", fit_linear, {"kind": "logreg"}, min_need=25.0, use_clean=True)
+    fit_extra("xgb", fit_xgb, {"lr": 0.05 if not big else 0.1, "depth": 7})
+    fit_extra("et", fit_et, {})
+    if not late_cat:
+        fit_extra("cat", fit_cat, cat_kw)
+
+    # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
     hist_cols = [c for c in X.columns if c.startswith("hist__last")] if spec.task_type == "regression" else []
     offsets = [(f"lgb_offset{j}", oc, X, Xt) for j, oc in enumerate(hist_cols[:2])]
     if hist_cols and plan.time_col:
-        # поправки и к истории ключей, которые исследование отклонило с небольшим проигрышем: принятие ключа зависит
-        # от пути исследования (на WiDS ключ «площадь + год + тип + штат + класс» то принимался, то нет — смесь
-        # 33.14 против 33.46), а смесь сама решит по OOF, нужна ли поправка
         for key in extra_entity_keys(researcher, 3 - len(offsets)):
             key = [c for c in key if c in prep.X.columns and c != plan.time_col]
             if not key:
@@ -608,7 +645,6 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 ha, hb = op_entity_history(prep.X, prep.Xt, y, key, plan.time_col, t_tr, t_te)
                 tag = f"__k{len(offsets)}"
                 ha, hb = ha.add_suffix(tag).reset_index(drop=True), hb.add_suffix(tag).reset_index(drop=True)
-                # своё семейство: слабая поправка не размывает среднее поправок к принятым ключам
                 offsets.append((f"lgb_xoffset{len(offsets)}", "hist__last" + tag, pd.concat([X, ha], axis=1),
                                 pd.concat([Xt, hb], axis=1)))
                 log(f"поправка и к истории по ключу {key} (в исследовании не принят)")
@@ -618,50 +654,14 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         if left() < eval_t * 3 + 60:
             break
         for sd in (0, 1):
+            if left() < eval_t * 3 + 60:
+                break
             r = safe_fit(fit_lgb, Xo, y, Xto, plan, spec, cfg, N_JOBS, max(60.0, left() * 0.25), lr=lr_main, es=200,
                          seed=sd, name=f"{nm}_s{sd}", offset_col=oc)
             if r is not None and r.test is not None:
                 log(f"{r.name} (поправка к {oc}): {spec.metric}={r.score:.5f} за {r.seconds:.0f}s")
                 results.append(r)
                 publish(r.name)
-    # 4.2 XGBoost, ExtraTrees и CatBoost для разнообразия смеси, если есть время
-    # XGBoost первым: быстрее CatBoost и чаще входит в смесь. CatBoost в мультиклассе с немногими категориями
-    # идёт до получаса и бывает слабее остальных (UNSW-NB15: худший под долями теста) — тогда он после сидов
-    rich_cats = [c for c in prep.cat_cols if c in X.columns and X[c].nunique() >= 30]  # флаги и короткие списки не в счёт
-    late_cat = spec.task_type == "multiclass" and len(spec.classes) > 3 and len(rich_cats) < 3
-    cat_kw = {"cat_cols": prep.cat_cols, "depth": 6,
-              "lr": 0.12 if (big or (spec.task_type == "multiclass" and len(spec.classes) > 3)) else 0.06}
-    # log1p исследование подбирает для LightGBM; при метрике на исходной шкале XGBoost, ExtraTrees и CatBoost
-    # учатся на исходном таргете: на WiDS с log1p XGBoost 35.70 против 35.19 (6 сидов), смесь 33.71 против 33.58
-    cfg_x = cfg
-    if spec.task_type == "regression" and cfg.target_transform == "log1p" and spec.metric in ("rmse", "mse", "r2"):
-        cfg_x = ModelConfig(**{**cfg.to_dict(), "target_transform": "none"})
-
-    def fit_extra(name, fn, kw, min_need=None):
-        need = (eval_t * 3 + 60) if min_need is None else min_need
-        if left() < need:
-            log(f"{name}: пропуск, мало времени ({left():.0f}s)")
-            return
-        lim = max(30.0 if min_need is not None else 60.0, left() * 0.45)
-        kwargs = dict(kw)
-        if name == "cat":
-            r = safe_fit(fn, X, y, Xt, plan, spec, cfg_x, kwargs.pop("cat_cols"), N_JOBS, lim, name=name, **kwargs)
-        else:
-            r = safe_fit(fn, X, y, Xt, plan, spec, cfg_x, N_JOBS, lim, name=name, **kwargs)
-        if r is not None and r.test is not None:
-            log(f"{name}: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
-            results.append(r)
-            publish(name)
-
-    if spec.task_type == "regression":
-        fit_extra("ridge", fit_linear, {"kind": "ridge"}, min_need=20.0)
-        fit_extra("huber", fit_linear, {"kind": "huber"}, min_need=25.0)
-    else:
-        fit_extra("logreg", fit_linear, {"kind": "logreg"}, min_need=25.0)
-    fit_extra("xgb", fit_xgb, {"lr": 0.05 if not big else 0.1, "depth": 7})
-    fit_extra("et", fit_et, {})
-    if not late_cat:
-        fit_extra("cat", fit_cat, cat_kw)
     # 4.3 ещё сиды, пока есть время: сиды одного семейства усредняются до смешивания (см. publish),
     # поэтому каждый новый сид уменьшает разброс модели, а не добавляет шанс случайно удачного сида
     def lgb_seed(k):

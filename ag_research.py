@@ -20,7 +20,7 @@ import pandas as pd
 
 from ag_features import (entity_key_candidates, entity_lag_cols, entity_periods, op_dup_count, op_entity_history,
                          op_entity_lags, op_freq, op_group_dev, op_nan_count, op_pairwise, op_target_oof, op_text_oof)
-from ag_metrics import PROBA_METRICS, TUNABLE, direction, fold_scores, gain, optimize_decision, score
+from ag_metrics import PROBA_METRICS, RANK_METRICS, TUNABLE, direction, fold_scores, gain, oof_score, optimize_decision, score
 from ag_llm import extract_code_blocks, extract_json
 from ag_models import ModelConfig, fit_lgb, make_plan, subset_plan
 from ag_utils import elapsed, log, log_exc, python_exe, save_json, short
@@ -171,8 +171,7 @@ class Researcher:
                 if r.test is not None and all(x.test is not None for x in runs):
                     r.test = sum(x.test for x in runs) / len(runs)
                 r.importance = sum(x.importance for x in runs) / len(runs)
-                m = self.eplan.oof_mask
-                r.score = score(self.spec.metric, self.spec.task_type, self.ey[m], r.oof[m])
+                r.score = oof_score(self.spec.metric, self.spec.task_type, self.ey, r.oof, self.eplan)
                 r.fold_scores = fold_scores(self.spec.metric, self.spec.task_type, self.ey, r.oof, self.eplan.folds)
         dt = time.time() - t0
         self.eval_times.append(dt)
@@ -239,7 +238,7 @@ class Researcher:
             self.add({"kind": "class_weight", "args": {"power": 0.5}, "title": "веса классов (обратная частота)^0.5",
                       "source": "builtin"})
         if spec.task_type == "regression":
-            if spec.metric in ("rmse", "mse", "r2"):
+            if spec.metric in ("rmse", "mse", "r2", "mae", "medae", "smape"):
                 self.add({"kind": "objective", "args": {"variant": "huber"}, "title": "Huber-потеря против выбросов",
                           "source": "builtin"})
             yy = self.y
@@ -257,21 +256,22 @@ class Researcher:
         if hc:
             self.add({"kind": "target_oof", "args": {"cols": hc}, "title": "кодирование категорий с сотнями значений "
                       "таргетом по чужим фолдам", "source": "builtin"})
-        vf = self.value_freq_cols()
-        if vf:
-            # частота точного значения: типовые значения (стандартные размеры пакетов, площади) повторяются,
-            # случайные — нет; на UNSW-NB15 это разделяет «нормальный» трафик и фаззинг (+0.01 macro-F1)
-            self.add({"kind": "freq", "args": {"cols": vf}, "title": "частота точного значения числовых признаков (train+test)",
-                      "source": "builtin"})
+        if not self.plan.time_col:
+            vf = self.value_freq_cols()
+            if vf:
+                # частота точного значения: только на невременных задачах (на временных сплитах train+test утекает)
+                self.add({"kind": "freq", "args": {"cols": vf}, "title": "частота точного значения числовых признаков",
+                          "source": "builtin"})
         if X.isna().any().any():
             self.add({"kind": "nan_count", "args": {}, "title": "число пропусков в строке", "source": "builtin"})
-        try:
-            sample = X.sample(min(len(X), 50000), random_state=0)
-            if sample.duplicated().mean() > 0.01:
-                self.add({"kind": "dup_count", "args": {}, "title": "число полных дублей строки (train+test)",
-                          "source": "builtin"})
-        except Exception:
-            pass
+        if not self.plan.time_col:
+            try:
+                sample = X.sample(min(len(X), 50000), random_state=0)
+                if sample.duplicated().mean() > 0.01:
+                    self.add({"kind": "dup_count", "args": {}, "title": "число полных дублей строки",
+                              "source": "builtin"})
+            except Exception:
+                pass
         self.add({"kind": "group_dev", "args": {}, "title": "отклонение числовых признаков от среднего по категории",
                   "source": "builtin"})
         self.add({"kind": "pairwise", "args": {}, "title": "отношения и разности пар важных числовых признаков",
@@ -327,7 +327,11 @@ class Researcher:
             return op_text_oof(raw, yy, self.spec.task_type, n_classes, self.n_jobs, periods=periods), None
         if kind == "freq":
             cols = [c for c in args.get("cols", []) if c in X.columns]
-            return (op_freq(X, Xt, cols), None) if cols else (None, None)
+            if self.plan.time_col:
+                # On temporal splits only train-only categorical frequencies are safe from future count leakage
+                cat_set = set(self.prep.cat_cols)
+                cols = [c for c in cols if c in cat_set]
+            return (op_freq(X, Xt, cols, train_only=bool(self.plan.time_col)), None) if cols else (None, None)
         if kind == "target_oof":
             cols = [c for c in args.get("cols", []) if c in X.columns]
             if not cols or self.plan.time_col:
@@ -337,12 +341,14 @@ class Researcher:
         if kind == "nan_count":
             return op_nan_count(X, Xt), None
         if kind == "dup_count":
-            return op_dup_count(X, Xt), None
+            if self.plan.time_col:
+                return None, None
+            return op_dup_count(X, Xt, train_only=False), None
         if kind == "group_dev":
             pairs = args.get("pairs") or self.auto_pairs()
             pairs = [(a, b) for a, b in pairs if a in X.columns and b in X.columns and a != b
                      and pd.api.types.is_numeric_dtype(X[b])]
-            return (op_group_dev(X, Xt, pairs[:12]), None) if pairs else (None, None)
+            return (op_group_dev(X, Xt, pairs[:12], train_only=bool(self.plan.time_col)), None) if pairs else (None, None)
         if kind == "pairwise":
             cols = args.get("cols") or self.top_numeric(5)
             cols = [c for c in cols if c in X.columns and pd.api.types.is_numeric_dtype(X[c])]
@@ -357,7 +363,7 @@ class Researcher:
             return None, cfg
         if kind == "objective" and self.spec.task_type == "regression":
             v = args.get("variant")
-            cfg.objective_variant = v if v in ("huber", "fair") else None
+            cfg.objective_variant = v if v in ("huber", "fair", "l2") else None
             if args.get("alpha"):
                 try:
                     cfg.huber_alpha = float(args["alpha"])
@@ -735,7 +741,7 @@ Rows: train={len(self.prep.X)}, test={len(self.prep.Xt)}. Validation: {self.plan
 Columns (sorted by importance in the current best model):
 {chr(10).join(rows)}
 Categorical columns: {cat_list}
-Already accepted engineered features: {accepted_feats}
+Already accepted engineered features (computed separately, NOT in train/test passed to make_features): {accepted_feats}
 Current config: {json.dumps(self.cfg.to_dict(), default=str)[:600]}
 Current best {spec.metric}: {self.best_score}
 Error analysis of the current best model:
@@ -745,12 +751,12 @@ Experiment journal (latest last):
 {chr(10).join(hist)}
 
 Propose up to {n} NEW hypotheses that were not tried yet. Allowed action types (use exactly these JSON shapes):
-- {{"type":"custom_features","code":"BLOCK_1"}}  the referenced python block must define make_features(train, test) that takes two pandas DataFrames with the feature columns listed above (no target!) and returns (new_train_df, new_test_df) containing ONLY new numeric columns, same row order. Categorical columns have pandas "category" dtype (convert with .astype(str) or .cat.codes before arithmetic). pandas as pd and numpy as np are available; no other imports needed. Row-wise formulas, ratios, differences, aggregates across related columns, group statistics computed on concatenated train+test are good ideas. Keep it vectorized and fast.
+- {{"type":"custom_features","code":"BLOCK_1"}}  the referenced python block must define make_features(train, test) that takes two pandas DataFrames with ONLY the base Columns listed above (no target, no already-accepted engineered features!) and returns (new_train_df, new_test_df) containing ONLY new numeric columns, same row order. Categorical columns have pandas "category" dtype (convert with .astype(str) or .cat.codes before arithmetic). pandas as pd and numpy as np are available; no other imports needed. Row-wise formulas, nonlinear interactions (combining event context, stream__*, nc__* nowcasts, __fcst, lags), ratios, differences, aggregates across related columns are good ideas. {'IMPORTANT: this is a chronological time split — NEVER use future rows or test statistics (NO concat(train, test) groupby/value_counts/quantiles, NO negative shifts, NO future lookahead)! Any group stats must be fit strictly on train and mapped to test, or computed strictly causally (< t).' if self.plan.time_col else 'Group statistics on categories are also fine.'} Keep it vectorized and fast.
 - {{"type":"params","params":{{lightgbm params: num_leaves, min_child_samples, feature_fraction, bagging_fraction, lambda_l1, lambda_l2, max_depth, min_split_gain, max_bin, path_smooth, cat_smooth, extra_trees}}}}
 - {{"type":"drop_features","columns":[...]}}
 - {{"type":"frequency_encoding","columns":[...]}}
 - {{"type":"group_deviation","pairs":[["<categorical>","<numeric>"],...]}}
-{'- {"type":"objective","objective":"l2|huber|fair"}  and  {"type":"target_transform","transform":"none|log1p"}' if spec.task_type == 'regression' else '- {"type":"class_weight","power":0.0-1.5}'}
+{'- {"type":"objective","objective":"l1|l2|huber|fair"}  and  {"type":"target_transform","transform":"none|log1p"}' if spec.task_type == 'regression' else '- {"type":"class_weight","power":0.0-1.5}'}
 {'- {"type":"entity_history","key_columns":[...]}  (target history of the same object in previous periods)' + chr(10) + '- {"type":"recency_weight","strength":0-3}' if self.plan.time_col else ''}
 Return: {{"analysis":"<2-4 sentences: what limits the model now>","hypotheses":[{{"title":"<short>","rationale":"<why>","action":{{...}}}}]}}
 For custom_features put the code itself in a separate ```python fenced block AFTER the JSON and write "code":"BLOCK_1" (BLOCK_2 for the second such hypothesis, and so on)."""
@@ -814,8 +820,8 @@ For custom_features put the code itself in a separate ```python fenced block AFT
             pairs = [tuple(map(str, p[:2])) for p in act["pairs"] if isinstance(p, (list, tuple)) and len(p) >= 2]
             return {**base, "kind": "group_dev", "args": {"pairs": pairs[:12]}} if pairs else None
         if t == "objective":
-            v = str(act.get("objective", "l2")).lower()
-            return {**base, "kind": "objective", "args": {"variant": v if v in ("huber", "fair") else None}}
+            v = str(act.get("objective", "default")).lower()
+            return {**base, "kind": "objective", "args": {"variant": v if v in ("huber", "fair", "l2") else None}}
         if t == "target_transform":
             return {**base, "kind": "target_transform", "args": {"how": str(act.get("transform", "none")).lower()}}
         if t == "class_weight":

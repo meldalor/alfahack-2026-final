@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-PROBE_ANCHOR = "def solve_target(spec, train, test, llm, hints, budget, writer, work):\n    global N_JOBS\n"
+PROBE_ANCHOR = "def solve_target(spec, train, test, llm, hints, budget, writer, work, rel_meta=None):\n    global N_JOBS\n"
 PROBE_PATCH = ('    if spec.task_type == "regression":\n'
                '        log("ДИАГНОСТИКА: регрессия намеренно оставлена константой")\n'
                '        return\n')

@@ -1,10 +1,12 @@
 """Schema-driven joins: unique dimensions, bounded temporal lookup, intervals, and causal one-to-many."""
 import itertools
+import re
 import numpy as np
 import pandas as pd
 from ag_utils import log, log_exc
 
 TIME_NAMES = {'timestamp', 'date', 'datetime', 'time', 'event_time', 'created_at', 'updated_at', 'recorded_at', 'ts', 'dt'}
+POST_FACTUM_RE = re.compile(r'(?:^|_)(?:actual|final|realized|outcome|result|resolved)(?:_|$)', re.I)
 
 
 def _is_time_col(name: str, series: pd.Series | None = None) -> bool:
@@ -83,7 +85,7 @@ def _keys(dim, common):
     return None, None, 0
 
 
-def _temporal_join(left, right, keys, marker):
+def _temporal_join(left, right, keys, marker, panels_out=None, table_name=None):
     times = [c for c in keys if _is_time_col(c, right[c])]
     if len(times) != 1:
         return None
@@ -125,6 +127,23 @@ def _temporal_join(left, right, keys, marker):
             b[fill_cols] = b.groupby(groups, sort=False)[fill_cols].ffill(limit=6)
         else:
             b[fill_cols] = b[fill_cols].ffill(limit=6)
+    # Export strictly-past regular panel snapshot for causal 1-step-ahead nowcaster (before shifting key by +cadence)
+    if isinstance(panels_out, list) and base_num and len(b) >= 4000:
+        slot_col = '__ag_slot__'
+        pcols = base_num[:16]
+        pdf = b[groups + [key] + pcols].copy()
+        pdf = pdf.rename(columns={key: slot_col})
+        for c in pcols:
+            pdf[c] = pdf[c].astype('float32')
+        panels_out.append({
+            'name': table_name or marker[:-len('__matched')],
+            'df': pdf,
+            'groups': list(groups),
+            'slot_col': slot_col,
+            'cadence': cadence,
+            'num_cols': list(pcols),
+            'time_col': tc,
+        })
     # Causal temporal dynamics from strictly completed past observations (all shifts >= 1, strictly <= rt <= ev - cadence).
     n_groups = int(b.groupby(groups, dropna=False).ngroups) if groups else 1
     per_grp = len(b) / max(n_groups, 1)
@@ -134,6 +153,8 @@ def _temporal_join(left, right, keys, marker):
         extra = {}
         is_hourly = (cadence == pd.Timedelta(hours=1))
         is_daily = (cadence == pd.Timedelta(days=1))
+        add_sys = bool(groups and 2 <= n_groups <= 200)
+        early_mask = (b[key] <= b[key].median()).values
         for c in base_num[:16]:
             s = b[c].astype('float32')
             s1 = (gb[c].shift(1) if gb is not None else s.shift(1)).astype('float32')
@@ -141,9 +162,14 @@ def _temporal_join(left, right, keys, marker):
             rm3 = (gb[c].transform(lambda x: x.rolling(3, min_periods=1).mean())
                    if gb is not None else s.rolling(3, min_periods=1).mean())
             extra[f'{c}__rm3'] = rm3.astype('float32')
-            # Strictly causal run-length of active binary state (consecutive 1s ending at completed interval rt).
-            non_na = b[c].dropna()
-            if len(non_na) >= 10 and non_na.iloc[:max(10, len(non_na) // 2)].nunique() == 2 and non_na.isin([0, 1, 0.0, 1.0]).mean() >= 0.95:
+            if add_sys:
+                # Cross-group (system-wide) aggregates strictly at the same completed timestamp rt <= ev - cadence.
+                sys_mean = b.groupby(key, sort=False)[c].transform('mean').astype('float32')
+                extra[f'{c}__sys_mean'] = sys_mean
+                extra[f'{c}__sys_dev'] = (s - sys_mean).astype('float32')
+            # Strictly causal run-length of active binary state (binary check strictly on first temporal half).
+            head = b.loc[early_mask, c].dropna()
+            if len(head) >= 10 and head.nunique() == 2 and head.isin([0, 1, 0.0, 1.0]).mean() >= 0.99:
                 v_bin = (b[c] == 1).astype(np.int8)
                 if groups:
                     grp_chg = b[groups[0]].ne(b[groups[0]].shift(1))
@@ -213,10 +239,9 @@ def _interval_join(left, dim, name, targets):
     if lt.notna().mean() < 0.9 or st.notna().mean() < 0.9 or et.notna().mean() < 0.9:
         return None
     a = left[groups].copy(); a['__t__'] = lt; a['__row__'] = np.arange(len(left))
-    dim_lows = {c.lower() for c in dim.columns}
     keep_cols = [c for c in dim.columns if c not in groups and c not in (sc, ec) and c not in targets
                  and not c.lower().endswith('_id') and c.lower() != 'id'
-                 and not (c.lower().startswith('actual_') and ('expected_' + c.lower()[7:]) in dim_lows)]
+                 and not POST_FACTUM_RE.search(str(c))]
     b = dim[groups + keep_cols].copy(); b['__s__'] = st; b['__e__'] = et
     a, b = _align_key_dtypes(a, b, groups)
     b = b.dropna(subset=['__s__', '__e__'] + groups)
@@ -340,12 +365,13 @@ def _aggregate_child(left, dim, name, targets):
     return merged[feat_cols].reset_index(drop=True), best_key, 'static'
 
 
-def enrich(train, test, tables, skip_names=(), report=None):
+def enrich(train, test, tables, skip_names=(), report=None, meta=None):
     targets = set(train) - set(test)
     n = len(train)
     combined = pd.concat([train, test], ignore_index=True)
     skip = {'train', 'test', 'sample_submission', 'data_dictionary'} | set(skip_names)
     remaining = {k: v for k, v in tables.items() if k not in skip}
+    panels = []
     def _rec(msg):
         if isinstance(report, list):
             report.append(msg)
@@ -353,6 +379,16 @@ def enrich(train, test, tables, skip_names=(), report=None):
         changed = False
         for name, dim in list(remaining.items()):
             try:
+                # Tables with (start_*, end_*) interval columns go through _interval_join unless they are an entity
+                # dimension joined on its own primary key (e.g. campaigns on campaign_id).
+                _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                if len(_st_c) == 1 and len(_en_c) == 1:
+                    _stem = name.lower().rstrip('s')
+                    _own_pk = [c for c in dim.columns if c in combined and c not in targets
+                               and c.lower() in (f'{_stem}_id', f'{name.lower()}_id')]
+                    if not (_own_pk and dim[_own_pk[0]].notna().all() and not dim[_own_pk[0]].duplicated().any()):
+                        continue
                 common = [c for c in dim if c in combined and c not in targets and
                           (c.lower().endswith('_id') or c.lower() == 'id' or c.lower() in TIME_NAMES or _is_time_col(c, dim[c]))]
                 keys, dim_clean, excluded = _keys(dim, common)
@@ -372,11 +408,16 @@ def enrich(train, test, tables, skip_names=(), report=None):
                 coverage = candidate[marker].notna().mean()
                 mode_tag = 'many-to-one'
                 if coverage < .95:
-                    temporal = _temporal_join(combined, right, keys, marker)
+                    p_before = len(panels)
+                    temporal = _temporal_join(combined, right, keys, marker,
+                                              panels_out=panels if isinstance(meta, dict) else None,
+                                              table_name=name)
                     if temporal is not None and temporal[0][marker].notna().mean() > coverage:
                         candidate, cadence = temporal
                         mode_tag = f'temporal-completed(shift={cadence})'
                         log(f'join {name}: completed-interval temporal lookup (strictly <= t - {cadence})')
+                    elif len(panels) > p_before:
+                        del panels[p_before:]
                 if candidate[marker].notna().mean() == 0:
                     iv = _interval_join(combined, dim_clean, name, targets)
                     if iv is not None:
@@ -432,4 +473,16 @@ def enrich(train, test, tables, skip_names=(), report=None):
             log_exc(f'one-to-many {name}')
     for name in remaining:
         log(f'join skipped {name}: no unambiguous unique shared key')
+    if isinstance(meta, dict):
+        meta['strict_hours'] = True
+        meta['panels'] = panels
+        event_time = next((p.get('time_col') for p in panels if p.get('time_col') in combined.columns), None)
+        meta['event_time'] = event_time
+        if event_time is not None:
+            meta['train_times'] = pd.to_datetime(combined[event_time].iloc[:n], errors='coerce', utc=True).reset_index(drop=True)
+            meta['test_times'] = pd.to_datetime(combined[event_time].iloc[n:], errors='coerce', utc=True).reset_index(drop=True)
+            gcols_all = sorted({g for p in panels for g in p['groups'] if g in combined.columns})
+            if gcols_all:
+                meta['train_groups'] = combined[gcols_all].iloc[:n].reset_index(drop=True)
+                meta['test_groups'] = combined[gcols_all].iloc[n:].reset_index(drop=True)
     return combined.iloc[:n].reset_index(drop=True), combined.iloc[n:].drop(columns=list(targets)).reset_index(drop=True)

@@ -736,18 +736,24 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         return [safe_fit(fit_et, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45), seed=k,
                          name=f"et_s{k}")]
 
+    def cat_seed(k):
+        depths = (6, 7, 5, 7, 6)
+        kw_k = {**cat_kw, "depth": depths[k % len(depths)]}
+        return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_x, kw_k.pop("cat_cols"), N_JOBS,
+                         max(60.0, left() * 0.45), seed=k, name=f"cat_s{k}", **kw_k)]
+
     seeders = [lgb_seed]
     if any(r is not None and r.name == "xgb" for r in results):
         seeders.append(xgb_seed)
     if any(r is not None and r.name.startswith(("lgb_offset", "lgb_xoffset")) for r in results):
         seeders.append(offset_seed)
     done = [r for r in results if r is not None and r.test is not None and np.isfinite(r.score)]
+    top = max(done, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score if done else None
+    cat_r = next((r for r in done if r.name == "cat"), None)
+    if cat_r is not None and not late_cat and top is not None and abs(cat_r.score - top) <= 0.05 * abs(top):
+        seeders.insert(0, cat_seed)  # CatBoost часто сильнейшее семейство на плотных временных таблицах
     et_r = next((r for r in done if r.name == "et"), None)
-    if et_r is not None:
-        top = max(done, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score
-        # ExtraTrees — другая индуктивная предвзятость: если он почти не хуже лучшей модели, его сиды усиливают
-        # средние (UNSW-NB15 под долями теста: LightGBM, XGBoost, ExtraTrees 0.631/0.630/0.629, их среднее 0.635;
-        # по сырому OOF без подбора весов ExtraTrees 0.618 против 0.633 у XGBoost — отсюда допуск 3%)
+    if et_r is not None and top is not None:
         if abs(et_r.score - top) <= 0.03 * abs(top):
             seeders.append(et_seed)
     next_k = {fn: 1 for fn in seeders}

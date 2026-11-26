@@ -66,24 +66,25 @@ class FinalTests(unittest.TestCase):
 
     def test_temporal_lookup_is_backward_bounded_and_keeps_order(self):
         dim=pd.DataFrame({'district_id':['a']*4, 'timestamp':pd.date_range('2025-01-01',periods=4,freq='h').astype(str), 'v':[10,20,30,40]})
-        # A conflicting hourly observation must not be selected arbitrarily.
-        tr=pd.DataFrame({'district_id':['a','a','a'], 'timestamp':['2025-01-01 02:15:00','2024-12-31 23:59:00','2025-01-01 00:30:00'], 'y':[0,1,2]})
-        te=pd.DataFrame({'district_id':['a','a'], 'timestamp':['2025-01-01 04:00:00','2025-01-01 03:59:00']})
+        # Interval [t, t+1h) completes at t+1h: at 02:15 last completed is 01:00 (20), NEVER 02:00 (30)!
+        tr=pd.DataFrame({'district_id':['a','a','a'], 'timestamp':['2025-01-01 02:15:00','2025-01-01 00:30:00','2025-01-01 01:00:00'], 'y':[0,1,2]})
+        te=pd.DataFrame({'district_id':['a','a','a'], 'timestamp':['2025-01-01 04:00:00','2025-01-01 03:59:00','2025-01-01 05:00:00']})
         a,b=enrich(tr,te,{'sensor':dim})
-        self.assertEqual(a.sensor__v.iloc[0],30)
-        self.assertTrue(pd.isna(a.sensor__v.iloc[1]))
-        self.assertEqual(a.sensor__v.iloc[2],10)
-        self.assertTrue(pd.isna(b.sensor__v.iloc[0]))
-        self.assertEqual(b.sensor__v.iloc[1],40)
+        self.assertEqual(a.sensor__v.iloc[0],20)      # 02:15 -> 01:00-02:00 completed (20)
+        self.assertTrue(pd.isna(a.sensor__v.iloc[1])) # 00:30 -> 00:00-01:00 NOT completed yet -> NaN
+        self.assertEqual(a.sensor__v.iloc[2],10)      # 01:00 -> 00:00-01:00 just completed (10)
+        self.assertEqual(b.sensor__v.iloc[0],40)      # 04:00 -> 03:00-04:00 just completed (40)
+        self.assertEqual(b.sensor__v.iloc[1],30)      # 03:59 -> 02:00-03:00 completed (30), NOT 03:00!
+        self.assertTrue(pd.isna(b.sensor__v.iloc[2])) # 05:00 -> 03:00-04:00 is >= 1h stale -> NaN
         self.assertEqual(a.timestamp.tolist(),tr.timestamp.tolist())
 
     def test_temporal_lookup_does_not_cross_groups(self):
         stamps=pd.date_range('2025-01-01',periods=4,freq='h').astype(str).tolist()
         dim=pd.DataFrame({'district_id':['a']*4+['b']*4,'timestamp':stamps*2,'v':[1,2,3,4,101,102,103,104]})
-        tr=pd.DataFrame({'district_id':['b','a'],'timestamp':['2025-01-01 01:10:00']*2,'y':[0,1]})
-        te=pd.DataFrame({'district_id':['c'],'timestamp':['2025-01-01 01:10:00']})
+        tr=pd.DataFrame({'district_id':['b','a'],'timestamp':['2025-01-01 02:10:00']*2,'y':[0,1]})
+        te=pd.DataFrame({'district_id':['c'],'timestamp':['2025-01-01 02:10:00']})
         a,b=enrich(tr,te,{'sensor':dim})
-        self.assertEqual(a.sensor__v.tolist(),[102,2])
+        self.assertEqual(a.sensor__v.tolist(),[102,2])  # 02:10 -> completed 01:00-02:00 (102 / 2)
         self.assertTrue(pd.isna(b.sensor__v.iloc[0]))
 
     def test_duplicate_composite_keys_are_removed(self):
@@ -159,12 +160,12 @@ class FinalTests(unittest.TestCase):
     def test_temporal_ffill_uses_only_past_values(self):
         stamps=pd.date_range('2025-01-01',periods=5,freq='h').astype(str).tolist()
         dim=pd.DataFrame({'district_id':['a']*5,'timestamp':stamps,'v':[np.nan,10.,np.nan,np.nan,99.]})
-        tr=pd.DataFrame({'district_id':['a','a'],'timestamp':['2025-01-01 00:30:00','2025-01-01 02:30:00'],'y':[0.,1.]})
-        te=pd.DataFrame({'district_id':['a'],'timestamp':['2025-01-01 03:30:00']})
+        tr=pd.DataFrame({'district_id':['a','a'],'timestamp':['2025-01-01 01:30:00','2025-01-01 03:30:00'],'y':[0.,1.]})
+        te=pd.DataFrame({'district_id':['a'],'timestamp':['2025-01-01 04:30:00']})
         a,b=enrich(tr,te,{'sensor':dim})
-        self.assertTrue(pd.isna(a.sensor__v.iloc[0]))  # no past value -> stays NaN, never uses future 10.0
-        self.assertEqual(a.sensor__v.iloc[1],10.)      # outage at 02:00 filled from 01:00
-        self.assertEqual(b.sensor__v.iloc[0],10.)      # outage at 03:00 filled from 01:00, never 99.0
+        self.assertTrue(pd.isna(a.sensor__v.iloc[0]))  # 01:30 -> 00:00 is NaN, never uses future 01:00 (10.0)!
+        self.assertEqual(a.sensor__v.iloc[1],10.)      # 03:30 -> 02:00 outage filled from completed 01:00 (10.0)
+        self.assertEqual(b.sensor__v.iloc[0],10.)      # 04:30 -> 03:00 outage filled from completed 01:00, never 04:00 (99.0)!
         self.assertEqual(a.sensor__raw_nulls.iloc[1],1.)
 
     def test_interval_join_matches_active_events_only(self):
@@ -247,16 +248,16 @@ class FinalTests(unittest.TestCase):
         self.assertEqual(rm['dictionary'],'metadata')
 
     def test_join_mismatched_key_dtypes_and_custom_time_names(self):
-        # int64 key in train/test vs padded string key in dimension + custom created_at time column
-        tr=pd.DataFrame({'event_id':[1,2],'user_id':[10,20],'created_at':['2025-01-01 01:30:00','2025-01-01 02:30:00'],'y':[0,1]})
-        te=pd.DataFrame({'event_id':[3],'user_id':[10],'created_at':['2025-01-01 03:30:00']})
+        # int64 key in train/test vs padded string key in dimension + custom created_at time column (strictly completed!)
+        tr=pd.DataFrame({'event_id':[1,2],'user_id':[10,20],'created_at':['2025-01-01 02:30:00','2025-01-01 03:30:00'],'y':[0,1]})
+        te=pd.DataFrame({'event_id':[3],'user_id':[10],'created_at':['2025-01-01 04:30:00']})
         users=pd.DataFrame({'user_id':[' 10 ','20'],'tier':['gold','silver']})
         stamps=pd.date_range('2025-01-01',periods=4,freq='h').astype(str).tolist()
         sensor=pd.DataFrame({'user_id':['10']*4,'created_at':stamps,'val':[1.,2.,3.,4.]})
         a,b=enrich(tr,te,{'users':users,'sensor':sensor})
         self.assertEqual(a.users__tier.tolist(),['gold','silver'])
-        self.assertEqual(a.sensor__val.iloc[0],2.)
-        self.assertEqual(b.sensor__val.iloc[0],4.)
+        self.assertEqual(a.sensor__val.iloc[0],2.)  # 02:30 -> completed 01:00-02:00 (2.0), NOT 02:00 (3.0)
+        self.assertEqual(b.sensor__val.iloc[0],4.)  # 04:30 -> completed 03:00-04:00 (4.0)
 
     def test_dirty_numeric_strings_and_date_diffs(self):
         from ag_features import prepare
@@ -365,5 +366,26 @@ class FinalTests(unittest.TestCase):
         self.assertIsNotNone(sbc)
         self.assertEqual(sbc['test'].shape,(10,2))
         self.assertTrue(np.isfinite(sbc['oof'][m]).all())
+
+    def test_completed_interval_never_leaks_current_hour(self):
+        # Exact organizer rule: hourly record stamped 10:00 covers [10:00, 11:00) and MUST NOT be used at 10:00 or 10:30!
+        stamps=pd.date_range('2025-01-01 00:00:00',periods=250,freq='h').astype(str).tolist()
+        vals=[float(i) for i in range(250)]
+        vals[210]=999999.0  # poison value at hour index 210 (current uncompleted hour for call at 210:30)
+        vals[211]=888888.0  # future hour
+        dim=pd.DataFrame({'district_id':['d1']*250,'timestamp':stamps,'v':vals})
+        t_cur=pd.Timestamp('2025-01-01 00:00:00')+pd.Timedelta(hours=210)
+        tr=pd.DataFrame({'event_id':[1,2],'district_id':['d1','d1'],
+                         'timestamp':[str(t_cur),str(t_cur+pd.Timedelta(minutes=30))],'y':[1.,2.]})
+        te=pd.DataFrame({'event_id':[3],'district_id':['d1'],
+                         'timestamp':[str(t_cur+pd.Timedelta(minutes=59))]})
+        a,b=enrich(tr,te,{'weather':dim})
+        # All 3 calls in [t_cur, t_cur+59m] must receive hour 209 (209.0), NEVER 210 (999999.0) in ANY column!
+        self.assertEqual(a.weather__v.tolist(),[209.0,209.0])
+        self.assertEqual(b.weather__v.iloc[0],209.0)
+        for df_chk in (a,b):
+            for c in df_chk.columns:
+                if c.startswith('weather__') and pd.api.types.is_numeric_dtype(df_chk[c]):
+                    self.assertLess(float(df_chk[c].max()),1000.0,f'Leak detected in {c}')
 
 if __name__=='__main__': unittest.main()

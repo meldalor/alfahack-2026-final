@@ -366,6 +366,8 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
     def make(iters, use_es):
         p = dict(iterations=iters, learning_rate=lr, depth=depth, random_seed=seed, thread_count=n_jobs,
                  verbose=False, allow_writing_files=False, **extra)
+        if len(cols) > 100 and spec.task_type != "multiclass":
+            p["rsm"] = 0.75
         if use_es:
             p.update(od_type="Iter", od_wait=es, use_best_model=True)
         return model_cls(**p)

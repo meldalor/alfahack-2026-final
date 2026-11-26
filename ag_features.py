@@ -50,6 +50,8 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
     out[f"{name}__doy"] = both.dt.dayofyear
     if (both.dt.hour.fillna(0) != 0).mean() > 0.05:
         out[f"{name}__hour"] = both.dt.hour
+    if (both.dt.minute.fillna(0) != 0).mean() > 0.05:
+        out[f"{name}__minute"] = both.dt.minute
     out[f"{name}__ord"] = (both - pd.Timestamp("1970-01-01")).dt.total_seconds() / 86400.0
     out = out.astype("float32")
     return out.iloc[: len(a)].reset_index(drop=True), out.iloc[len(a):].reset_index(drop=True)
@@ -336,8 +338,9 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
     return res.iloc[:n].reset_index(drop=True), res.iloc[n:].reset_index(drop=True)
 
 
-_DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__ord", "__cnt", "__freq",
-                "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag")
+_DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__minute", "__ord", "__cnt", "__freq",
+                "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag",
+                "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst")
 
 
 def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_corr: float = 0.15):
@@ -608,10 +611,12 @@ def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> t
         X_str[c] = X_str[c].astype("string").fillna("__missing__").astype(str)
         Xt_str[c] = Xt_str[c].astype("string").fillna("__missing__").astype(str)
     reconstructed = 0
+    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst")
     for nm in null_markers:
         prefix = nm[:-len("__raw_nulls")] + "__"
-        t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"]
-        other_num = [c for c in num_all if not c.startswith(prefix)]
+        t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"
+                  and not c.endswith(_lag_sfx)]
+        other_num = [c for c in num_all if not c.startswith(prefix) and not c.endswith(_lag_sfx)]
         other_cat = [c for c in cat_all if not c.startswith(prefix)]
         if not t_cols or (not other_num and not other_cat):
             continue

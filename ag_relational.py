@@ -115,8 +115,9 @@ def _temporal_join(left, right, keys, marker):
     aok = a.loc[valid].sort_values(key)
     b = b.loc[b[key].notna()].sort_values(key)
     # Bounded backward forward-fill for transient sensor outages (strictly past observations, no future leakage).
-    fill_cols = [c for c in b.columns if c not in groups and c not in (key, marker)
-                 and pd.api.types.is_numeric_dtype(b[c]) and b[c].isna().any()]
+    base_num = [c for c in b.columns if c not in groups and c not in (key, marker)
+                and pd.api.types.is_numeric_dtype(b[c])]
+    fill_cols = [c for c in base_num if b[c].isna().any()]
     if fill_cols:
         null_col = f'{marker[:-len("__matched")]}__raw_nulls' if marker.endswith('__matched') else f'{marker}__raw_nulls'
         b[null_col] = b[fill_cols].isna().sum(axis=1).astype('float32')
@@ -124,8 +125,53 @@ def _temporal_join(left, right, keys, marker):
             b[fill_cols] = b.groupby(groups, sort=False)[fill_cols].ffill(limit=6)
         else:
             b[fill_cols] = b[fill_cols].ffill(limit=6)
-    # Exclude the boundary of the following interval: an hour-old reading is stale.
-    joined = pd.merge_asof(aok, b, on=key, by=groups or None, direction='backward',
+    # Causal temporal dynamics from strictly completed past observations (all shifts >= 1, strictly <= rt <= ev - cadence).
+    n_groups = int(b.groupby(groups, dropna=False).ngroups) if groups else 1
+    per_grp = len(b) / max(n_groups, 1)
+    if base_num and per_grp >= 12:
+        b = b.sort_values((groups + [key]) if groups else [key]).reset_index(drop=True)
+        gb = b.groupby(groups, sort=False) if groups else None
+        extra = {}
+        is_hourly = (cadence == pd.Timedelta(hours=1))
+        is_daily = (cadence == pd.Timedelta(days=1))
+        for c in base_num[:16]:
+            s = b[c].astype('float32')
+            s1 = (gb[c].shift(1) if gb is not None else s.shift(1)).astype('float32')
+            extra[f'{c}__d1'] = (s - s1).astype('float32')
+            rm3 = (gb[c].transform(lambda x: x.rolling(3, min_periods=1).mean())
+                   if gb is not None else s.rolling(3, min_periods=1).mean())
+            extra[f'{c}__rm3'] = rm3.astype('float32')
+            if is_hourly and per_grp >= 200:
+                # Shifts 23,47,...,167 from completed hour t = exact target hour (t+1h) over last 7 completed days!
+                d_tgt = [(gb[c].shift(k) if gb is not None else s.shift(k)).astype('float32')
+                         for k in (23, 47, 71, 95, 119, 143, 167)]
+                h7d = pd.concat(d_tgt, axis=1).mean(axis=1).astype('float32')
+                extra[f'{c}__h7d_tgt'] = h7d
+                if per_grp >= 700:
+                    # Same weekday & exact target hour over last 4 completed weeks (167, 335, 503, 671h before t).
+                    w_tgt = [(gb[c].shift(k) if gb is not None else s.shift(k)).astype('float32')
+                             for k in (167, 335, 503, 671)]
+                    w_cur = [(gb[c].shift(k) if gb is not None else s.shift(k)).astype('float32')
+                             for k in (168, 336, 504, 672)]
+                    dow4_tgt = pd.concat(w_tgt, axis=1).mean(axis=1).astype('float32')
+                    dow4_cur = pd.concat(w_cur, axis=1).mean(axis=1).astype('float32')
+                    anom = (s - dow4_cur).astype('float32')
+                    extra[f'{c}__dow4_tgt'] = dow4_tgt
+                    extra[f'{c}__anom'] = anom
+                    extra[f'{c}__fcst'] = (dow4_tgt + 0.65 * anom).astype('float32')
+            elif is_daily and per_grp >= 35:
+                w_tgt = [(gb[c].shift(k) if gb is not None else s.shift(k)).astype('float32')
+                         for k in (6, 13, 20, 27)]
+                extra[f'{c}__dow4_tgt'] = pd.concat(w_tgt, axis=1).mean(axis=1).astype('float32')
+        if extra:
+            b = pd.concat([b, pd.DataFrame(extra, index=b.index)], axis=1)
+    # STRICT COMPLETED-INTERVAL AVAILABILITY:
+    # A periodic measurement stamped at `rt` covers [rt, rt + cadence) and completes at `rt + cadence`.
+    # Matching `rt + cadence <= event_time` (with tolerance < cadence) guarantees we NEVER use an in-progress interval
+    # (e.g., for an event at 10:30 with 1h cadence, the 10:00-11:00 record is excluded; last allowed is 09:00-10:00).
+    b[key] = b[key] + cadence
+    b = b.sort_values(key)
+    joined = pd.merge_asof(aok, b, on=key, by=groups or None, direction='backward', allow_exact_matches=True,
                            tolerance=cadence - pd.Timedelta(nanoseconds=1))
     missing = a.loc[~valid]
     joined = pd.concat([joined, missing], ignore_index=True).sort_values(row)
@@ -155,8 +201,10 @@ def _interval_join(left, dim, name, targets):
     if lt.notna().mean() < 0.9 or st.notna().mean() < 0.9 or et.notna().mean() < 0.9:
         return None
     a = left[groups].copy(); a['__t__'] = lt; a['__row__'] = np.arange(len(left))
+    dim_lows = {c.lower() for c in dim.columns}
     keep_cols = [c for c in dim.columns if c not in groups and c not in (sc, ec) and c not in targets
-                 and not c.lower().endswith('_id') and c.lower() != 'id']
+                 and not c.lower().endswith('_id') and c.lower() != 'id'
+                 and not (c.lower().startswith('actual_') and ('expected_' + c.lower()[7:]) in dim_lows)]
     b = dim[groups + keep_cols].copy(); b['__s__'] = st; b['__e__'] = et
     a, b = _align_key_dtypes(a, b, groups)
     b = b.dropna(subset=['__s__', '__e__'] + groups)
@@ -315,8 +363,8 @@ def enrich(train, test, tables, skip_names=(), report=None):
                     temporal = _temporal_join(combined, right, keys, marker)
                     if temporal is not None and temporal[0][marker].notna().mean() > coverage:
                         candidate, cadence = temporal
-                        mode_tag = f'temporal-asof(<{cadence})'
-                        log(f'join {name}: backward temporal lookup, maximum age < {cadence}')
+                        mode_tag = f'temporal-completed(shift={cadence})'
+                        log(f'join {name}: completed-interval temporal lookup (strictly <= t - {cadence})')
                 if candidate[marker].notna().mean() == 0:
                     iv = _interval_join(combined, dim_clean, name, targets)
                     if iv is not None:

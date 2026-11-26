@@ -340,7 +340,7 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
 
 _DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__minute", "__ord", "__cnt", "__freq",
                 "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag",
-                "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst")
+                "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen")
 
 
 def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_corr: float = 0.15):
@@ -350,6 +350,7 @@ def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_
     нет: с ней RMSE 34.90 против 34.67 без неё."""
     skip = set(key_cols) | set(exclude)
     cols = [c for c in X.columns if c not in skip and not str(c).endswith(_DERIVED_SFX)
+            and not str(c).startswith("stream__")
             and "__minus__" not in str(c) and pd.api.types.is_numeric_dtype(X[c])
             and X[c].nunique() > 2]
     if not cols:
@@ -414,7 +415,7 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
     pairs = list(zip(periods[:-1], periods[1:]))[-6:]
     stats = {}
     for c in X.columns:
-        if c == time_col or str(c).endswith(_DERIVED_SFX) or "__minus__" in str(c):
+        if c == time_col or str(c).endswith(_DERIVED_SFX) or str(c).startswith("stream__") or "__minus__" in str(c):
             continue
         s = X[c]
         pers = []
@@ -611,12 +612,13 @@ def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> t
         X_str[c] = X_str[c].astype("string").fillna("__missing__").astype(str)
         Xt_str[c] = Xt_str[c].astype("string").fillna("__missing__").astype(str)
     reconstructed = 0
-    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst")
+    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen")
     for nm in null_markers:
         prefix = nm[:-len("__raw_nulls")] + "__"
         t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"
                   and not c.endswith(_lag_sfx)]
-        other_num = [c for c in num_all if not c.startswith(prefix) and not c.endswith(_lag_sfx)]
+        other_num = [c for c in num_all if not c.startswith(prefix) and not c.startswith("stream__")
+                     and not c.endswith(_lag_sfx)]
         other_cat = [c for c in cat_all if not c.startswith(prefix)]
         if not t_cols or (not other_num and not other_cat):
             continue
@@ -656,3 +658,157 @@ def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> t
     if reconstructed:
         log(f"кросс-сенсорная реконструкция сбоев: обновлено {reconstructed} колонок")
     return X_out, Xt_out
+
+
+def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Generic strictly-causal event-stream features (< t, NEVER >= t, NEVER using target or joined tables).
+
+    Captures real-time arrival bursts, inter-arrival gaps, and recent-window event composition strictly before
+    the current event timestamp `t` (identical in online single-event streaming). Protected by a chronological
+    sampling-density guard so differing train/test subsampling rates never cause covariate shift.
+    """
+    import warnings
+
+    excl = set(exclude or ()) | (set(train.columns) - set(test.columns))
+    n_tr, n_te = len(train), len(test)
+    n_tot = n_tr + n_te
+    if n_tot < 500 or n_tot > 1_000_000:
+        return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+    # Inspect ONLY raw main-table columns (no '__' from joined auxiliary tables).
+    raw_cols = [c for c in test.columns if c in train.columns and c not in excl and "__" not in str(c)]
+    time_cands = []
+    for c in raw_cols:
+        low = str(c).lower()
+        if low.startswith(("start_", "end_")):
+            continue
+        is_dt = pd.api.types.is_datetime64_any_dtype(train[c])
+        if not is_dt:
+            if pd.api.types.is_numeric_dtype(train[c]) or pd.api.types.is_bool_dtype(train[c]):
+                continue
+            name_ok = (low in {"timestamp", "datetime", "event_time", "created_at", "recorded_at", "ts", "time"}
+                       or low.endswith(("_time", "_timestamp", "_datetime", "_at", "_ts")))
+            if not name_ok and not _is_datetime_series(train[c]):
+                continue
+        sample = train[c].dropna().head(300)
+        if len(sample) < 10:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            p = pd.to_datetime(sample, errors="coerce", utc=True)
+        if p.notna().mean() >= 0.95 and (p.dt.hour != 0).mean() > 0.05:
+            time_cands.append(c)
+    if len(time_cands) != 1:
+        return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+    tc = time_cands[0]
+    comb = pd.concat([train[raw_cols], test[raw_cols]], ignore_index=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ts = pd.to_datetime(comb[tc], errors="coerce", utc=True)
+    valid = ts.notna().values
+    if float(valid.mean()) < 0.95:
+        return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+    ts_ok = ts.loc[valid]
+    if ts_ok.nunique() / max(len(ts_ok), 1) < 0.05:
+        return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+    # Require sub-daily median positive inter-event gap (< 12h)
+    ts_sorted_ns = np.sort(ts_ok.values.astype("int64"))
+    diffs = np.diff(ts_sorted_ns)
+    pos_diffs = diffs[diffs > 0]
+    if len(pos_diffs) < 100 or float(np.median(pos_diffs)) >= 12 * 3600 * 1e9:
+        return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+    # Chronological density guard: skip if test is chronologically after train with mismatched sampling rate.
+    tr_t = ts.iloc[:n_tr].dropna()
+    te_t = ts.iloc[n_tr:].dropna()
+    if len(tr_t) > 10 and len(te_t) > 10 and te_t.min() > tr_t.max():
+        r_tr = len(tr_t) / max((tr_t.max() - tr_t.min()).total_seconds(), 1.0)
+        r_te = len(te_t) / max((te_t.max() - te_t.min()).total_seconds(), 1.0)
+        ratio = r_te / max(r_tr, 1e-12)
+        if not (0.4 <= ratio <= 2.5):
+            log(f"stream: пропуск из-за разной плотности train/test ({ratio:.2f}x)")
+            return pd.DataFrame(index=train.index), pd.DataFrame(index=test.index)
+
+    v_idx = np.flatnonzero(valid)
+    nv = len(v_idx)
+    ts_v = ts.iloc[v_idx]
+    order = np.argsort(ts_v.values, kind="mergesort")
+    orig_pos = v_idx[order]
+    ts_ns = ts_v.values.astype("int64")[order]
+    ts_s = ts_ns / 1e9
+    # STRICTLY < t: searchsorted(..., side='left') excludes BOTH future events AND simultaneous ties!
+    j_end = np.searchsorted(ts_ns, ts_ns, side="left")
+
+    def _scatter(vals_ord):
+        arr = np.full(n_tot, np.nan, dtype="float32")
+        arr[orig_pos] = vals_ord.astype("float32")
+        return arr
+
+    out = {}
+    for w_min in (15, 30, 60, 120, 360, 1440):
+        j_beg = np.searchsorted(ts_ns, ts_ns - int(w_min * 60 * 1e9), side="left")
+        out[f"stream__cnt_{w_min}m"] = _scatter(j_end - j_beg)
+    for k in (1, 2, 3, 5, 10):
+        idx_k = j_end - k
+        gap = np.where(idx_k >= 0, (ts_s - ts_s[np.maximum(idx_k, 0)]) / 60.0, np.nan)
+        out[f"stream__gap_prev{k}_min"] = _scatter(gap)
+
+    hr_ns = ts_v.dt.floor("h").values.astype("int64")[order]
+    prev_hr_ns = hr_ns - int(3600 * 1e9)
+    j_hr = np.searchsorted(ts_ns, hr_ns, side="left")
+    j_phr = np.searchsorted(ts_ns, prev_hr_ns, side="left")
+    cnt_cur = (j_end - j_hr).astype("float32")
+    cnt_prev = (j_hr - j_phr).astype("float32")
+    min_in_hr = (ts_v.dt.minute.values + ts_v.dt.second.values / 60.0).astype("float32")[order]
+    rate_cur = cnt_cur / (min_in_hr + 4.0) * 60.0
+    out["stream__cnt_cur_hr_past"] = _scatter(cnt_cur)
+    out["stream__cnt_prev_hr"] = _scatter(cnt_prev)
+    out["stream__rate_cur_hr_past"] = _scatter(rate_cur)
+    out["stream__rate_ratio_cur_prev"] = _scatter(rate_cur / (cnt_prev + 0.5))
+    cnt_24h = (j_end - np.searchsorted(ts_ns, ts_ns - int(1440 * 60 * 1e9), side="left")).astype("float32")
+    cnt_60m = (j_end - np.searchsorted(ts_ns, ts_ns - int(60 * 60 * 1e9), side="left")).astype("float32")
+    out["stream__burst_vs_24h"] = _scatter(rate_cur / (cnt_24h / 24.0 + 0.25))
+    out["stream__burst_60m_vs_24h"] = _scatter(cnt_60m / (cnt_24h / 24.0 + 0.25))
+
+    # Strictly-past rolling sums, rates, and recency for raw binary (0/1) event flags
+    bin_cols = [c for c in raw_cols if c != tc and not str(c).lower().endswith("_id") and str(c).lower() != "id"
+                and (pd.api.types.is_numeric_dtype(comb[c]) or pd.api.types.is_bool_dtype(comb[c]))
+                and comb[c].dropna().nunique() == 2
+                and set(pd.to_numeric(comb[c].dropna(), errors="coerce").unique()).issubset({0, 1, 0.0, 1.0})][:8]
+    for c in bin_cols:
+        vals = pd.to_numeric(comb[c], errors="coerce").fillna(0.0).values[orig_pos].astype("float64")
+        csum = np.concatenate([[0.0], np.cumsum(vals)])
+        # Vectorized O(N) time since latest positive event strictly < t (safe under timestamp ties!)
+        pos_idx = np.where(vals >= 0.5, np.arange(nv, dtype=np.int64), -1)
+        last_pos_le = np.maximum.accumulate(pos_idx)
+        lp = np.where(j_end > 0, last_pos_le[np.maximum(j_end - 1, 0)], -1)
+        gap_pos = np.where(lp >= 0, (ts_s - ts_s[np.maximum(lp, 0)]) / 60.0, np.nan)
+        out[f"stream__{c}_gap_pos_min"] = _scatter(gap_pos)
+        out[f"stream__{c}_pos_in_cur_hr"] = _scatter((gap_pos < min_in_hr).astype("float32"))
+        for w_min in (30, 60, 180):
+            j_beg = np.searchsorted(ts_ns, ts_ns - int(w_min * 60 * 1e9), side="left")
+            s_w = csum[j_end] - csum[j_beg]
+            c_w = np.maximum(j_end - j_beg, 1)
+            out[f"stream__{c}_sum_{w_min}m"] = _scatter(s_w)
+            out[f"stream__{c}_rate_{w_min}m"] = _scatter(s_w / c_w)
+        out[f"stream__{c}_cur_hr_past"] = _scatter(csum[j_end] - csum[j_hr])
+        out[f"stream__{c}_prev_hr"] = _scatter(csum[j_hr] - csum[j_phr])
+
+    # Strictly-past rolling composition for low-cardinality raw categoricals (2..8 unique values)
+    cat_cands = [c for c in raw_cols if c != tc and c not in bin_cols
+                 and not str(c).lower().endswith("_id") and str(c).lower() != "id"
+                 and not pd.api.types.is_numeric_dtype(comb[c]) and not pd.api.types.is_bool_dtype(comb[c])
+                 and 2 <= train[c].dropna().nunique() <= 8][:3]
+    j_60 = np.searchsorted(ts_ns, ts_ns - int(60 * 60 * 1e9), side="left")
+    for c in cat_cands:
+        # Determine tracked category vocabulary strictly from train (never from future test rows).
+        top_vals = train[c].astype("string").fillna("__nan__").value_counts().index[:5]
+        s_ord = comb[c].astype("string").fillna("__nan__").values[orig_pos]
+        for idx_v, v in enumerate(top_vals):
+            ind = (s_ord == v).astype("float64")
+            csum = np.concatenate([[0.0], np.cumsum(ind)])
+            tag = re.sub(r"[^\w]+", "_", str(v)).strip("_")[:12] or f"v{idx_v}"
+            out[f"stream__{c}_{tag}_cur_hr"] = _scatter(csum[j_end] - csum[j_hr])
+            out[f"stream__{c}_{tag}_60m"] = _scatter(csum[j_end] - csum[j_60])
+
+    df = pd.DataFrame(out)
+    log(f"строго причинный поток событий ({tc}, строго < t): +{df.shape[1]} признаков")
+    return df.iloc[:n_tr].reset_index(drop=True), df.iloc[n_tr:].reset_index(drop=True)

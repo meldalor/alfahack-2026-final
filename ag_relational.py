@@ -141,6 +141,18 @@ def _temporal_join(left, right, keys, marker):
             rm3 = (gb[c].transform(lambda x: x.rolling(3, min_periods=1).mean())
                    if gb is not None else s.rolling(3, min_periods=1).mean())
             extra[f'{c}__rm3'] = rm3.astype('float32')
+            # Strictly causal run-length of active binary state (consecutive 1s ending at completed interval rt).
+            non_na = b[c].dropna()
+            if len(non_na) >= 10 and non_na.iloc[:max(10, len(non_na) // 2)].nunique() == 2 and non_na.isin([0, 1, 0.0, 1.0]).mean() >= 0.95:
+                v_bin = (b[c] == 1).astype(np.int8)
+                if groups:
+                    grp_chg = b[groups[0]].ne(b[groups[0]].shift(1))
+                    for gcol in groups[1:]:
+                        grp_chg = grp_chg | b[gcol].ne(b[gcol].shift(1))
+                    reset = (v_bin == 0) | grp_chg
+                else:
+                    reset = (v_bin == 0)
+                extra[f'{c}__runlen'] = v_bin.groupby(reset.cumsum(), sort=False).cumsum().astype('float32')
             if is_hourly and per_grp >= 200:
                 # Shifts 23,47,...,167 from completed hour t = exact target hour (t+1h) over last 7 completed days!
                 d_tgt = [(gb[c].shift(k) if gb is not None else s.shift(k)).astype('float32')

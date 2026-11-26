@@ -426,8 +426,10 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
-    params = {"tree_method": "hist", "eta": lr, "max_depth": depth, "subsample": 0.8, "colsample_bytree": 0.7,
-              "min_child_weight": 3, "lambda": 1.0, "nthread": n_jobs, "seed": seed, "max_cat_to_onehot": 1,
+    wide = len(cols) > 100
+    params = {"tree_method": "hist", "eta": lr, "max_depth": depth, "subsample": 0.8,
+              "colsample_bytree": 0.55 if wide else 0.7, "min_child_weight": 5 if wide else 3,
+              "lambda": 3.0 if wide else 1.0, "nthread": n_jobs, "seed": seed, "max_cat_to_onehot": 1,
               "max_bin": 256}
     if spec.task_type == "regression":
         if spec.metric in ("mae", "medae", "smape"):

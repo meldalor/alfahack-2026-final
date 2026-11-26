@@ -388,4 +388,46 @@ class FinalTests(unittest.TestCase):
                 if c.startswith('weather__') and pd.api.types.is_numeric_dtype(df_chk[c]):
                     self.assertLess(float(df_chk[c].max()),1000.0,f'Leak detected in {c}')
 
+    def test_binary_runlen_completed_interval_no_leak(self):
+        stamps=pd.date_range('2025-01-01 00:00:00',periods=30,freq='h').astype(str).tolist()
+        # Storm active at hours 10, 11, 12, 13 (runlen=1,2,3,4), off at 14, on at 15 (runlen=1)
+        flags=[0]*30
+        for h in (10,11,12,13,15): flags[h]=1
+        dim=pd.DataFrame({'district_id':['d1']*30,'timestamp':stamps,'storm_flag':flags})
+        tr=pd.DataFrame({'event_id':[1,2,3],'district_id':['d1']*3,
+                         'timestamp':['2025-01-01 13:30:00','2025-01-01 14:30:00','2025-01-01 15:30:00'],'y':[1.,2.,3.]})
+        te=pd.DataFrame({'event_id':[4],'district_id':['d1'],'timestamp':['2025-01-01 16:30:00']})
+        a,b=enrich(tr,te,{'weather':dim})
+        # At 13:30 -> completed 12:00 (runlen=3, NEVER 13:00 runlen=4!)
+        # At 14:30 -> completed 13:00 (runlen=4); at 15:30 -> completed 14:00 (runlen=0); at 16:30 -> completed 15:00 (runlen=1)
+        self.assertEqual(a.weather__storm_flag__runlen.tolist(),[3.0,4.0,0.0])
+        self.assertEqual(b.weather__storm_flag__runlen.iloc[0],1.0)
+
+    def test_causal_stream_zero_future_or_tie_leak_and_density_guard(self):
+        from ag_features import causal_stream_features
+        rng=np.random.default_rng(11)
+        ts_tr=pd.date_range('2025-01-01 00:00:00',periods=400,freq='30min')
+        ts_te=pd.date_range('2025-01-09 08:00:00',periods=200,freq='30min')
+        # Add exact timestamp tie in test (rows 50 and 51 share exact timestamp!)
+        ts_te=ts_te.tolist()
+        ts_te[51]=ts_te[50]
+        tr=pd.DataFrame({'event_id':range(400),'timestamp':ts_tr.astype(str),
+                         'flag':rng.integers(0,2,400),'kind':rng.choice(['A','B'],400),'y':rng.normal(size=400)})
+        te=pd.DataFrame({'event_id':range(400,600),'timestamp':[str(x) for x in ts_te],
+                         'flag':rng.integers(0,2,200),'kind':rng.choice(['A','B'],200)})
+        s_tr1,s_te1=causal_stream_features(tr,te,exclude={'y','event_id'})
+        self.assertGreater(s_tr1.shape[1],10)
+        # Poison row 50 (tie) and all rows > 50 in test -> row 50 AND row 51 MUST NOT change by a single bit!
+        te_poison=te.copy()
+        te_poison.loc[50:,'flag']=1 - te_poison.loc[50:,'flag']
+        te_poison.loc[50:,'kind']='B'
+        s_tr2,s_te2=causal_stream_features(tr,te_poison,exclude={'y','event_id'})
+        pd.testing.assert_frame_equal(s_tr1,s_tr2)
+        pd.testing.assert_frame_equal(s_te1.iloc[:52],s_te2.iloc[:52])
+        # Density-mismatch guard: test 10x sparser than train -> must cleanly return 0 columns
+        ts_sparse=pd.date_range('2025-02-01 00:00:00',periods=200,freq='5h')
+        te_sp=te.copy(); te_sp['timestamp']=ts_sparse.astype(str)
+        st_a,st_b=causal_stream_features(tr,te_sp,exclude={'y','event_id'})
+        self.assertEqual(st_a.shape[1],0); self.assertEqual(st_b.shape[1],0)
+
 if __name__=='__main__': unittest.main()

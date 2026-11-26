@@ -139,12 +139,24 @@ def stack_blend(results, y, mask, spec, plan=None):
             meta_folds = list(KFold(5, shuffle=True, random_state=42).split(M_oof))
 
     if spec.task_type == "regression":
+        from sklearn.linear_model import HuberRegressor
+
         y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
+        use_l1 = spec.metric in ("mae", "medae")
+
+        def _fit_meta_reg(A, b):
+            if use_l1:
+                try:
+                    return HuberRegressor(epsilon=1.15, alpha=1.0, max_iter=500).fit(A, b)
+                except Exception:
+                    pass
+            return RidgeCV(alphas=np.logspace(0, 4, 9)).fit(A, b)
+
         mo = np.full(len(y), np.nan, dtype=float)
         for tr, va in meta_folds:
-            reg = RidgeCV(alphas=np.logspace(0, 4, 9)).fit(M_oof[tr], ym[tr])
+            reg = _fit_meta_reg(M_oof[tr], ym[tr])
             mo[idx[va]] = np.clip(reg.predict(M_oof[va]), y_lo, y_hi)
-        reg_full = RidgeCV(alphas=np.logspace(0, 4, 9)).fit(M_oof, ym)
+        reg_full = _fit_meta_reg(M_oof, ym)
         mt = np.clip(reg_full.predict(M_test), y_lo, y_hi)
         coefs = np.asarray(reg_full.coef_, float).reshape(-1)
         denom = float(np.abs(coefs).sum()) or 1.0

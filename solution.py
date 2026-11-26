@@ -24,7 +24,8 @@ import pandas as pd  # noqa: E402
 
 from ag_ensemble import (LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification,  # noqa: E402
                          rank_blend, stack_blend)
-from ag_features import cross_impute_outages, detect_time_split, entity_periods, op_entity_history, prepare  # noqa: E402
+from ag_features import (causal_stream_features, cross_impute_outages, detect_time_split, entity_periods,  # noqa: E402
+                         op_entity_history, prepare)
 from ag_llm import LLM  # noqa: E402
 from ag_metrics import PROBA_METRICS, TUNABLE, better, decide, direction, score  # noqa: E402
 from ag_models import (FitResult, ModelConfig, adversarial_scores, fit_cat, fit_et, fit_lgb, fit_linear, fit_mlp,  # noqa: E402
@@ -317,7 +318,15 @@ def solve_target(spec, train, test, llm, hints, budget, writer, work):
         f"id {spec.id_col}, вывод {spec.output_kind}, время до {budget.total:.0f}s")
 
     # 2. признаки и схема валидации
-    prep = prepare(train, test, spec)
+    tr_in, te_in = train, test
+    try:
+        st_tr, st_te = causal_stream_features(train, test, exclude={spec.target, *spec.extra_targets, spec.id_col})
+        if st_tr.shape[1] > 0:
+            tr_in = pd.concat([train.reset_index(drop=True), st_tr], axis=1)
+            te_in = pd.concat([test.reset_index(drop=True), st_te], axis=1)
+    except Exception:
+        log_exc("causal_stream_features")
+    prep = prepare(tr_in, te_in, spec)
     prep.X, prep.Xt = cross_impute_outages(prep.X, prep.Xt, prep.cat_cols)
     y = prep.y
     log(f"признаков {prep.X.shape[1]}, категориальных {len(prep.cat_cols)}, текстовых {len(prep.text_cols)}")
@@ -676,10 +685,10 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         fit_extra("huber", fit_linear, {"kind": "huber"}, min_need=25.0, use_clean=True)
     else:
         fit_extra("logreg", fit_linear, {"kind": "logreg"}, min_need=25.0, use_clean=True)
-    fit_extra("xgb", fit_xgb, {"lr": 0.05 if not big else 0.1, "depth": 7})
-    fit_extra("et", fit_et, {})
     if not late_cat:
         fit_extra("cat", fit_cat, cat_kw)
+    fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7})
+    fit_extra("et", fit_et, {})
     fit_extra("mlp", fit_mlp, {}, min_need=30.0, use_clean=True)
 
     # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
@@ -724,8 +733,9 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          seed=k, name=f"lgb_s{k}")]
 
     def xgb_seed(k):
+        depths = (6, 7, 5, 7, 6)
         return [safe_fit(fit_xgb, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45),
-                         lr=0.05 if not big else 0.1, depth=7, seed=k, name=f"xgb_s{k}")]
+                         lr=0.04 if not big else 0.1, depth=depths[k % len(depths)], seed=k, name=f"xgb_s{k}")]
 
     def offset_seed(k):
         return [safe_fit(fit_lgb, Xo, y, Xto, plan, spec, cfg, N_JOBS, max(60.0, left() * 0.25), lr=lr_main, es=200,
@@ -737,7 +747,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          name=f"et_s{k}")]
 
     def cat_seed(k):
-        depths = (6, 7, 5, 7, 6)
+        depths = (6, 6, 7, 6, 5)
         kw_k = {**cat_kw, "depth": depths[k % len(depths)]}
         return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_x, kw_k.pop("cat_cols"), N_JOBS,
                          max(60.0, left() * 0.45), seed=k, name=f"cat_s{k}", **kw_k)]

@@ -430,4 +430,91 @@ class FinalTests(unittest.TestCase):
         st_a,st_b=causal_stream_features(tr,te_sp,exclude={'y','event_id'})
         self.assertEqual(st_a.shape[1],0); self.assertEqual(st_b.shape[1],0)
 
+class Pool5HarnessTests(unittest.TestCase):
+    def test_synthetic_generators_deterministic_and_disjoint(self):
+        from tools.stress_private import generate, CASES
+        for name in CASES:
+            with self.subTest(name=name):
+                a,b,aux,sample,y=generate(name, 600, 42)
+                aa,bb,aux2,sample2,y2=generate(name, 600, 42)
+                self.assertEqual(len(a)+len(b),600)
+                self.assertTrue(set(a.row_id).isdisjoint(b.row_id))
+                self.assertNotIn('target',b)
+                pd.testing.assert_frame_equal(a,aa)
+                pd.testing.assert_frame_equal(sample,sample2)
+                np.testing.assert_array_equal(y,y2)
+                if name=='multiclass':
+                    self.assertEqual(a.target.nunique(),12)
+                    self.assertEqual(len(sample.columns),13)
+                if name=='regression': self.assertTrue((y==0).any())
+
+    def test_stress_contract_rejects_bad_order_and_probabilities(self):
+        from tools.stress_private import generate, validate
+        a,b,aux,sample,y=generate('multiclass',600)
+        good=sample.copy(); good.iloc[:,1:]=1/12
+        scores,constant=validate(good,sample,b,y,'multiclass')
+        self.assertTrue(constant); self.assertAlmostEqual(scores['LogLoss'],np.log(12))
+        with self.assertRaises(ValueError): validate(good.iloc[::-1],sample,b,y,'multiclass')
+        bad=good.copy(); bad.iloc[0,1]=2
+        with self.assertRaises(ValueError): validate(bad,sample,b,y,'multiclass')
+        bad=good.copy(); bad.iloc[0,1]=0
+        with self.assertRaises(ValueError): validate(bad,sample,b,y,'multiclass')
+
+    def test_release_whitelist_rejects_unapproved_versions(self):
+        from tools.release_check import check_requirements
+        reg='Approved packages:\nnumpy==1.26.4\npandas==2.2.3\n'
+        self.assertEqual(check_requirements('numpy==1.26.4\n',reg)['used'],1)
+        for wrong in ['numpy==2.0.0','torch==1.0','numpy>=1.0','numpy==1.26.4\nnumpy==1.26.4']:
+            with self.subTest(wrong=wrong),self.assertRaises(ValueError): check_requirements(wrong,reg)
+
+    def test_dual_poison_audit_with_synthetic_public_fixture(self):
+        from tools.release_check import poison_audit
+        from unittest.mock import patch
+        from ag_features import causal_stream_features
+        cutoff=pd.Timestamp('2025-08-01 06:50:00')
+        times=pd.date_range(cutoff-pd.Timedelta(minutes=6500),periods=750,freq='10min')
+        rng=np.random.default_rng(4)
+        df=pd.DataFrame({'event_id':np.arange(750)+10512,'timestamp':times,
+                         'district_id':'D06','flag':rng.integers(0,2,750),
+                         'kind':rng.choice(['A','B'],750)})
+        tr=df.iloc[:600].copy(); tr['target']=rng.normal(size=600)
+        te=df.iloc[600:].reset_index(drop=True)
+        sensor_times=pd.date_range(times.min().floor('h')-pd.Timedelta(hours=12),times.max().ceil('h')+pd.Timedelta(hours=2),freq='h')
+        tables={'train':tr,'test':te}
+        for name in ('weather','traffic','air_quality','power_grid','public_transport'):
+            tables[name]=pd.DataFrame({'timestamp':sensor_times,'district_id':'D06','v':rng.normal(size=len(sensor_times))})
+        report=poison_audit(tables)
+        self.assertEqual(set(report),{'sensors','events','combined'})
+        self.assertTrue(all(v['compared']>0 and not v['changed'] for v in report.values()))
+        # Positive control: deliberately make a derived feature depend on the current raw flag.
+        def leaky(a,b,exclude=()):
+            x,z=causal_stream_features(a,b,exclude=exclude)
+            x['deliberate_leak']=a.flag.to_numpy(); z['deliberate_leak']=b.flag.to_numpy()
+            return x,z
+        with patch('ag_features.causal_stream_features',side_effect=leaky):
+            report=poison_audit(tables)
+        self.assertIn('deliberate_leak',report['events']['changed'])
+        self.assertIn('deliberate_leak',report['combined']['changed'])
+
+    def test_release_zip_rejects_bad_content(self):
+        import zipfile
+        from tools.release_check import audit_zip
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); (root/'solution.py').write_text('print(1)\n'); (root/'requirements.txt').write_text('numpy==1.26.4\n')
+            archive=root/'test.zip'
+            def pack(extra=None):
+                with zipfile.ZipFile(archive,'w') as z:
+                    for n in ('solution.py','requirements.txt'): z.write(root/n,n)
+                    if extra: z.writestr(extra,'extra')
+            pack(); self.assertEqual(audit_zip(archive,root)['files'],2)
+            pack('nested/a.py')
+            with self.assertRaises(ValueError): audit_zip(archive,root)
+            (root/'solution.py').write_bytes(b'print(1)\r\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive,root)
+            (root/'solution.py').write_text('import sys\nsys.path.append("/x")\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive,root)
+            (root/'solution.py').write_text('token="sk-'+'x'*20+'"\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive,root)
+
+
 if __name__=='__main__': unittest.main()

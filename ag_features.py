@@ -117,7 +117,8 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
     if pd.isna(origin):
         origin = pd.Timestamp("1970-01-01", tz="UTC")
     out[f"{name}__ord"] = (both - origin).dt.total_seconds() / 86400.0
-    out = out.astype("float32")
+    for col in out.columns:
+        out[col] = out[col].astype("float64" if col.endswith("__ord") else "float32")
     a_out = out.iloc[: len(a)].reset_index(drop=True)
     b_out = out.iloc[len(a):].reset_index(drop=True)
     a_out.attrs["origin"] = origin
@@ -269,35 +270,88 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 continue
 
             def _tag_pair(sa: pd.Series, sb: pd.Series):
-                u1 = {str(u): frozenset(t.strip().lower() for t in str(u).split(",") if t.strip())
-                      for u in sa.dropna().unique()}
-                u2 = {str(u): frozenset(t.strip().lower() for t in str(u).split(",") if t.strip())
-                      for u in sb.dropna().unique()}
-                cache = {}
-                ov = np.full(len(sa), np.nan, dtype=np.float32)
-                jac = np.full(len(sa), np.nan, dtype=np.float32)
-                for idx_r, (va, vb) in enumerate(zip(sa.astype(object).tolist(), sb.astype(object).tolist())):
-                    if va is None or vb is None or va is pd.NA or vb is pd.NA:
-                        continue
-                    if (isinstance(va, float) and np.isnan(va)) or (isinstance(vb, float) and np.isnan(vb)):
-                        continue
-                    key = (va, vb)
-                    res = cache.get(key)
-                    if res is None:
-                        s1, s2 = u1.get(str(va)), u2.get(str(vb))
-                        if not s1 or not s2:
-                            res = (np.nan, np.nan)
-                        else:
-                            k = len(s1 & s2)
-                            res = (float(k), float(k) / float(len(s1 | s2)))
-                        cache[key] = res
-                    ov[idx_r], jac[idx_r] = res
+                ca, ua = pd.factorize(sa.astype("string"), sort=False)
+                cb, ub = pd.factorize(sb.astype("string"), sort=False)
+                sets_a = [frozenset(t.strip().lower() for t in str(u).split(",") if t.strip()) for u in ua]
+                sets_b = [frozenset(t.strip().lower() for t in str(u).split(",") if t.strip()) for u in ub]
+                n_row = len(sa)
+                ov = np.full(n_row, np.nan, dtype=np.float32)
+                jac = np.full(n_row, np.nan, dtype=np.float32)
+                ok = (ca >= 0) & (cb >= 0)
+                if not ok.any():
+                    return ov, jac
+                nb = len(ub) + 1
+                pair_keys = ca[ok].astype(np.int64) * nb + cb[ok].astype(np.int64)
+                uniq_p, inv = np.unique(pair_keys, return_inverse=True)
+                ov_u = np.full(len(uniq_p), np.nan, dtype=np.float32)
+                jac_u = np.full(len(uniq_p), np.nan, dtype=np.float32)
+                for idx_p, pk in enumerate(uniq_p.tolist()):
+                    s1 = sets_a[pk // nb]
+                    s2 = sets_b[pk % nb]
+                    if s1 and s2:
+                        k = len(s1 & s2)
+                        ov_u[idx_p] = float(k)
+                        jac_u[idx_p] = float(k) / float(len(s1 | s2))
+                ov[ok] = ov_u[inv]
+                jac[ok] = jac_u[inv]
                 return ov, jac
 
             ov_a, jac_a = _tag_pair(X[c1], X[c2])
             ov_b, jac_b = _tag_pair(Xt[c1], Xt[c2])
             X[f"{c1}__ov__{c2}"], Xt[f"{c1}__ov__{c2}"] = ov_a, ov_b
             X[f"{c1}__jac__{c2}"], Xt[f"{c1}__jac__{c2}"] = jac_a, jac_b
+
+    # Кросс-табличный матчинг обычных категориальных колонок из разных таблиц (пересечение словарей train >= 30%)
+    def _tbl_pfx(cname: str) -> str:
+        s = str(cname)
+        return s.split("__", 1)[0] if "__" in s else "__main__"
+
+    plain_vocabs = {}
+    for c in cat_cols:
+        if c in tag_vocab:
+            continue
+        u_tr = X[c].dropna().unique()
+        if not (2 <= len(u_tr) <= 500):
+            continue
+        v_tr = {str(v).strip().lower() for v in u_tr if str(v).strip()}
+        if 2 <= len(v_tr) <= 500:
+            plain_vocabs[c] = v_tr
+    match_pairs = []
+    plain_cols = list(plain_vocabs)
+    for i, c1 in enumerate(plain_cols):
+        p1, v1 = _tbl_pfx(c1), plain_vocabs[c1]
+        for c2 in plain_cols[i + 1:]:
+            if _tbl_pfx(c2) == p1:
+                continue
+            v2 = plain_vocabs[c2]
+            inter = v1 & v2
+            if len(inter) >= 2 and len(inter) / float(min(len(v1), len(v2))) >= 0.30:
+                jac_v = len(inter) / float(len(v1 | v2))
+                match_pairs.append((jac_v, len(inter), c1, c2))
+    if match_pairs:
+        match_pairs.sort(reverse=True)
+        norm_cache = {}
+
+        def _norm_cat_col(df_t: pd.DataFrame, col: str, tag: str):
+            key = (tag, col)
+            if key not in norm_cache:
+                s = df_t[col]
+                u = s.dropna().unique()
+                mp = {v: str(v).strip().lower() for v in u}
+                norm_cache[key] = s.map(mp)
+            return norm_cache[key]
+
+        eq_tr_dict, eq_te_dict = {}, {}
+        for _, _, c1, c2 in match_pairs[:16]:
+            a1, a2 = _norm_cat_col(X, c1, "tr"), _norm_cat_col(X, c2, "tr")
+            b1, b2 = _norm_cat_col(Xt, c1, "te"), _norm_cat_col(Xt, c2, "te")
+            ok_a = a1.notna().to_numpy() & a2.notna().to_numpy()
+            ok_b = b1.notna().to_numpy() & b2.notna().to_numpy()
+            eq_tr_dict[f"{c1}__eq__{c2}"] = np.where(ok_a, (a1 == a2).to_numpy(dtype=np.float32), np.nan).astype("float32")
+            eq_te_dict[f"{c1}__eq__{c2}"] = np.where(ok_b, (b1 == b2).to_numpy(dtype=np.float32), np.nan).astype("float32")
+        if eq_tr_dict:
+            X = pd.concat([X, pd.DataFrame(eq_tr_dict, index=X.index)], axis=1)
+            Xt = pd.concat([Xt, pd.DataFrame(eq_te_dict, index=Xt.index)], axis=1)
 
     # категориальные: частоты/ранги высокой кардинальности строго по train (без утечки частот из test)
     final_cats = []
@@ -496,7 +550,8 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
 _DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__minute", "__ord", "__cnt", "__freq",
                 "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag",
                 "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen",
-                "__sys_mean", "__sys_dev", "__n_tags")
+                "__sys_mean", "__sys_max", "__sys_dev", "__n_tags",
+                "__hist_nunique_1d", "__hist_nunique_7d", "__hist_nunique_30d")
 _DERIVED_PFX = ("stream__", "stream_grp__", "nc__", "nc_d1__", "nc_prof__", "nc_gb__", "nc_gbd__")
 
 
@@ -509,6 +564,7 @@ def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_
     cols = [c for c in X.columns if c not in skip and not str(c).endswith(_DERIVED_SFX)
             and not str(c).startswith(_DERIVED_PFX)
             and "__minus__" not in str(c) and "__ov__" not in str(c) and "__jac__" not in str(c)
+            and "__eq__" not in str(c)
             and pd.api.types.is_numeric_dtype(X[c])
             and X[c].nunique() > 2]
     if not cols:

@@ -3,11 +3,16 @@ Connection comes from standard PG* environment variables (never logged).
 """
 import ctypes as C
 import ctypes.util
+import gc
 import os
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+_INT32_MIN = -2_147_483_648
+_INT32_MAX = 2_147_483_647
 
 
 def _convert_pg_booleans(df: pd.DataFrame, bool_cols: list[str]) -> pd.DataFrame:
@@ -19,6 +24,52 @@ def _convert_pg_booleans(df: pd.DataFrame, bool_cols: list[str]) -> pd.DataFrame
         df[c] = s.map({"t": 1.0, "true": 1.0, "1": 1.0, "f": 0.0, "false": 0.0, "0": 0.0}).astype("float32")
     return df
 
+
+def _downcast_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Safe downcast (int64->int32 if in range, float64->float32 for non-IDs < 1e7) to cut peak RAM."""
+    for c in df.columns:
+        dt = df[c].dtype
+        low = str(c).lower()
+        if dt == np.int64:
+            if len(df) == 0:
+                df[c] = df[c].astype(np.int32)
+            else:
+                cmin, cmax = int(df[c].min()), int(df[c].max())
+                if _INT32_MIN <= cmin and cmax <= _INT32_MAX:
+                    df[c] = df[c].astype(np.int32)
+        elif dt == np.float64:
+            if low == 'id' or low.endswith('_id'):
+                continue
+            vals = df[c].to_numpy()
+            fin = vals[np.isfinite(vals)]
+            if len(fin) == 0 or float(np.max(np.abs(fin))) < 1e7:
+                df[c] = df[c].astype(np.float32)
+    return df
+
+
+def _spooled_temp(tmp_dir: Path | None = None):
+    d = str(tmp_dir) if (tmp_dir is not None and Path(tmp_dir).is_dir()) else None
+    try:
+        return tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, dir=d, mode="w+b")
+    except Exception:
+        return tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, mode="w+b")
+
+
+# pg_catalog.pg_constraint works for non-owner read-only roles (e.g. hack_reader), unlike information_schema on PG
+_PG_FK_SQL = (
+    "SELECT ns.nspname AS src_schema, cls.relname AS src_table, sa.attname AS src_col, "
+    "nd.nspname AS dst_schema, cld.relname AS dst_table, da.attname AS dst_col "
+    "FROM pg_catalog.pg_constraint c "
+    "JOIN pg_catalog.pg_class cls ON cls.oid = c.conrelid "
+    "JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace "
+    "JOIN pg_catalog.pg_class cld ON cld.oid = c.confrelid "
+    "JOIN pg_catalog.pg_namespace nd ON nd.oid = cld.relnamespace "
+    "JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS ord(src_att, dst_att, pos) ON TRUE "
+    "JOIN pg_catalog.pg_attribute sa ON sa.attrelid = c.conrelid AND sa.attnum = ord.src_att "
+    "JOIN pg_catalog.pg_attribute da ON da.attrelid = c.confrelid AND da.attnum = ord.dst_att "
+    "WHERE c.contype = 'f' AND ns.nspname NOT IN ('pg_catalog', 'information_schema') "
+    "ORDER BY ns.nspname, cls.relname, c.conname, ord.pos"
+)
 
 _FK_SQL = (
     "SELECT tc.table_schema AS src_schema, tc.table_name AS src_table, kcu.column_name AS src_col, "
@@ -59,13 +110,16 @@ class _PsycopgDatabase:
             return pd.DataFrame(rows, columns=cols)
 
     def foreign_keys(self):
-        try:
-            df = self.query(_FK_SQL)
-            return df.to_dict("records") if not df.empty else []
-        except Exception:
-            return []
+        for sql in (_PG_FK_SQL, _FK_SQL):
+            try:
+                df = self.query(sql)
+                if df is not None and not df.empty:
+                    return df.to_dict("records")
+            except Exception:
+                continue
+        return []
 
-    def table(self, schema, name):
+    def table(self, schema, name, tmp_dir: Path | None = None):
         quote = lambda s: '"' + s.replace('"', '""') + '"'
         literal = lambda s: "'" + s.replace("'", "''") + "'"
         types = self.query(
@@ -75,14 +129,14 @@ class _PsycopgDatabase:
         text_types = {'text', 'character varying', 'character', 'uuid'}
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
         bool_cols = [r.column_name for r in types.itertuples(index=False) if r.data_type == 'boolean']
-        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as buf:
+        with _spooled_temp(tmp_dir) as buf:
             with self.conn.cursor() as cur:
                 with cur.copy(f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER') as copy:
                     for chunk in copy:
                         buf.write(chunk)
             buf.seek(0)
             df = pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
-        return _convert_pg_booleans(df, bool_cols)
+        return _downcast_df(_convert_pg_booleans(df, bool_cols))
 
 
 class _LibpqDatabase:
@@ -139,13 +193,16 @@ class _LibpqDatabase:
             if res: self.lib.PQclear(res)
 
     def foreign_keys(self):
-        try:
-            df = self.query(_FK_SQL)
-            return df.to_dict("records") if not df.empty else []
-        except Exception:
-            return []
+        for sql in (_PG_FK_SQL, _FK_SQL):
+            try:
+                df = self.query(sql)
+                if df is not None and not df.empty:
+                    return df.to_dict("records")
+            except Exception:
+                continue
+        return []
 
-    def table(self, schema, name):
+    def table(self, schema, name, tmp_dir: Path | None = None):
         quote = lambda s: '"' + s.replace('"', '""') + '"'
         literal = lambda s: "'" + s.replace("'", "''") + "'"
         types = self.query("SELECT column_name,data_type FROM information_schema.columns WHERE table_schema="
@@ -157,7 +214,7 @@ class _LibpqDatabase:
         ok = res and self.lib.PQresultStatus(res) == 3
         if res: self.lib.PQclear(res)
         if not ok: raise RuntimeError('PostgreSQL table export failed')
-        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as buf:
+        with _spooled_temp(tmp_dir) as buf:
             while True:
                 ptr = C.c_void_p()
                 size = self.lib.PQgetCopyData(self.conn, C.byref(ptr), 0)
@@ -174,7 +231,7 @@ class _LibpqDatabase:
                 if status != 1: raise RuntimeError('PostgreSQL export did not complete')
             buf.seek(0)
             df = pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
-        return _convert_pg_booleans(df, bool_cols)
+        return _downcast_df(_convert_pg_booleans(df, bool_cols))
 
 
 def Database():
@@ -183,6 +240,58 @@ def Database():
         return _PsycopgDatabase()
     except ImportError:
         return _LibpqDatabase()
+
+
+def _fetch_column_comments(db, key_of: dict) -> list:
+    """Read COMMENT ON COLUMN metadata from pg_description when data_dictionary is absent or incomplete."""
+    try:
+        df = db.query(
+            "SELECT n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, "
+            "pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, d.description "
+            "FROM pg_catalog.pg_description d "
+            "JOIN pg_catalog.pg_class c ON c.oid = d.objoid "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid = d.objoid AND a.attnum = d.objsubid "
+            "WHERE d.objsubid > 0 AND n.nspname NOT IN ('pg_catalog','information_schema') "
+            "AND d.description IS NOT NULL AND d.description <> '' "
+            "ORDER BY n.nspname, c.relname, a.attnum"
+        )
+        if df is None or df.empty:
+            return []
+        out = []
+        for r in df.itertuples(index=False):
+            tk = key_of.get((str(r.table_schema), str(r.table_name)), str(r.table_name))
+            out.append({
+                'table': tk,
+                'column': str(r.column_name),
+                'type': str(r.data_type),
+                'description': str(r.description),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def comments_to_dictionary(comments: list, main_tables=()) -> pd.DataFrame | None:
+    """Build a data_dictionary-compatible DataFrame from pg_description column comments."""
+    if not comments:
+        return None
+    main_set = {str(t) for t in (main_tables or ())}
+    rows = []
+    seen = set()
+    for item in comments:
+        tbl = str(item.get('table', ''))
+        col = str(item.get('column', ''))
+        dtype = str(item.get('type', ''))
+        desc = str(item.get('description', '')).strip()
+        if not col or not desc:
+            continue
+        names = [col] if tbl in main_set else [f'{tbl}__{col}', col]
+        for nm in names:
+            if nm not in seen:
+                seen.add(nm)
+                rows.append({'column': nm, 'type': dtype, 'description': desc})
+    return pd.DataFrame(rows) if rows else None
 
 
 def extract(work: Path, meta: dict | None = None):
@@ -203,19 +312,23 @@ def extract(work: Path, meta: dict | None = None):
             key = row.table_name
             if key in tables:
                 key = f"{row.table_schema}__{row.table_name}"
-            tables[key] = db.table(row.table_schema, row.table_name)
+            tables[key] = db.table(row.table_schema, row.table_name, tmp_dir=work)
             key_of[(row.table_schema, row.table_name)] = key
+            if len(tables[key]) >= 500_000:
+                gc.collect()
         if isinstance(meta, dict):
             fks = []
+            seen_fk = set()
             for r in db.foreign_keys():
                 src_k = key_of.get((r.get("src_schema"), r.get("src_table")), r.get("src_table"))
                 dst_k = key_of.get((r.get("dst_schema"), r.get("dst_table")), r.get("dst_table"))
-                if src_k and dst_k and r.get("src_col") and r.get("dst_col"):
-                    fks.append({
-                        "src_table": src_k, "src_col": r["src_col"],
-                        "dst_table": dst_k, "dst_col": r["dst_col"],
-                    })
+                sc, dc = r.get("src_col"), r.get("dst_col")
+                sig = (src_k, sc, dst_k, dc)
+                if src_k and dst_k and sc and dc and sig not in seen_fk:
+                    seen_fk.add(sig)
+                    fks.append({"src_table": src_k, "src_col": sc, "dst_table": dst_k, "dst_col": dc})
             meta["foreign_keys"] = fks
+            meta["column_comments"] = _fetch_column_comments(db, key_of)
         return tables
     finally:
         db.close()

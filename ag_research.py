@@ -95,8 +95,12 @@ class Researcher:
         self.custom_counter = 0
         self.n_seeds = 1
         self.empty_llm_rounds = 0
+        self.no_gain_llm_rounds = 0
+        self.early_exit_rounds = 2 if os.environ.get("AGENT_LLM_EARLY_EXIT", "1") != "0" else 0
         self.search_tries = 0
         self.search_fails = 0
+        self.time_breakdown = {"baseline": 0.0, "builtin": 0.0, "llm_api": 0.0, "llm_eval": 0.0, "search": 0.0}
+        self._retry_sig = None
         self.orig_name = {v: k for k, v in prep.info.get("rename", {}).items()}
         self.shift_note = ""
         # сдвиг долей классов в тесте (LabelShift): если он учтён, гипотезы оцениваются под распределение теста
@@ -459,6 +463,12 @@ class Researcher:
         dtypes = ", ".join(f"{c}:{'category' if c in self.prep.cat_cols else t}" for c, t in self.prep.X.dtypes.items())
         sys_prompt = ("You fix pandas feature-engineering code. Reply with only one ```python fenced block containing the "
                       "full corrected function make_features(train, test).")
+        leak_rule = (
+            "\nCRITICAL ANTI-LEAKAGE (chronological time split): NEVER use test statistics, concat(train, test), "
+            "future shifts (shift(-k)), or test.mean()/quantile()/value_counts(). Fit any encoders/aggregates strictly "
+            "on train and map to test, or use strictly row-wise / causal (< t) computations."
+            if self.plan.time_col else ""
+        )
         user = f"""This function raised an error:
 ```python
 {code}
@@ -468,9 +478,11 @@ Error (end of traceback):
 
 Columns of train/test with dtypes: {short(dtypes, 4000)}
 make_features must return (new_train_df, new_test_df) with ONLY new numeric columns, same row order. pandas as pd and
-numpy as np are available. Fix this error and any similar problems; keep all other features."""
+numpy as np are available. Fix this error and any similar problems; keep all other features.{leak_rule}"""
+        t_api = time.time()
         text = self.llm.chat([{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
                              max_tokens=8000, temperature=0.2)
+        self.time_breakdown["llm_api"] += time.time() - t_api
         blocks = [b for b in extract_code_blocks(text) if "make_features" in b]
         return blocks[0] if blocks else None
 
@@ -493,11 +505,13 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         worker = Path(__file__).resolve().parent / "ag_worker.py"
         env = dict(os.environ)
         env.update({"OMP_NUM_THREADS": str(self.n_jobs), "PYTHONIOENCODING": "utf-8"})
+        cmd = [python_exe(), "-u", str(worker), str(d)]
         if self.plan.time_col is not None:
             env["AG_CHECK_TEMPORAL_LEAK"] = "1"
+            cmd.append(str(self.plan.time_col))
         timeout = max(30.0, min(300.0, self.budget.left() * 0.05))
         try:
-            res = subprocess.run([python_exe(), "-u", str(worker), str(d)], capture_output=True, text=True,
+            res = subprocess.run(cmd, capture_output=True, text=True,
                                  timeout=timeout, env=env, cwd=str(d))
         except subprocess.TimeoutExpired:
             h["error"] = f"код признаков не уложился в {timeout:.0f}с"
@@ -519,10 +533,18 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         except Exception:
             h["error"] = "не удалось прочитать результат кода"
             return None, None
+        stdout_txt = (res.stdout or "").strip()
+        for line in stdout_txt.splitlines():
+            if line.startswith("POISON_DROP:"):
+                dropped = [x.strip() for x in line.split(":", 1)[1].split(",") if x.strip()]
+                if dropped:
+                    h["poison_dropped"] = dropped
+                    log(f"poison-фильтр отбросил протекающие LLM-признаки ({len(dropped)}): {dropped[:8]}")
         prefix = f"llm{self.custom_counter}__"
         a.columns = [prefix + str(c) for c in a.columns]
         b.columns = [prefix + str(c) for c in b.columns]
-        log("код признаков:", (res.stdout or "").strip()[-300:])
+        ok_lines = [ln for ln in stdout_txt.splitlines() if ln.startswith("OK ")]
+        log("код признаков:", (ok_lines[-1] if ok_lines else stdout_txt)[-300:])
         return (a, b), None
 
     # ------------------------------------------------------------ эксперимент
@@ -571,6 +593,8 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
             h["error"] = repr(e)[:400]
         if h.get("repaired"):
             entry["repaired"] = True
+        if h.get("poison_dropped"):
+            entry["poison_dropped"] = list(h["poison_dropped"])[:12]
         if block is None and cfg is None:
             entry.update(accepted=False, error=h.get("error", "гипотеза неприменима"), seconds=round(time.time() - t0, 1))
             self.journal.append(entry)
@@ -765,8 +789,10 @@ Propose up to {n} NEW hypotheses that were not tried yet. Allowed action types (
 {'- {"type":"entity_history","key_columns":[...]}  (target history of the same object in previous periods)' + chr(10) + '- {"type":"recency_weight","strength":0-3}' if self.plan.time_col else ''}
 Return: {{"analysis":"<2-4 sentences: what limits the model now>","hypotheses":[{{"title":"<short>","rationale":"<why>","action":{{...}}}}]}}
 For custom_features put the code itself in a separate ```python fenced block AFTER the JSON and write "code":"BLOCK_1" (BLOCK_2 for the second such hypothesis, and so on)."""
+        t_api = time.time()
         text = self.llm.chat([{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
                              max_tokens=12000, temperature=0.5)
+        self.time_breakdown["llm_api"] += time.time() - t_api
         if not text:
             return 0
         obj = extract_json(text)
@@ -847,20 +873,35 @@ For custom_features put the code itself in a separate ```python fenced block AFT
 
     def run(self, deadline: float, max_experiments: int = 60, on_baseline=None):
         """deadline — момент (в секундах от старта), к которому исследование должно закончиться."""
+        t_b = time.time()
         self.baseline(on_baseline)
+        self.time_breakdown["baseline"] += time.time() - t_b
         if self.best_score is None:
             return
         self.builtin()
         llm_ok = self.llm is not None and self.llm.enabled
         t_start = elapsed()
         n_exp = 0
+        in_llm_round = False
+        llm_round_gained = False
+        self._retry_sig = (json.dumps(self.cfg.to_dict(), sort_keys=True, default=str), tuple(sorted(self.blocks)))
         while n_exp < max_experiments:
             if elapsed() + self.est_eval_time() > deadline:
                 log("исследование: время на эксперименты исчерпано")
                 break
+            if in_llm_round and not any(q.get("source") == "llm" for q in self.queue):
+                if llm_round_gained:
+                    self.no_gain_llm_rounds = 0
+                else:
+                    self.no_gain_llm_rounds += 1
+                    log(f"исследование: раунд LLM #{self.llm_rounds} без прироста "
+                        f"({self.no_gain_llm_rounds}/{self.early_exit_rounds or '-'})")
+                in_llm_round = False
+                if (self.early_exit_rounds > 0 and self.no_gain_llm_rounds >= self.early_exit_rounds
+                        and not any(q.get("source") == "builtin" for q in self.queue)):
+                    log(f"исследование: {self.no_gain_llm_rounds} раунда LLM подряд без прироста — ранний выход в финальные модели")
+                    break
             if self.llm_rounds == 0:
-                # первый раунд — после встроенных гипотез (но не позже середины исследования): LLM достраивает
-                # поверх пути, который агент проходит и без неё, а не закрывает его своими ранними находками
                 due = (not any(q.get("source") == "builtin" for q in self.queue)
                        or elapsed() - t_start > 0.5 * (deadline - t_start))
             else:
@@ -869,23 +910,49 @@ For custom_features put the code itself in a separate ```python fenced block AFT
                 not self.queue or due)
             if want_llm and elapsed() + self.est_eval_time() + 120 < deadline:
                 try:
-                    self.llm_round()
+                    added = self.llm_round()
+                    if added > 0:
+                        in_llm_round = True
+                        llm_round_gained = False
+                    else:
+                        self.no_gain_llm_rounds += 1
+                        if (self.early_exit_rounds > 0 and self.no_gain_llm_rounds >= self.early_exit_rounds
+                                and not any(q.get("source") == "builtin" for q in self.queue)):
+                            log(f"исследование: {self.no_gain_llm_rounds} раунда LLM подряд без прироста — ранний выход в финальные модели")
+                            break
                 except Exception:
                     log_exc("llm_round")
             if not self.queue and self.retry:
-                self.queue, self.retry = self.retry, []
+                cur_sig = (json.dumps(self.cfg.to_dict(), sort_keys=True, default=str), tuple(sorted(self.blocks)))
+                if cur_sig != self._retry_sig:
+                    self.queue, self.retry = self.retry, []
+                    self._retry_sig = cur_sig
+                else:
+                    self.retry = []
             if not self.queue:
                 h = self.search_hypothesis()
                 if h is None:
                     break
                 self.queue.append(h)
             h = self.queue.pop(0)
+            t_e = time.time()
             ok = self.try_one(h)
-            if h.get("source") == "search":
+            dt_e = time.time() - t_e
+            src = h.get("source")
+            if src == "builtin":
+                self.time_breakdown["builtin"] += dt_e
+            elif src == "llm":
+                self.time_breakdown["llm_eval"] += dt_e
+                if ok:
+                    llm_round_gained = True
+            elif src == "search":
+                self.time_breakdown["search"] += dt_e
                 self.search_fails = 0 if ok else self.search_fails + 1
             n_exp += 1
             self.since_llm += 1
             self.save()
+        if in_llm_round and not any(q.get("source") == "llm" for q in self.queue):
+            self.no_gain_llm_rounds = 0 if llm_round_gained else (self.no_gain_llm_rounds + 1)
         self.save()
 
     def search_hypothesis(self):
@@ -921,6 +988,10 @@ For custom_features put the code itself in a separate ```python fenced block AFT
         return None
 
     def save(self):
-        save_json(self.work / "journal.json", {"best_score": self.best_score, "metric": self.spec.metric,
-                                               "config": self.cfg.to_dict(), "blocks": list(self.blocks),
-                                               "journal": self.journal})
+        save_json(self.work / "journal.json", {
+            "best_score": self.best_score, "metric": self.spec.metric,
+            "config": self.cfg.to_dict(), "blocks": list(self.blocks),
+            "llm_rounds": self.llm_rounds, "no_gain_llm_rounds": self.no_gain_llm_rounds,
+            "time_breakdown": {k: round(float(v), 1) for k, v in self.time_breakdown.items()},
+            "journal": self.journal,
+        })

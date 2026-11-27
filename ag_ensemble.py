@@ -1,5 +1,7 @@
 """Смешивание моделей по OOF, решающее правило и поправка на сдвиг априорных вероятностей классов."""
 
+import time
+
 import numpy as np
 import pandas as pd
 
@@ -25,7 +27,8 @@ def _eval(spec, metric, y, p, plan=None, mask=None):
     return proba_score(metric, yy, pp) if metric in PROBA_METRICS else score(metric, spec.task_type, yy, pp)
 
 
-def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None) -> np.ndarray:
+def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None,
+                         time_budget: float = 4.0) -> np.ndarray:
     """Оптимизация весов на неотрицательном симплексе (w >= 0, sum(w) = 1) напрямую под целевую метрику регрессии."""
     from scipy.optimize import minimize
 
@@ -33,6 +36,10 @@ def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None)
     if k == 1:
         return np.ones(1, dtype=float)
     sign = 1.0 if direction(metric) == "max" else -1.0
+    deadline = time.time() + float(time_budget)
+
+    class _StopOpt(Exception):
+        pass
 
     def _softmax(z):
         z = np.asarray(z, dtype=float)
@@ -40,9 +47,21 @@ def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None)
         e = np.exp(np.clip(z, -40.0, 0.0))
         return e / np.sum(e)
 
+    best_w = np.asarray(init_w, dtype=float) if init_w is not None else np.full(k, 1.0 / k)
+    best_w = np.clip(best_w, 0.0, None)
+    best_w = best_w / max(best_w.sum(), 1e-12)
+    best_val = -sign * score(metric, "regression", y, M @ best_w)
+
     def _loss(z):
+        nonlocal best_val, best_w
+        if time.time() > deadline:
+            raise _StopOpt()
         w = _softmax(z)
-        return -sign * score(metric, "regression", y, M @ w)
+        v = -sign * score(metric, "regression", y, M @ w)
+        if np.isfinite(v) and v < best_val - 1e-12:
+            best_val = float(v)
+            best_w = w.copy()
+        return v
 
     starts = [np.zeros(k)]
     if init_w is not None and len(init_w) == k:
@@ -53,22 +72,71 @@ def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None)
     z_best[best_j] = 1.5
     starts.append(z_best)
 
-    best_w = np.asarray(init_w, dtype=float) if init_w is not None else np.full(k, 1.0 / k)
-    best_w = np.clip(best_w, 0.0, None)
-    best_w = best_w / max(best_w.sum(), 1e-12)
-    best_val = -sign * score(metric, "regression", y, M @ best_w)
-
+    n = len(y)
+    maxfev_p = 300 if n > 50_000 else 1500
+    maxfev_n = 400 if n > 50_000 else 1500
     for z0 in starts:
-        for meth, maxit in (("Powell", 600), ("Nelder-Mead", 1200)):
+        if time.time() > deadline:
+            break
+        for meth, maxit, maxfev in (("Powell", 400, maxfev_p), ("Nelder-Mead", 800, maxfev_n)):
+            if time.time() > deadline:
+                break
             try:
-                res = minimize(_loss, z0, method=meth, options={"maxiter": maxit})
+                res = minimize(_loss, z0, method=meth, options={"maxiter": maxit, "maxfev": maxfev})
                 if np.isfinite(res.fun) and res.fun < best_val - 1e-12:
                     best_val = float(res.fun)
                     best_w = _softmax(res.x)
                     z0 = res.x
+            except _StopOpt:
+                break
             except Exception:
                 continue
-    best_w = np.where(best_w < 1e-3, 0.0, best_w)
+    best_w = np.where(best_w < 0.005, 0.0, best_w)
+    s = best_w.sum()
+    return (best_w / s) if s > 0 else np.full(k, 1.0 / k)
+
+
+def _simplex_logloss_weights(P_list: list[np.ndarray], y: np.ndarray, init_w=None) -> np.ndarray:
+    """Точная быстрая оптимизация весов на неотрицательном симплексе для logloss (аналитический градиент L-BFGS-B)."""
+    from scipy.optimize import minimize
+
+    k = len(P_list)
+    if k == 1:
+        return np.ones(1, dtype=float)
+    y_arr = np.asarray(y, dtype=np.int64)
+    rows = np.arange(len(y_arr))
+    Py = np.column_stack([np.clip(np.asarray(p, dtype=np.float64)[rows, y_arr], 1e-12, 1.0) for p in P_list])
+
+    def _softmax(z):
+        z = np.asarray(z, dtype=float)
+        z = z - np.max(z)
+        e = np.exp(np.clip(z, -40.0, 0.0))
+        return e / np.sum(e)
+
+    def _nll_and_grad(z):
+        w = _softmax(z)
+        py = np.clip(Py @ w, 1e-12, 1.0)
+        loss = -float(np.mean(np.log(py)))
+        gw = -np.mean(Py / py[:, None], axis=0)
+        gz = w * (gw - float(np.dot(w, gw)))
+        return loss, gz
+
+    starts = [np.zeros(k)]
+    if init_w is not None and len(init_w) == k:
+        starts.append(np.log(np.clip(np.asarray(init_w, dtype=float), 1e-3, 1.0)))
+    best_w = np.asarray(init_w, dtype=float) if init_w is not None else np.full(k, 1.0 / k)
+    best_w = np.clip(best_w, 0.0, None)
+    best_w = best_w / max(best_w.sum(), 1e-12)
+    best_val = -float(np.mean(np.log(np.clip(Py @ best_w, 1e-12, 1.0))))
+    for z0 in starts:
+        try:
+            res = minimize(_nll_and_grad, z0, jac=True, method="L-BFGS-B", options={"maxiter": 200})
+            if np.isfinite(res.fun) and res.fun < best_val - 1e-12:
+                best_val = float(res.fun)
+                best_w = _softmax(res.x)
+        except Exception:
+            continue
+    best_w = np.where(best_w < 0.005, 0.0, best_w)
     s = best_w.sum()
     return (best_w / s) if s > 0 else np.full(k, 1.0 / k)
 
@@ -314,9 +382,9 @@ def rank_blend(results, y, mask, spec, max_steps: int = 30, plan=None):
 
 
 def stack_blend(results, y, mask, spec, plan=None):
-    """Честный вложенный OOF-стекинг (RidgeCV для регрессии, LogisticRegression по log-odds для классификации).
-    Оценка meta_oof строго out-of-fold — без переобучения на валидацию."""
-    from sklearn.linear_model import LogisticRegression, RidgeCV
+    """Честный вложенный OOF-стекинг на неотрицательном симплексе (w >= 0, sum(w) = 1) напрямую под целевую
+    метрику для регрессии (MAE, RMSLE, MAPE, RMSE) и классификации (PR-AUC, ROC-AUC, LogLoss).
+    Оценка meta_oof строго out-of-fold по границам plan.folds (>= 2 фолдов) — без отрицательных весов."""
     from sklearn.model_selection import KFold, StratifiedKFold
 
     usable = [r for r in results if r is not None and r.test is not None
@@ -326,49 +394,37 @@ def stack_blend(results, y, mask, spec, plan=None):
         return None
     ym = np.asarray(y)[idx]
 
-    def _build_meta(arrs):
-        if spec.task_type == "regression":
-            return np.column_stack([np.asarray(a, float).reshape(-1) for a in arrs])
-        # Log-odds (clipped) — линейная комбинация логитов калибрует и комбинирует вероятности разных семейств
-        parts = []
-        for a in arrs:
-            p = np.clip(np.asarray(a, float), 1e-6, 1.0 - 1e-6)
-            if p.shape[1] == 2:
-                parts.append(np.log(p[:, 1:2] / (1.0 - p[:, 1:2])))
-            else:
-                parts.append(np.log(p))
-        return np.hstack(parts)
-
-    M_oof = _build_meta([r.oof[idx] for r in usable])
-    M_test = _build_meta([r.test for r in usable])
-    if not (np.isfinite(M_oof).all() and np.isfinite(M_test).all()):
-        return None
-
-    # Строим честные вложенные фолды поверх idx: если в plan >= 3 фолдов (временных или CV), используем их границы!
+    # Строим честные вложенные фолды поверх idx строго по реальным границам plan.folds (поддержаны >= 2 фолдов)
     meta_folds = []
-    if plan is not None and len(getattr(plan, "folds", [])) >= 3:
+    if plan is not None and len(getattr(plan, "folds", [])) >= 2:
         pos = {int(g): i for i, g in enumerate(idx)}
         groups = []
         for _, va in plan.folds:
             g = np.array([pos[int(v)] for v in va if int(v) in pos], dtype=int)
             if len(g):
                 groups.append(g)
-        if len(groups) >= 3:
+        if len(groups) >= 2:
             all_i = np.arange(len(idx))
             for g in groups:
                 va_m = np.zeros(len(idx), bool)
                 va_m[g] = True
-                meta_folds.append((all_i[~va_m], g))
+                tr_i = all_i[~va_m]
+                if len(tr_i):
+                    meta_folds.append((tr_i, g))
     if not meta_folds:
         if spec.task_type != "regression":
             cnt = np.bincount(ym.astype(int))
             min_c = int(cnt[cnt > 0].min()) if (cnt > 0).any() else 0
             if min_c >= 3:
-                meta_folds = list(StratifiedKFold(min(5, min_c), shuffle=True, random_state=42).split(M_oof, ym))
+                meta_folds = list(StratifiedKFold(min(5, min_c), shuffle=True, random_state=42).split(idx, ym))
         if not meta_folds:
-            meta_folds = list(KFold(5, shuffle=True, random_state=42).split(M_oof))
+            meta_folds = list(KFold(5, shuffle=True, random_state=42).split(idx))
 
     if spec.task_type == "regression":
+        M_oof = np.column_stack([np.asarray(r.oof[idx], dtype=float).reshape(-1) for r in usable])
+        M_test = np.column_stack([np.asarray(r.test, dtype=float).reshape(-1) for r in usable])
+        if not (np.isfinite(M_oof).all() and np.isfinite(M_test).all()):
+            return None
         y_lo, y_hi = float(np.nanmin(y)), float(np.nanmax(y))
         mo = np.full(len(y), np.nan, dtype=float)
         for tr, va in meta_folds:
@@ -376,23 +432,46 @@ def stack_blend(results, y, mask, spec, plan=None):
             mo[idx[va]] = np.clip(M_oof[va] @ w_f, y_lo, y_hi)
         w_full = _simplex_reg_weights(M_oof, ym, spec.metric)
         mt = np.clip(M_test @ w_full, y_lo, y_hi)
-        weights = {r.name: round(float(c), 3) for r, c in zip(usable, w_full) if c >= 0.01}
+        weights = {r.name: round(float(c), 3) for r, c in zip(usable, w_full) if c >= 0.005}
         return {"weights": weights, "oof": mo, "test": mt,
                 "score": score(spec.metric, spec.task_type, y[mask], mo[mask])}
 
-    n_classes = usable[0].oof.shape[1]
+    P_oof = [np.clip(np.asarray(r.oof[idx], dtype=float), 1e-7, 1.0) for r in usable]
+    P_test = [np.clip(np.asarray(r.test, dtype=float), 1e-7, 1.0) for r in usable]
+    if not all(np.isfinite(p).all() for p in P_oof + P_test):
+        return None
+    P_oof = [p / np.maximum(p.sum(1, keepdims=True), 1e-12) for p in P_oof]
+    P_test = [p / np.maximum(p.sum(1, keepdims=True), 1e-12) for p in P_test]
+    metric = _blend_metric(spec)
+    n_classes = P_oof[0].shape[1]
     mo = np.full((len(y), n_classes), np.nan, dtype=float)
+
+    def _fit_cls_w(p_list, yy, use_plan=None, use_mask=None):
+        if metric == "logloss":
+            return _simplex_logloss_weights(p_list, yy)
+        w_s, _ = _simplex_cls_weights(p_list, yy, metric, spec, plan=use_plan, mask=use_mask, log_odds=False)
+        w_s = np.where(w_s < 0.005, 0.0, w_s)
+        sw = w_s.sum()
+        return (w_s / sw) if sw > 0 else np.full(len(p_list), 1.0 / len(p_list))
+
     for tr, va in meta_folds:
         if len(np.unique(ym[tr])) < 2:
             return None
-        clf = LogisticRegression(C=0.2, max_iter=200, solver="lbfgs").fit(M_oof[tr], ym[tr])
-        p = np.zeros((len(va), n_classes))
-        p[:, clf.classes_.astype(int)] = clf.predict_proba(M_oof[va])
-        mo[idx[va]] = p
-    clf_full = LogisticRegression(C=0.2, max_iter=200, solver="lbfgs").fit(M_oof, ym)
-    mt = np.zeros((len(M_test), n_classes))
-    mt[:, clf_full.classes_.astype(int)] = clf_full.predict_proba(M_test)
-    weights = {r.name: round(1.0 / len(usable), 3) for r in usable}
+        w_f = _fit_cls_w([p[tr] for p in P_oof], ym[tr])
+        p_va = sum(wi * p[va] for wi, p in zip(w_f, P_oof) if wi > 0)
+        mo[idx[va]] = p_va / np.maximum(p_va.sum(1, keepdims=True), 1e-12)
+    use_p = plan if (plan is not None and metric in RANK_METRICS and len(getattr(plan, "folds", [])) >= 2) else None
+    if metric == "logloss":
+        w_full = _simplex_logloss_weights(P_oof, ym)
+    else:
+        full_oofs = [np.asarray(r.oof, dtype=float) for r in usable]
+        w_full, _ = _simplex_cls_weights(full_oofs, y, metric, spec, plan=use_p, mask=mask, log_odds=False)
+        w_full = np.where(w_full < 0.005, 0.0, w_full)
+        sw = w_full.sum()
+        w_full = (w_full / sw) if sw > 0 else np.full(len(usable), 1.0 / len(usable))
+    mt = sum(wi * p for wi, p in zip(w_full, P_test) if wi > 0)
+    mt = mt / np.maximum(mt.sum(1, keepdims=True), 1e-12)
+    weights = {r.name: round(float(c), 3) for r, c in zip(usable, w_full) if c >= 0.005}
     return {"weights": weights, "oof": mo, "test": mt, "score": None}
 
 

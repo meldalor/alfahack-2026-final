@@ -1,72 +1,54 @@
-# Результаты ветки `exp/rodion-nowcast-ensemble-leakfix` (Родион)
+# Результаты ветки `exp/rodion-v11-resnet-pools14` (Родион)
 
-- Ветка: `exp/rodion-nowcast-ensemble-leakfix` (создана от `origin/main` `6b499e3`)
-- Затронутые файлы: `ag_database.py`, `ag_relational.py`, `ag_nowcast.py` (новый), `ag_features.py`, `ag_research.py`, `ag_metrics.py`, `ag_models.py`, `ag_ensemble.py`, `solution.py`, `tools/make_zip.py`, `tools/test_final.py`, `NOTES_rodion.md`
+- Ветка: `exp/rodion-v11-resnet-pools14` (создана от актуального `origin/main` `dc6ec5f` — **v10**, с полным переносом улучшений пулов 1–4 поверх `v10` без потери ни одной фичи или теста `v9`/`v10` и Pool 5)
+- Затронутые файлы: `ag_database.py`, `ag_relational.py`, `ag_features.py`, `ag_models.py`, `ag_ensemble.py`, `ag_worker.py`, `ag_research.py`, `solution.py`, `tools/test_final.py`, `tools/bench_pool1_ram.py`, `tools/analyze_task2_errors.py`, `tools/analyze_task1_signal.py`, `tools/bench_neural_mae.py`, `tools/bench_multiclass.py`, `NOTES_rodion.md`
 
-## Что проверено
-- **Аудит утечек `main` (`6b499e3`) и закрытие каналов утечки в AutoResearch / признаках на временных сплитах:**
-  - На `hack_final_task2` подтверждено, что в `main` базовый `_temporal_join` и `causal_stream_features` чистые, но слой AutoResearch и `prepare()` допускали утечки из будущих строк `test`: `op_freq(value_freq_cols)` менял `37/40` колонок при удалении будущих строк `test`, `op_group_dev` — `2/10`, высококардинальные категории (`>1000`) в `prepare()` использовали `train+test`, а промпт в `ag_research.py` рекомендовал статистики по `concat(train, test)`. Все эти каналы переведены в режим строго `train_only` / отключены на временных сплитах.
-  - Расширен фильтр постфактум-колонок в `_interval_join` (`actual|final|realized|outcome|result|resolved`), добавлена защита интервальных таблиц `(start_*, end_*)` от попадания в статический `many-to-one` (кроме таблиц сущностей со своим первичным ключом вида `<singular_table>_id`, таких как `campaigns` по `campaign_id`).
-- **Реляционные признаки, потоковое чтение БД и строго каузальный 1-step-ahead Nowcaster (`ag_nowcast.py`):**
-  - В `ag_database.py` `io.BytesIO()` заменён на `tempfile.SpooledTemporaryFile(max_size=64MB)` для снижения пика RAM при `COPY`.
-  - В `_temporal_join` добавлены кросс-групповые общесистемные агрегаты на тот же завершённый интервал (`__sys_mean`, `__sys_dev`), исправлен детектор бинарности `__runlen` по первой временной половине (`b[key] <= b[key].median()`), добавлен экспорт регулярных панелей в `meta['panels']`.
-  - Добавлен модуль `ag_nowcast.py`: expanding-window 1-step-ahead прогноз состояния регулярных панелей (`сезонный профиль + многовыходный Cholesky Ridge + топ-6 LightGBM`), выровненный по границам `plan.folds` и `test_cutoff`, без какого-либо доступа к текущему или будущему слоту (`t_obs <= slot - cadence`).
-  - В `ag_features.py` добавлены: `origin` для `__ord` строго от `min(train)` (сохраняет секундную точность в `float32` и исключает зависимость от `test`) + точные разности пар дат (`__minus__`); защита `{0, 1}` флагов от перевода в категории по `cat_hint`; быстрый кешированный кросс-табличный матчинг списков тегов через запятую (`__n_tags`, `__ov__`, `__jac__`, словарь строго по `train`); строго-прошлые (`< t`) групповые потоковые признаки `stream_grp__*` и фикс граничного условия `pos_in_cur_hr` (`lp >= j_hr`); фильтрация присоединённых числовых телеметрических колонок из `entity_key_candidates` и `_DERIVED_PFX` из `cross_impute_outages`/`entity_lag_cols`.
-- **Модели, функции потерь, неотрицательный симплекс-ансамбль и вложенный стекинг:**
-  - В `ag_metrics.py` добавлена пофолдовая `oof_score()` для ранжирующих метрик (`roc_auc`, `average_precision`).
-  - В `ag_models.py` добавлены: `lgb_objective` с оценкой `huber`/`fair`/`l2` по `l1` на MAE-задачах; `fit_xgb` с `objective_override='pseudohuber'` (`huber_slope=0.5*std(yt)`) и калиброванным `base_score`; `fit_hgb` (`HistGradientBoosting` с нативным `absolute_error` и категориями); `fit_cat` с `loss_override`, `l2_leaf_reg` и `border_count=128` на широких не-мультикласс задачах (`>200` признаков); исправление `fit_linear` и `fit_mlp` на временной регрессии (исключение монотонных `__ord`/`__year`, отбор `top_cols`, `QuantileTransformer(output_distribution='normal')` для MLP).
-  - В `ag_ensemble.py` реализована оптимизация весов на неотрицательном симплексе `_simplex_reg_weights` (`w >= 0, sum(w) = 1`) напрямую под целевую метрику регрессии как в `blend()`, так и во вложенном OOF-стекинге `stack_blend()` по границам `plan.folds` (полностью устранены отрицательные веса вроде `-0.19` / `-0.128` от `HuberRegressor`).
-  - В `solution.py` подключены `build_nowcast_features`, мульти-loss модели (`lgb_huber`, `cat_rmse`, `xgb_ph`), `hgb`, передача `top_cols` в `fit_linear`/`fit_hgb`/`fit_mlp` и `plan` в `blend`/`rank_blend`/`stack_blend`/`pool_results`.
-- **Юнит-тесты, сборка ZIP и серверная проверка в `/root/alfahack/exp_rodion`:**
-  - В `tools/test_final.py` добавлено 6 новых тестов (итого `37/37 PASSED` локально и на сервере).
-  - Двойной poison-аудит и онлайн-стрим аудит на реальной БД `hack_final_task2` (пробная строка `452`, `2025-08-01 06:50:00`).
-  - Полные E2E-прогоны `solution.py` с реальным LLM на `hack_final_task1` (`480s`) и `hack_final_task2` (`900s`), плюс прямой 3-fold 9-модельный бенчмарк на `hack_final_task2`.
+## Что перенесено поверх актуального `main` (`v10`, `dc6ec5f`)
+- **Сохранено 100% из `v9`/`v10` и Pool 5:** `_convert_pg_booleans`, `_unix_epoch_unit` / `_parse_time_series` (Unix epoch + `DD.MM.YYYY`), калиброванный `ag_nowcast.py`, Tier-1/Tier-2 `final_stage` с сортировкой сидов по весу, `lgb_et`, `cat_top`, `apply_zero_mape_hurdle`, `log_odds` симплекс-бленд, `tools/release_check.py`, `tools/stress_private.py` и все 56 тестов `v10`.
+- **Пул 1 — Реляционный движок, схемы Private-БД и RAM:**
+  - `ag_database.py`: чтение `FOREIGN KEY` через `pg_catalog.pg_constraint` (`contype='f'`) в первую очередь с fallback на `information_schema` (критично для read-only роли `hack_reader`, где `information_schema` может отдавать 0 строк); безопасный `_downcast_df` (`int64->int32`, не-ID `float64->float32`); `SpooledTemporaryFile(max_size=32MB, dir=work)` вместо дефолтного `/tmp`; чтение `COMMENT ON COLUMN` из `pg_catalog.pg_description` + `comments_to_dictionary` при отсутствии таблицы `data_dictionary`.
+  - `ag_relational.py`: `__sys_max` в `_temporal_join` на том же завершённом часе; строго каузальный скользящий `nunique` категорий по окнам `1d/7d/30d` (`_causal_window_cat_nunique`) в `_aggregate_child`; эвристические многоролевые джойны (`sender_id`/`receiver_id -> users.id`) при отсутствии SQL FK; запрет `_keys` на джойн по голому `timestamp` при наличии общего ID; фикс утечки `v10` на нерегулярных дочерних таблицах `(entity_id, timestamp)` с одновременными метками (`_is_irregular_timed_table` гарантированно направляет их в строго каузальный `_aggregate_child < event_time`).
+- **Пул 2 — Признаки и кросс-табличный матчинг:**
+  - `ag_features.py`: хранение `*__ord` строго в `float64` (исключает ~2.8 мин округление `float32` на стыке train/test); ускоренный векторизованный тег-матчинг (`0.497s` на 400k строках); универсальный кросс-табличный категориальный матчинг `__eq__` (пересечение словарей `>= 30%` строго по `train`, пакетная сборка через `pd.concat`).
+- **Пул 3 — Zero-dependency L1/Huber/CE нейросеть, быстрый HGB и неотрицательный симплекс-стекинг:**
+  - `ag_models.py`: `sklearn.MLPRegressor`/`MLPClassifier` (поддерживавший только L2) заменён на компактный `_NumpyTabularResNet` (`Linear(128)->LN->SiLU->Dropout->Residual(128)->Linear(64)->LN->SiLU->Dropout->Linear(out)`, `Uniform(-1/sqrt(d))`, глобальный L2 `clip_grad_norm_(5.0)`, AdamW, CosineLR, Early Stopping, `_TimeGuard`) с нативными потерями `L1`, `SmoothL1/Huber`, `MSE`, `BCEWithLogits`, `CrossEntropy` и `sample_weight`; `fit_hgb` переведён на пошаговый `warm_start=True` + раннюю остановку + `_TimeGuard` (с сохранением train-only `umap` для object-колонок и `threadpool_limits` из `v10`); добавлены ускорения мультикласса в `fit_cat` (`border_count=128` при `>= 6` классах) и `fit_xgb` (`depth<=5, max_bin=128, colsample_bytree=0.5` при `>= 10` классах).
+  - `ag_ensemble.py`: в `stack_blend` для классификации `LogisticRegression` заменён на неотрицательную оптимизацию на симплексе (`w >= 0, sum(w) = 1`) напрямую под целевую метрику (`L-BFGS-B` с аналитическим градиентом для `logloss`, быстрый `_simplex_cls_weights` для `PR-AUC`/`ROC-AUC`) с поддержкой `>= 2` временных фолдов; в `_simplex_reg_weights` добавлен wall-clock лимит `time_budget=4.0s` и `maxfev`.
+  - `solution.py`: `comments_to_dictionary` fallback, адаптивные `cat_kw`/`xgb_lr`/`xgb_depth` на мультиклассе и ограничение глубины `xgb_seed <= 6` на широких таблицах (`>100` признаков).
+- **Пул 4 — AutoResearch, 2-ступенчатый poison-фильтр и бюджет:**
+  - `ag_worker.py`: объединённый 2-ступенчатый poison-фильтр (отравление будущих строк `test` + онлайн-усечение) с точечным отбрасыванием только протекающих колонок (`POISON_DROP`) и полным отказом с ошибкой `temporal leakage detected` при утечке всех колонок.
+  - `ag_research.py` + `solution.py`: анти-утечное правило в `repair_code()`, ранний выход после 2 раундов LLM подряд без прироста (`AGENT_LLM_EARLY_EXIT=1`), запрет дублирующего `retry` без смены конфигурации (`_retry_sig`), `time_breakdown` в `journal.json`, настраиваемый сплит `AGENT_RESEARCH_FRAC=0.30`.
 
-## Что сработало (с цифрами против main)
+## Что сработало (с цифрами против `main` v8/v10)
 - **Task 2 (`hack_final_task2`, 3-fold хронологическая CV по `timestamp__ord`, MAE, строго `<= 09:00`):**
-  - Ориентиры `main` (`6b499e3`): `LightGBM = 2.273`, `XGBoost = 2.251`, `CatBoost (depth=6) = 2.162` (с AutoResearch); в прямом 3-fold бенчмарке без AutoResearch у `main`: `cat_d6 = 2.20159`, бленд `2.17265`, `mlp ~ 3.09`.
-  - Прямой 3-fold бенчмарк нашей ветки (без AutoResearch, 623 признака, `0/648` утечек):
-    - `lgb_l1`: `2.28708` (`87.6s`)
-    - `lgb_huber`: **`2.20691`** (`30.1s`, **−0.066 MAE** к `main` LightGBM `2.273`, в 2.9× быстрее `lgb_l1`)
-    - `xgb_l1`: `2.24914` (`190.5s`) -> `xgb_ph` (PseudoHuber): **`2.24195`** (`85.8s`, в 2.2× быстрее)
-    - `hgb` (L1): **`2.24279`** (`39.1s`)
-    - `mlp` (`QuantileTransformer`, без `__ord`/`__year`, `top_cols`): **`2.37586`** (`28.8s`, вместо `~3.09` в `main`)
-    - `cat_d6` (`border_count=128`): `2.19482` (`101.9s`, ускорение со `176s` до `102s`)
-    - `cat_d6_rmse` (`loss_override='RMSE'`): **`2.18734`** (`87.1s`)
-    - `cat_d7` (`border_count=128`): **`2.17331`** (`132.3s`)
-    - **Симплекс-ансамбль (`blend`):** **`2.12180`** (`cat_d7: 0.333`, `mlp: 0.218`, `cat_d6_rmse: 0.169`, `lgb_huber: 0.135`, `xgb_ph: 0.107`, `cat_d6: 0.039`, все веса `>= 0`) — улучшение **−0.051 MAE** против бленда `main` (`2.17265`) и **−0.040 MAE** против `CatBoost 2.162` из `main`.
-    - **Вложенный OOF-стекинг (`stack_blend`, строго по 3 временным фолдам):** **`2.13577`** (все веса `>= 0`).
-  - Полный E2E-прогон `solution.py` с LLM (`AGENT_TIME_BUDGET=900`): AutoResearch принял `#7 Huber (+0.08848, 3/3 фолдов)` и `#12 pairwise (+0.02421, 2/3 фолдов)` (`2.31246 -> 2.19977`); `lgb_main (Huber) = 2.19465` (**−0.078 MAE** к `main` `2.273`), `xgb_ph = 2.23220`, `hgb = 2.25020`, итоговый бленд (на 900s бюджете без CatBoost до правки `border_count=128`) = **`2.16950`**, `submission.csv` `(2219, 2), nan=0`.
-- **Task 1 (`hack_final_task1`, 2-fold хронологическая CV, PR-AUC, 322k / 77k):**
-  - Ориентир `main` (`6b499e3`): `0.1535–0.1552`.
-  - Полный E2E-прогон `solution.py` с LLM (`AGENT_TIME_BUDGET=480`): **`0.15449`** (`ранг-смесь`: `xgb 0.667 + hgb 0.333`; `xgb=0.15353`, `hgb=0.15326`, `lgb_fast=0.15288`, `lgb_main=0.15206`, `logreg=0.14883`), `submission.csv` `(77332, 2), nan=0`.
-  - Подтверждён джойн `campaigns` (`many-to-one on ['campaign_id'], cov=1.000, +5 feats`) и автодетект кросс-табличного тег-матчинга (`ads__target_interests__ov__users__interests`, `__jac__`): на 400k строках `extract=2.2s, enrich=1.9s, stream=2.6s, prepare=30.2s`.
-- **Время / пик RAM (сервер 8 CPU, 32 ГБ RAM):**
-  - Task 2 E2E (`900s`): `835.6s`, пик RAM **`3.49 GB`** (`3659176 KB`).
-  - Task 2 9-модельный бенчмарк (`bench_cat.py`, Nowcast `67.9s` + 3×CatBoost): `905.7s`, пик RAM **`3.38 GB`** (`3545636 KB`).
-  - Task 1 E2E (`480s`, 400k строк): `409.7s`, пик RAM **`3.02 GB`** (`3169484 KB`).
+  - Ориентиры: `main v8 (6b499e3)`: `CatBoost = 2.162`, `LGB = 2.273`; `v10 (dc6ec5f)` с `sklearn` L2 MLP: `mlp ~ 2.35`, бленд `~2.12–2.13`.
+  - **Новый замер `v11` (`exp/rodion-v11-resnet-pools14`, `v10` calibrated nowcast + `_NumpyTabularResNet` L1 + GBDTs, `674` признака, `timestamp__ord` `float64`):**
+    - `lgb_huber`: `2.20681` (`94.7s`)
+    - `cat` (MAE): `2.17752` (`116.0s`)
+    - `cat_rmse` (RMSE): **`2.17011`** (`93.1s`)
+    - `xgb_ph` (PseudoHuber): `2.27393` (`44.7s`)
+    - `hgb` (warm_start L1): `2.23130` (`40.4s`)
+    - `mlp_s0 = 2.12429` (`28.7s`), `mlp_s1 = 2.09411` (`29.5s`), `mlp_s2 = 2.18441` (`24.4s`) -> **`mlpx3 = 2.09764`** (`82.5s`)
+    - **Симплекс-ансамбль (`V11_BLEND`):** **`2.06668`** (`mlpx3: 0.622`, `cat_rmse: 0.279`, `cat: 0.077`, `hgb: 0.023`) — **−0.095 MAE** против `main v8` (`2.162`) и **~−0.06 MAE** против `v10`!
+    - **Вложенный 3-fold OOF-стекинг (`V11_STACK`):** **`2.06991`** (все веса `>= 0`).
+- **Стресс-стенд Private-БД (`tools/stress_private.py --primary-only --budget 60 --rows 2000 --large-rows 200000 --threads 4`):** **5 / 5 PASS**, `0` ошибок, `0` watchdog:
+  - `fraud` (`PR-AUC`): `PASS`, `PR-AUC=0.529`, `ROC-AUC=0.879`, `0.24 GiB`, `34.6s` (`logreg: 0.842`, `mlp: 0.154`).
+  - `multiclass` (`LogLoss`, 12 классов + сдвиг долей): `PASS`, `LogLoss=0.378`, `F1-macro=0.862`, `0.25 GiB`, `37.2s` — `_NumpyTabularResNet` соло дал `0.357` против `0.420` у `lgb_main`, получил вес `0.635` и довёл OOF LogLoss смеси до **`0.343`**.
+  - `regression` (`RMSLE`, 18% нулей + грязные строки): `PASS`, `RMSLE=0.966`, `0.23 GiB`, `28.4s`.
+  - `text` (русские тексты + временной сплит, `PR-AUC`): `PASS`, `PR-AUC=1.0`, `future_text_poison_delta=0.0`, `0.99 GiB`, `32.5s`.
+  - `large` (`200k` строк, `MAE`): `PASS`, `MAE=0.794`, `0.35 GiB`, `38.7s`.
+- **Замеры пулов 1–4 из серии экспериментов (подтверждены на сервере 8 CPU / 31 ГБ RAM):**
+  - **Пул 1 RAM (2M child -> 50k events, `tools/bench_pool1_ram.py`):** `SpooledTemporaryFile` RSS `0.143 GB`, `_downcast_df` `0.268 -> 0.246 GB`, `enrich` `13.74s`, общий пик RSS **`1.51 GB`**.
+  - **Пул 2 (Task 1 400k + Task 2 error decomposition):** скорость матчинга на Task 1 **`0.497s`** (`< 5s`), `48.8%` ошибок `>5 мин` на Task 2 приходятся на переходы шторма (`6.75%` строк).
+  - **Пул 3 (`torch==2.5.1+cpu` vs NumPy ResNet, 15-class multiclass):** `torch` L1 `2.1354` требует `+41s` и `+807 MB`, тогда как zero-dependency `_NumpyTabularResNet` дал `2.094–2.137` при `0s` установки; на 15 классах × 50k все 7 семейств укладываются в тайм-лимиты (`180s` и `10s`).
+  - **Пул 4 (длинные 40-минутные E2E с `Qwen3.8-27B`):** Task 2 `30/70 + early-exit` дал OOF MAE **`2.07287`** (`3.43 GB` RAM, экономия `343.5s` = 5.7 мин на AutoResearch, `0` poison-дропов) против `2.07316` у `45/55`; Task 1 `45/55` дал OOF PR-AUC **`0.15472`** (`3.31 GB` RAM, `0` poison-дропов).
 
 ## Что не сработало
-- Условное включение правила завершённого интервала по регулярному выражению из `task.md` оказалось ненадёжным на коротких формулировках задачи — оставлено безусловное правило `rt + cadence <= event_time` из `main`.
-- В первичном варианте `ag_relational.py` проверка бинарности для `__runlen` через `iloc[:len//2]` на таблице, отсортированной по `(district_id, timestamp)`, затрагивала хвост 2025 года и ломалась при отравлении будущих строк; исправлено на `b[key] <= b[key].median()`.
-- В первичном варианте `ag_nowcast.py` порог `(te_pidx >= 0).mean() < 0.5` мог отбрасывать панель при появлении новых групп в `test`, а многопоточный BLAS (8 потоков) вносил 1-ULP шум float32 (`1.22e-4`) при смене размера батча; заменено на `not (te_pidx >= 0).any()`, окно Ridge ограничено `150k` последними строками с `threadpool_limits(min(4, n_jobs))` -> аудит дал `0 / 648`.
-- `fit_cat` на 623 признаках с дефолтным `border_count=254` требовал `~176s` на первый фолд и отменялся по тайм-лимиту на коротком 900s прогоне; переход на `border_count=128` при `>200` признаках ускорил `cat_d6` до `101.9s` суммарно на 3 фолда + refit без потери качества.
-- Автоматический перехват всех таблиц с `(start_*, end_*)` в `_interval_join` первоначально перехватывал `campaigns` в Задаче 1; исправлено проверкой наличия собственного уникального ключа `<singular_table>_id` (`campaigns` вернулся к `many-to-one, cov=1.000`).
-
-## Где смотреть код
-- `ag_database.py`: `_PsycopgDatabase.table` (строки 38–53), `_LibpqDatabase.table` (строки 109–136) — `SpooledTemporaryFile` вместо `BytesIO`.
-- `ag_relational.py`: `POST_FACTUM_RE` (строка 9); `_temporal_join` (строки 88–217: экспорт панелей 130–146, `__sys_mean`/`__sys_dev` 165–169, фикс `__runlen` 170–181); `_interval_join` (строки 220–264); `enrich` (строки 368–488: защита `(start_*, end_*)` с исключением для собственного PK 382–391, заполнение `meta` 476–487).
-- `ag_nowcast.py`: целиком новый модуль (строки 1–413) — `_merge_panel_group`, `_build_causal_design`, `_seasonal_profile`, `_select_top_targets`, `build_nowcast_features`.
-- `ag_features.py`: `_expand_datetime` (строки 43–75: `origin` по `train`); `prepare` (строки 113–127: защита `{0, 1}` флагов; 183–196: точные `__minus__` разности дат; 198–250: кросс-табличный тег-матчинг `__n_tags`/`__ov__`/`__jac__`; 252–271: `train`-only высококардинальные категории `>1000`); `op_freq`/`op_dup_count`/`op_group_dev` с `train_only` (строки 332–390); `entity_lag_cols`/`entity_key_candidates`/`cross_impute_outages` (строки 446–533, 742–750); `op_text_oof` с `train`-only TF-IDF при `periods is not None` (строки 600–673); `causal_stream_features` (строки 898–993: `bin_cols` по `train`, фикс `pos_in_cur_hr`, групповые `stream_grp__*`).
-- `ag_research.py`: `seed_queue` (строки 240–276: `Huber` для MAE, отключение `value_freq_cols` и `dup_count` на временных сплитах); `materialize` (строки 328–372: `train_only=True` для `freq`/`group_dev`, поддержка `l2`); `propose` и `normalize` (строки 744–825: анти-утечный промпт для временных сплитов).
-- `ag_metrics.py`: `RANK_METRICS` и `oof_score` (строки 30, 200–216).
-- `ag_models.py`: `lgb_objective` (строки 79–95); `refit_rounds` (строки 300–310); `fit_cat` (строки 333–423: `loss_override`, `l2_leaf_reg`, `border_count=128`); `fit_xgb` (строки 429–525: `pseudohuber`, `base_score`); `fit_linear` (строки 597–700); `fit_hgb` (строки 706–803); `fit_mlp` (строки 806–896).
-- `ag_ensemble.py`: `_eval`, `_simplex_reg_weights`, `blend`, `rank_blend`, `stack_blend` (строки 18–235).
-- `solution.py`: `run`/`solve_target` (строки 232–243, 308–371: `rel_meta` + `build_nowcast_features`); `model_family`/`pool_results` (строки 439–463); `final_stage` (строки 691–750, 812–833: `lgb_huber`, `cat_rmse`, `xgb_ph`, `hgb`, `top_cols`, `lgb_huber_seed`).
-- `tools/test_final.py`: 6 новых юнит-тестов (строки 433–568).
+- Предвестники `07:00 -> 08:00 -> 09:00` (`d2` + наклон 3ч) ухудшали `lgb_huber` (`+0.003` MAE) — не добавлялись глобально.
+- `CatBoost Huber` на Task 2 дал `MAE = 3.31` — не используется (оставлены `MAE` и `RMSE`).
+- Добавление `torch==2.5.1+cpu` в `requirements.txt` признано избыточным из-за `+41s`/`807 MB` и риска `--index-url` при равном/лучшем качестве `_NumpyTabularResNet`.
 
 ## Проверка регламента
-- Утечек будущего нет (`<= 09:00` / `< t`): **да** (проверено полным двойным poison-аудитом на `hack_final_task2` для строки `452`: отравление всех 5 почасовых таблиц `>= 06:00` + отравление всех будущих/одновременных строк `test` -> **`0 / 648`** изменённых колонок; онлайн-стрим с полным удалением будущих строк `test` -> **`0 / 648`** изменённых колонок; включая `Nowcaster`, `__sys_mean`/`__sys_dev`, `__runlen`, `stream__*`, `stream_grp__*`, `op_freq(train_only=True)`, `op_group_dev(train_only=True)`).
-- Хардкода под конкретные таблицы/колонки нет: **да** (все механизмы — панельный Nowcaster, кросс-групповые агрегаты, тег-матчинг, групповые потоки, мульти-loss модели, симплекс-стекинг — определяются автоматически по схеме и типам данных).
-- Новые пакеты в `requirements.txt`: **нет** (ровно 14 пакетов из белого списка регламента без изменений, `0s` дополнительных накладных расходов).
-- `tools/test_final.py`: **passed** (`37/37 PASSED` локально в WSL и на сервере `/root/alfahack/exp_rodion`; плоский ZIP без CRLF, без секретов и без `sys.path`/`PYTHONPATH`).
+- Утечек будущего нет (`<= 09:00` / `< t`): **да** (`tools/release_check.py` `poison_audit` на реальной БД `hack_final_task2`: `sensors: 0/526`, `events: 0/526`, `combined: 0/526`; `stress_private` `future_text_poison_delta = 0.0`; 2-ступенчатый poison-фильтр в `ag_worker.py`; защита нерегулярных `(entity_id, timestamp)` таблиц в `ag_relational.py`).
+- Хардкода под конкретные таблицы/колонки нет: **да**.
+- Новые пакеты в `requirements.txt`: **нет** (ровно 14 разрешённых пакетов из белого списка без изменений).
+- Тесты и плоский ZIP: **passed** (`py_compile` OK; **`63 / 63 OK`** за `20.1s` в `tools/test_final.py`; `tools/stress_private.py` **5/5 PASS**; `dist/solution_v11.zip` прошёл `audit_zip` — `14` файлов, `126,638` байт, `SHA-256: 1c7e37c4b7b8e3c1a32699c4f091c9aef966d6af38505db65ce99051ca6cecfc`, 0 подкаталогов, 0 CRLF, 0 секретов, 0 `sys.path`/`PYTHONPATH`).

@@ -919,6 +919,192 @@ class FinalTests(unittest.TestCase):
         self.assertEqual(kept['lgb_huber'], ['lgb_huber'])
         self.assertEqual(kept['lgb'], ['lgb_main'])
 
+    def test_heuristic_multi_role_fk_and_rolling_cat_nunique(self):
+        # 1) Heuristic multi-role without explicit SQL FK: sender_id / receiver_id -> users.id
+        tr = pd.DataFrame({'event_id': [1, 2], 'sender_id': [1, 2], 'receiver_id': [2, 3], 'y': [0, 1]})
+        te = pd.DataFrame({'event_id': [3], 'sender_id': [3], 'receiver_id': [1]})
+        users = pd.DataFrame({'id': [1, 2, 3], 'tier': ['gold', 'silver', 'bronze']})
+        a, b = enrich(tr, te, {'users': users})
+        self.assertEqual(a['sender__users__tier'].tolist(), ['gold', 'silver'])
+        self.assertEqual(a['receiver__users__tier'].tolist(), ['silver', 'bronze'])
+        self.assertEqual(b['sender__users__tier'].iloc[0], 'bronze')
+        self.assertEqual(b['receiver__users__tier'].iloc[0], 'gold')
+        # 2) Strictly causal rolling categorical nunique over 1d / 7d / 30d (< event_time)
+        tr2 = pd.DataFrame({'event_id': [1], 'client_id': ['c1'], 'timestamp': ['2025-02-10 12:00:00'], 'y': [1.0]})
+        te2 = pd.DataFrame({'event_id': [2], 'client_id': ['c1'], 'timestamp': ['2025-02-10 12:00:00']})
+        tx = pd.DataFrame({
+            'client_id': ['c1'] * 6,
+            'timestamp': [
+                '2025-01-01 00:00:00',  # 40d ago
+                '2025-01-20 12:00:00',  # 21d ago (in 30d only)
+                '2025-02-05 12:00:00',  # 5d ago (in 7d & 30d)
+                '2025-02-10 06:00:00',  # 6h ago (in 1d, 7d, 30d)
+                '2025-02-10 12:00:00',  # EXACT tie -> MUST BE EXCLUDED!
+                '2025-02-11 00:00:00',  # FUTURE -> MUST BE EXCLUDED!
+            ],
+            'amt': [1000., 100., 40., 20., 99999., 88888.],
+            'cat': ['old', 'food', 'tech', 'food', 'POISON_TIE', 'POISON_FUT'],
+        })
+        a2, b2 = enrich(tr2, te2, {'tx': tx})
+        self.assertEqual(float(a2['tx__cat__hist_nunique_1d'].iloc[0]), 1.0)
+        self.assertEqual(float(a2['tx__cat__hist_nunique_7d'].iloc[0]), 2.0)
+        self.assertEqual(float(a2['tx__cat__hist_nunique_30d'].iloc[0]), 2.0)
+        self.assertEqual(float(b2['tx__cat__hist_nunique_30d'].iloc[0]), 2.0)
+
+    def test_temporal_sys_max_and_float64_ord_precision(self):
+        from ag_features import detect_time_split, prepare
+        stamps = pd.date_range('2025-01-01 00:00:00', periods=20, freq='h').astype(str).tolist()
+        dim = pd.DataFrame({'district_id': ['d1'] * 20 + ['d2'] * 20, 'timestamp': stamps * 2,
+                            'v': [float(i) for i in range(20)] + [float(i * 10) for i in range(20)]})
+        tr = pd.DataFrame({'event_id': [1, 2, 3, 4, 5, 6], 'district_id': ['d1'] * 6,
+                           'timestamp': ['2025-01-01 15:30:00', '2025-01-01 15:35:00', '2025-01-01 15:40:00',
+                                         '2025-01-01 15:45:00', '2025-01-01 15:50:00', '2025-01-01 15:59:50'],
+                           'y': [1., 2., 3., 4., 5., 6.]})
+        te = pd.DataFrame({'event_id': [7, 8], 'district_id': ['d1', 'd1'],
+                           'timestamp': ['2025-01-01 16:00:00', '2025-01-01 16:05:00']})
+        a, b = enrich(tr, te, {'sensor': dim})
+        self.assertIn('sensor__v__sys_max', a.columns)
+        self.assertAlmostEqual(float(a['sensor__v__sys_max'].iloc[0]), 140.0, places=3)
+        spec = TaskSpec('', '', id_col='event_id', target='y', task_type='regression', metric='mae')
+        prep = prepare(a, b, spec)
+        self.assertEqual(prep.X['timestamp__ord'].dtype, np.float64)
+        self.assertEqual(detect_time_split(prep.X, prep.Xt, prep.cat_cols), 'timestamp__ord')
+
+    def test_cross_table_categorical_match_train_only(self):
+        from ag_features import prepare
+        tr = pd.DataFrame({
+            'id': range(30),
+            'ads__target_gender': ['Male', 'Female', 'All'] * 10,
+            'users__gender': ['Male', 'Male', 'Female'] * 10,
+            'ads__target_age': ['18-24', '25-34', '35-44'] * 10,
+            'users__age': ['18-24', '35-44', '35-44'] * 10,
+            'ads__unrelated': ['red', 'blue', 'green'] * 10,
+            'y': np.arange(30, dtype=float),
+        })
+        te = tr.drop(columns=['y']).iloc[:6].copy()
+        te['ads__unrelated'] = ['Male', 'Female', 'Male', 'Female', 'Male', 'Female']
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        prep = prepare(tr, te, spec)
+        self.assertIn('ads__target_gender__eq__users__gender', prep.X.columns)
+        self.assertIn('ads__target_age__eq__users__age', prep.X.columns)
+        self.assertNotIn('ads__unrelated__eq__users__gender', prep.X.columns)
+        self.assertEqual(prep.X['ads__target_gender__eq__users__gender'].iloc[:3].tolist(), [1.0, 0.0, 0.0])
+        self.assertEqual(prep.X['ads__target_age__eq__users__age'].iloc[:3].tolist(), [1.0, 0.0, 1.0])
+
+    def test_simplex_stack_classification_and_regression_metrics(self):
+        from ag_ensemble import stack_blend
+        from ag_models import FitResult
+        rng = np.random.default_rng(41)
+        n = 400
+        y = rng.integers(0, 2, size=n)
+        m = np.ones(n, bool)
+        s_good = (2.0 * y - 1.0) + rng.normal(0, 0.9, n)
+        def to_p(z):
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -15, 15)))
+            return np.column_stack([1.0 - p, p])
+        r1 = FitResult('good1', to_p(s_good), to_p(rng.normal(size=20)), 0.85, [], [], None, 1.0)
+        r2 = FitResult('good2', to_p(s_good + rng.normal(0, 0.4, n)), to_p(rng.normal(size=20)), 0.82, [], [], None, 1.0)
+        r_bad = FitResult('noisy', to_p(rng.normal(0, 2.5, n)), to_p(rng.normal(size=20)), 0.50, [], [], None, 1.0)
+        X_t = pd.DataFrame({'t': np.arange(n, dtype=float)})
+        plan2 = make_plan(X_t, y, 'binary', time_col='t')
+        for met in ('average_precision', 'logloss'):
+            spec = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric=met, classes=[0, 1])
+            sb = stack_blend([r1, r2, r_bad], y, plan2.oof_mask if plan2.oof_mask.sum() >= 300 else m, spec,
+                             plan=plan2 if plan2.oof_mask.sum() >= 300 else None)
+            self.assertIsNotNone(sb)
+            self.assertTrue(all(w >= 0.0 for w in sb['weights'].values()), f'Negative weight in {met}: {sb["weights"]}')
+            self.assertAlmostEqual(sum(sb['weights'].values()), 1.0, places=2)
+            self.assertLess(sb['weights'].get('noisy', 0.0), 0.15)
+        yr = np.exp(rng.normal(2.0, 0.5, n))
+        rr1 = FitResult('g1', np.clip(yr * rng.normal(1.0, 0.08, n), 0.1, None), np.full(10, 7.0), 0.1, [], [], None, 1.0)
+        rr2 = FitResult('g2', np.clip(yr * rng.normal(1.0, 0.12, n), 0.1, None), np.full(10, 7.0), 0.15, [], [], None, 1.0)
+        rr3 = FitResult('bad', np.clip(yr * rng.normal(2.0, 0.8, n), 0.1, None), np.full(10, 15.0), 0.9, [], [], None, 1.0)
+        for met in ('rmsle', 'mape'):
+            spec_r = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric=met)
+            sbr = stack_blend([rr1, rr2, rr3], yr, m, spec_r)
+            self.assertIsNotNone(sbr)
+            self.assertTrue(all(w >= 0.0 for w in sbr['weights'].values()))
+            self.assertAlmostEqual(sum(sbr['weights'].values()), 1.0, places=2)
+            self.assertLess(sbr['weights'].get('bad', 0.0), 0.05)
+
+    def test_worker_poison_filter_drops_leaky_features(self):
+        import subprocess
+        worker = Path(__file__).resolve().parents[1] / 'ag_worker.py'
+        rng = np.random.default_rng(51)
+        tr = pd.DataFrame({'t__ord': np.arange(100, dtype=np.float64), 'a': rng.normal(size=100), 'b': rng.normal(size=100)})
+        te = pd.DataFrame({'t__ord': np.arange(100, 160, dtype=np.float64), 'a': rng.normal(size=60), 'b': rng.normal(size=60)})
+        code = (
+            "def make_features(train, test):\n"
+            "    tr_out = pd.DataFrame(index=train.index)\n"
+            "    te_out = pd.DataFrame(index=test.index)\n"
+            "    tr_out['clean_sum'] = train['a'] + train['b']\n"
+            "    te_out['clean_sum'] = test['a'] + test['b']\n"
+            "    tr_out['leak_test_mean'] = train['a'] - test['a'].mean()\n"
+            "    te_out['leak_test_mean'] = test['a'] - test['a'].mean()\n"
+            "    tr_out['leak_shift_fut'] = train['a'].shift(-1).fillna(0.0)\n"
+            "    te_out['leak_shift_fut'] = test['a'].shift(-1).fillna(0.0)\n"
+            "    return tr_out, te_out\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d)
+            tr.to_pickle(dp / 'train.pkl'); te.to_pickle(dp / 'test.pkl')
+            (dp / 'code.py').write_text(code, encoding='utf-8')
+            res = subprocess.run([sys.executable, '-u', str(worker), str(dp), 't__ord'], capture_output=True, text=True, timeout=30)
+            self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+            out_tr = pd.read_pickle(dp / 'out_train.pkl')
+            self.assertIn('clean_sum', out_tr.columns)
+            self.assertNotIn('leak_test_mean', out_tr.columns)
+            self.assertNotIn('leak_shift_fut', out_tr.columns)
+            self.assertIn('POISON_DROP:', res.stdout)
+
+    def test_downcast_and_pg_description_comments(self):
+        from ag_database import _downcast_df, comments_to_dictionary
+        df = pd.DataFrame({
+            'id': np.array([10 ** 12, 10 ** 12 + 1], dtype=np.int64),
+            'small_int': np.array([1, 2], dtype=np.int64),
+            'val': np.array([1.5, 2.5], dtype=np.float64),
+            'big_id': np.array([1e12, 1e12 + 1], dtype=np.float64),
+        })
+        dc = _downcast_df(df.copy())
+        self.assertEqual(dc['id'].dtype, np.int64)
+        self.assertEqual(dc['small_int'].dtype, np.int32)
+        self.assertEqual(dc['val'].dtype, np.float32)
+        self.assertEqual(dc['big_id'].dtype, np.float64)
+        dic = comments_to_dictionary([
+            {'table': 'train', 'column': 'amount', 'type': 'numeric', 'description': 'Order amount in RUB'},
+            {'table': 'users', 'column': 'tier', 'type': 'text', 'description': 'User loyalty tier'},
+        ], main_tables={'train', 'test'})
+        self.assertIsNotNone(dic)
+        self.assertIn('amount', dic['column'].tolist())
+        self.assertIn('users__tier', dic['column'].tolist())
+
+    def test_autoresearch_early_exit_after_two_no_gain_llm_rounds(self):
+        from ag_features import Prepared
+        from ag_research import Researcher
+        from ag_utils import Budget
+        rng = np.random.default_rng(77)
+        X = pd.DataFrame({'a': rng.normal(size=120), 'b': rng.normal(size=120)})
+        Xt = pd.DataFrame({'a': rng.normal(size=20), 'b': rng.normal(size=20)})
+        y = 2.0 * X['a'].values + rng.normal(0, 0.3, 120)
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        plan = make_plan(X, y, 'regression', n_folds=3)
+        prep = Prepared(X=X, Xt=Xt, y=y, cat_cols=[])
+
+        class DummyLLM:
+            enabled = True
+            calls = 0
+            def chat(self, *args, **kwargs):
+                self.calls += 1
+                return '{"analysis":"test","hypotheses":[{"title":"noop","rationale":"r","action":{"type":"params","params":{"min_split_gain":' + str(5.0 + self.calls) + '}}}]}'
+
+        with tempfile.TemporaryDirectory() as d:
+            r = Researcher(spec, prep, plan, DummyLLM(), Budget(300.0), n_jobs=2, work=Path(d))
+            r.queue = []
+            r.builtin = lambda: None
+            r.run(deadline=1e9, max_experiments=20)
+            self.assertEqual(r.llm_rounds, 2)
+            self.assertEqual(r.no_gain_llm_rounds, 2)
+
 
 class Pool5HarnessTests(unittest.TestCase):
     def test_synthetic_generators_deterministic_and_disjoint(self):

@@ -363,6 +363,11 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
     if spec.task_type == "regression":
         eval_m = {"mae": "MAE", "medae": "MAE", "smape": "MAE", "mape": "MAPE"}.get(spec.metric, "RMSE")
         loss = loss_override or eval_m
+        if loss == "Huber":
+            delta = float(np.std(yt) * 0.5)
+            if not np.isfinite(delta) or delta <= 1e-4:
+                delta = 1.0
+            loss = f"Huber:delta={delta:.4f}"
         model_cls, extra = CatBoostRegressor, {"loss_function": loss, "eval_metric": eval_m}
     elif spec.task_type == "binary":
         ev = {"roc_auc": "AUC", "average_precision": "PRAUC"}.get(spec.metric, "Logloss")
@@ -387,7 +392,7 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
                  verbose=False, allow_writing_files=False, **extra)
         if len(cols) > 100 and spec.task_type != "multiclass":
             p["rsm"] = 0.75
-        if len(cols) > 200 and spec.task_type != "multiclass":
+        if len(cols) > 200 or (spec.task_type == "multiclass" and n_classes >= 6):
             p["border_count"] = 128
         if use_es:
             p.update(od_type="Iter", od_wait=es, use_best_model=True)
@@ -448,10 +453,11 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
     wide = len(cols) > 100
-    params = {"tree_method": "hist", "eta": lr, "max_depth": depth, "subsample": 0.8,
-              "colsample_bytree": 0.55 if wide else 0.7, "min_child_weight": 5 if wide else 3,
+    mc_many = spec.task_type == "multiclass" and n_classes >= 10
+    params = {"tree_method": "hist", "eta": lr, "max_depth": min(depth, 5) if mc_many else depth, "subsample": 0.8,
+              "colsample_bytree": 0.5 if mc_many else (0.55 if wide else 0.7), "min_child_weight": 5 if wide else 3,
               "lambda": 3.0 if wide else 1.0, "nthread": n_jobs, "seed": seed, "max_cat_to_onehot": 1,
-              "max_bin": 256}
+              "max_bin": 128 if mc_many else 256}
     if spec.task_type == "regression":
         eval_m = "mae" if spec.metric in ("mae", "medae", "smape") else "rmse"
         if objective_override == "pseudohuber":
@@ -732,11 +738,13 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
 def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
             lr: float = 0.05, max_leaf_nodes: int = 31, max_iter: int = 450, seed: int = 0,
             name: str = "hgb", top_cols: list | None = None, max_cols: int = 160) -> FitResult | None:
-    """HistGradientBoosting (sklearn): быстрый независимый бустинг на CPU, нативная поддержка категорий и L1."""
+    """HistGradientBoosting (sklearn): быстрый независимый бустинг на CPU, нативная поддержка категорий и L1.
+    Обучается чанками через warm_start с ранней остановкой и строгим контролем time_limit (без двойного refit)."""
     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
     from ag_metrics import better
 
     t0 = time.time()
+    guard = _TimeGuard(time_limit)
     cols = [c for c in X.columns if c not in set(cfg.drop)]
     if top_cols and len(cols) > max_cols:
         chosen = [c for c in top_cols if c in cols][:max_cols]
@@ -769,17 +777,19 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     if n > 100_000:
         max_iter = min(max_iter, 300)
-    if spec.task_type == "multiclass" and n_classes > 5:
-        max_iter = min(max_iter, 250)
+    if spec.task_type == "multiclass" and n_classes >= 6:
+        max_iter = min(max_iter, 150 if (n_classes >= 10 and n > 30_000) else 200)
+        lr = max(lr, 0.08)
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
     cats_arg = cat_mask if any(cat_mask) else None
+    n_parts = len(plan.folds) + (1 if plan.mode == "refit" else 0)
 
-    def make(iters):
+    def make(iters, warm: bool = True):
         common = dict(learning_rate=lr, max_leaf_nodes=max_leaf_nodes, max_iter=iters,
                       min_samples_leaf=30 if n < 100_000 else 80, l2_regularization=1.0,
-                      categorical_features=cats_arg, early_stopping=False, random_state=seed)
+                      categorical_features=cats_arg, early_stopping=False, warm_start=warm, random_state=seed)
         if spec.task_type == "regression":
             loss = "absolute_error" if spec.metric in ("mae", "medae", "smape") else "squared_error"
             return HistGradientBoostingRegressor(loss=loss, **common)
@@ -792,6 +802,7 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         p[:, m.classes_.astype(int)] = m.predict_proba(df)
         return p
 
+    chunk = 20 if (spec.task_type == "multiclass" and n_classes >= 6) else 30
     shape = (n, n_classes) if spec.task_type != "regression" else (n,)
     oof = np.full(shape, np.nan)
     test, iters = [], []
@@ -805,53 +816,281 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         for k, (tr, va) in enumerate(plan.folds):
             if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
                 return None
-            m = make(max_iter)
-            m.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
-            best_it, best_sc, best_p = m.n_iter_, None, None
-            step = max(5, m.n_iter_ // 25)
-            staged = m.staged_predict(X_in.iloc[va]) if spec.task_type == "regression" else m.staged_predict_proba(X_in.iloc[va])
-            for idx_it, sp in enumerate(staged, 1):
-                if idx_it % step != 0 and idx_it != m.n_iter_:
-                    continue
-                if spec.task_type == "regression":
-                    cand = inverse_target(sp, cfg.target_transform)
-                else:
-                    cand = np.zeros((len(va), n_classes))
-                    cand[:, m.classes_.astype(int)] = sp
+            fold0_lim = t0 + 1.3 * time_limit / n_parts if k == 0 else None
+            m = make(min(chunk, max_iter), warm=True)
+            best_it, best_sc, best_p, best_tp = 0, None, None, None
+            no_imp = 0
+            cur_it = 0
+            while cur_it < max_iter:
+                cur_it = min(max_iter, cur_it + chunk)
+                m.max_iter = cur_it
+                m.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
+                cand = pred(m, X_in.iloc[va])
                 sc = score(spec.metric, spec.task_type, y[va], cand)
                 if best_sc is None or better(sc, best_sc, spec.metric):
-                    best_sc, best_it, best_p = sc, idx_it, cand
-            iters.append(best_it)
+                    best_sc, best_it, best_p = sc, cur_it, cand
+                    if plan.mode == "cv" and Xt_in is not None:
+                        best_tp = pred(m, Xt_in)
+                    no_imp = 0
+                else:
+                    no_imp += 1
+                if no_imp >= 3:
+                    break
+                if fold0_lim is not None and time.time() > fold0_lim:
+                    log(f"{name}: первый фолд не уложился в {1.3 * time_limit / n_parts:.0f}s — модель пропущена")
+                    return None
+                if guard.stop_training():
+                    break
+            iters.append(max(best_it, chunk))
             oof[va] = best_p if best_p is not None else pred(m, X_in.iloc[va])
             if plan.mode == "cv" and Xt_in is not None:
-                if best_it >= m.n_iter_:
-                    test.append(pred(m, Xt_in))
-                else:
-                    m_cv = make(best_it)
-                    m_cv.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
-                    test.append(pred(m_cv, Xt_in))
+                test.append(best_tp if best_tp is not None else pred(m, Xt_in))
             if k == 0 and _too_slow(t0, plan, time_limit, name):
                 return None
+            if guard.expired() and k < len(plan.folds) - 1:
+                log(f"{name}: время вышло на фолде {k + 1}/{len(plan.folds)}")
+                return _finish(name, oof, None, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
         if plan.mode == "refit" and Xt_in is not None:
-            n_round = refit_rounds(iters, plan, len(X))
-            m = make(min(max_iter, n_round))
+            n_round = min(max_iter, refit_rounds(iters, plan, len(X)))
+            m = make(n_round, warm=False)
             m.fit(X_in, yt, sample_weight=w)
             test = pred(m, Xt_in)
-    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg)
+    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
+
+
+class _NumpyTabularResNet:
+    """Компактная табличная нейросеть ResNet/MLP на чистом NumPy/OpenBLAS с поддержкой
+    L1, SmoothL1 (Huber), MSE, BCEWithLogits и CrossEntropy, LayerNorm, SiLU, Dropout и AdamW."""
+
+    def __init__(self, d_in: int, d_out: int, loss_kind: str = "l1", hidden: int = 128,
+                 h2: int = 64, dropout: float = 0.12, lr: float = 2.5e-3, wd: float = 1e-2,
+                 huber_delta: float = 0.35, seed: int = 0):
+        self.loss_kind = loss_kind
+        self.d_out = d_out
+        self.dropout = float(dropout)
+        self.lr = float(lr)
+        self.wd = float(wd)
+        self.delta = float(huber_delta)
+        self.rng = np.random.default_rng(seed)
+
+        def _lin(a, b):
+            lim = 1.0 / np.sqrt(max(a, 1))
+            return self.rng.uniform(-lim, lim, size=(a, b)).astype(np.float32)
+
+        def _bias(a, b):
+            lim = 1.0 / np.sqrt(max(a, 1))
+            return self.rng.uniform(-lim, lim, size=(b,)).astype(np.float32)
+
+        self.p = {
+            "W1": _lin(d_in, hidden), "b1": _bias(d_in, hidden),
+            "g1": np.ones(hidden, np.float32), "be1": np.zeros(hidden, np.float32),
+            "Wr": _lin(hidden, hidden), "br": _bias(hidden, hidden),
+            "gr": np.ones(hidden, np.float32), "ber": np.zeros(hidden, np.float32),
+            "W2": _lin(hidden, h2), "b2": _bias(hidden, h2),
+            "g2": np.ones(h2, np.float32), "be2": np.zeros(h2, np.float32),
+            "W3": _lin(h2, d_out), "b3": _bias(h2, d_out),
+        }
+        self.m = {k: np.zeros_like(v) for k, v in self.p.items()}
+        self.v = {k: np.zeros_like(v) for k, v in self.p.items()}
+        self.step_t = 0
+        self.n_iter_ = 0
+
+    @staticmethod
+    def _ln_fwd(x, g, be):
+        mu = x.mean(axis=1, keepdims=True)
+        xc = x - mu
+        inv = 1.0 / np.sqrt(np.mean(xc * xc, axis=1, keepdims=True) + 1e-5)
+        xh = xc * inv
+        return xh * g + be, (xh, inv, g)
+
+    @staticmethod
+    def _ln_bwd(dy, cache):
+        xh, inv, g = cache
+        dg = np.sum(dy * xh, axis=0)
+        dbe = np.sum(dy, axis=0)
+        dxh = dy * g
+        dx = inv * (dxh - np.mean(dxh, axis=1, keepdims=True) - xh * np.mean(dxh * xh, axis=1, keepdims=True))
+        return dx, dg, dbe
+
+    @staticmethod
+    def _silu_fwd(x):
+        s = 1.0 / (1.0 + np.exp(-np.clip(x, -20.0, 20.0)))
+        return x * s, (x, s)
+
+    @staticmethod
+    def _silu_bwd(dy, cache):
+        x, s = cache
+        return dy * (s * (1.0 + x * (1.0 - s)))
+
+    def _forward(self, x: np.ndarray, train: bool = False):
+        p = self.p
+        z1 = x @ p["W1"] + p["b1"]
+        n1, c_n1 = self._ln_fwd(z1, p["g1"], p["be1"])
+        a1, c_a1 = self._silu_fwd(n1)
+        if train and self.dropout > 0:
+            m1 = (self.rng.random(a1.shape, dtype=np.float32) >= self.dropout).astype(np.float32) / (1.0 - self.dropout)
+            a1d = a1 * m1
+        else:
+            m1, a1d = None, a1
+        zr = a1d @ p["Wr"] + p["br"]
+        nr, c_nr = self._ln_fwd(zr, p["gr"], p["ber"])
+        ar, c_ar = self._silu_fwd(nr)
+        if train and self.dropout > 0:
+            mr = (self.rng.random(ar.shape, dtype=np.float32) >= self.dropout).astype(np.float32) / (1.0 - self.dropout)
+            h1 = a1d + ar * mr
+        else:
+            mr, h1 = None, a1d + ar
+        z2 = h1 @ p["W2"] + p["b2"]
+        n2, c_n2 = self._ln_fwd(z2, p["g2"], p["be2"])
+        a2, c_a2 = self._silu_fwd(n2)
+        if train and self.dropout > 0:
+            m2 = (self.rng.random(a2.shape, dtype=np.float32) >= self.dropout * 0.7).astype(np.float32) / (1.0 - self.dropout * 0.7)
+            a2d = a2 * m2
+        else:
+            m2, a2d = None, a2
+        out = a2d @ p["W3"] + p["b3"]
+        return out, (x, c_n1, c_a1, m1, a1d, c_nr, c_ar, mr, h1, c_n2, c_a2, m2, a2d)
+
+    def _loss_grad(self, out: np.ndarray, y: np.ndarray, sw: np.ndarray):
+        w = sw / max(float(sw.sum()), 1e-12)
+        if self.loss_kind == "huber":
+            diff = out[:, 0] - y
+            ad = np.abs(diff)
+            loss = float(np.sum(w * np.where(ad <= self.delta, 0.5 * diff * diff / self.delta, ad - 0.5 * self.delta)))
+            g = np.where(ad <= self.delta, diff / self.delta, np.sign(diff)) * w
+            return loss, g[:, None].astype(np.float32)
+        if self.loss_kind == "l1":
+            diff = out[:, 0] - y
+            loss = float(np.sum(w * np.abs(diff)))
+            g = np.sign(diff) * w
+            return loss, g[:, None].astype(np.float32)
+        if self.loss_kind == "mse":
+            diff = out[:, 0] - y
+            loss = float(np.sum(w * 0.5 * diff * diff))
+            return loss, (diff * w)[:, None].astype(np.float32)
+        if self.loss_kind == "bce":
+            z = np.clip(out[:, 0], -20.0, 20.0)
+            p = 1.0 / (1.0 + np.exp(-z))
+            loss = float(np.sum(w * (np.logaddexp(0.0, z) - y * z)))
+            return loss, ((p - y) * w)[:, None].astype(np.float32)
+        z = out - np.max(out, axis=1, keepdims=True)
+        ez = np.exp(np.clip(z, -30.0, 0.0))
+        pr = ez / np.sum(ez, axis=1, keepdims=True)
+        yi = y.astype(np.int64)
+        loss = float(-np.sum(w * np.log(np.clip(pr[np.arange(len(yi)), yi], 1e-12, 1.0))))
+        pr[np.arange(len(yi)), yi] -= 1.0
+        return loss, (pr * w[:, None]).astype(np.float32)
+
+    def fit(self, X: np.ndarray, y: np.ndarray, sw: np.ndarray, max_epochs: int = 55,
+            batch_size: int = 256, patience: int = 10, guard: _TimeGuard | None = None,
+            n_jobs: int = 4):
+        try:
+            from threadpoolctl import threadpool_limits
+            ctx = threadpool_limits(limits=min(4, max(1, n_jobs)))
+        except Exception:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        n = len(X)
+        idx = self.rng.permutation(n)
+        n_va = max(32, min(int(0.1 * n), 5000))
+        if n < 160:
+            n_va = max(16, int(0.15 * n))
+        va_i, tr_i = idx[:n_va], idx[n_va:]
+        Xtr, ytr, wtr = X[tr_i], y[tr_i], sw[tr_i]
+        Xva, yva, wva = X[va_i], y[va_i], sw[va_i]
+        best_val = float("inf")
+        best_p = {k: v.copy() for k, v in self.p.items()}
+        no_imp = 0
+
+        with ctx:
+            for ep in range(max_epochs):
+                if guard is not None and guard.stop_training():
+                    break
+                lr_ep = self.lr * (0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * ep / max(max_epochs, 1))))
+                perm = self.rng.permutation(len(Xtr))
+                for s in range(0, len(Xtr), batch_size):
+                    bi = perm[s:s + batch_size]
+                    out, cache = self._forward(Xtr[bi], train=True)
+                    _, dout = self._loss_grad(out, ytr[bi], wtr[bi])
+                    x, c_n1, c_a1, m1, a1d, c_nr, c_ar, mr, h1, c_n2, c_a2, m2, a2d = cache
+                    grads = {}
+                    grads["W3"] = a2d.T @ dout
+                    grads["b3"] = dout.sum(axis=0)
+                    da2d = dout @ self.p["W3"].T
+                    da2 = da2d * m2 if m2 is not None else da2d
+                    dn2 = self._silu_bwd(da2, c_a2)
+                    dz2, grads["g2"], grads["be2"] = self._ln_bwd(dn2, c_n2)
+                    grads["W2"] = h1.T @ dz2
+                    grads["b2"] = dz2.sum(axis=0)
+                    dh1 = dz2 @ self.p["W2"].T
+                    dar = dh1 * mr if mr is not None else dh1
+                    dnr = self._silu_bwd(dar, c_ar)
+                    dzr, grads["gr"], grads["ber"] = self._ln_bwd(dnr, c_nr)
+                    grads["Wr"] = a1d.T @ dzr
+                    grads["br"] = dzr.sum(axis=0)
+                    da1d = dh1 + dzr @ self.p["Wr"].T
+                    da1 = da1d * m1 if m1 is not None else da1d
+                    dn1 = self._silu_bwd(da1, c_a1)
+                    dz1, grads["g1"], grads["be1"] = self._ln_bwd(dn1, c_n1)
+                    grads["W1"] = x.T @ dz1
+                    grads["b1"] = dz1.sum(axis=0)
+
+                    gnorm = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads.values())))
+                    gscale = (5.0 / gnorm) if gnorm > 5.0 else 1.0
+
+                    self.step_t += 1
+                    bc1 = 1.0 - 0.9 ** self.step_t
+                    bc2 = 1.0 - 0.999 ** self.step_t
+                    for k, g in grads.items():
+                        if gscale < 1.0:
+                            g = g * gscale
+                        if k.startswith("W"):
+                            self.p[k] *= (1.0 - lr_ep * self.wd)
+                        self.m[k] = 0.9 * self.m[k] + 0.1 * g
+                        self.v[k] = 0.999 * self.v[k] + 0.001 * (g * g)
+                        mh = self.m[k] / bc1
+                        vh = self.v[k] / bc2
+                        self.p[k] -= lr_ep * mh / (np.sqrt(vh) + 1e-8)
+
+                va_out, _ = self._forward(Xva, train=False)
+                vloss, _ = self._loss_grad(va_out, yva, wva)
+                self.n_iter_ = ep + 1
+                if np.isfinite(vloss) and vloss < best_val - 1e-5:
+                    best_val = vloss
+                    best_p = {k: v.copy() for k, v in self.p.items()}
+                    no_imp = 0
+                else:
+                    no_imp += 1
+                    if no_imp >= patience:
+                        break
+        self.p = best_p
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        out, _ = self._forward(X, train=False)
+        if self.loss_kind in ("huber", "l1", "mse"):
+            return out[:, 0].astype(np.float64)
+        if self.loss_kind == "bce":
+            p1 = 1.0 / (1.0 + np.exp(-np.clip(out[:, 0], -20.0, 20.0)))
+            return np.column_stack([1.0 - p1, p1]).astype(np.float64)
+        z = out - np.max(out, axis=1, keepdims=True)
+        ez = np.exp(np.clip(z, -30.0, 0.0))
+        return (ez / np.sum(ez, axis=1, keepdims=True)).astype(np.float64)
 
 
 def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
             seed: int = 0, name: str = "mlp", top_cols: list | None = None,
             max_cols: int = 80) -> FitResult | None:
-    """Табличная нейросеть MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
-    (QuantileTransformer) + OHE категорий, другая индуктивная предвзятость для ансамбля и стекинга."""
-    from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+    """Табличная нейросеть ResNet/MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
+    (QuantileTransformer) + OHE категорий, нативная поддержка L1 (под MAE), MSE, BCE и CrossEntropy."""
+    from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
-    from sklearn.neural_network import MLPClassifier, MLPRegressor
     from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import OneHotEncoder, QuantileTransformer, StandardScaler
+    from sklearn.preprocessing import OneHotEncoder, QuantileTransformer
 
     t0 = time.time()
+    guard = _TimeGuard(time_limit)
     cols = [c for c in X.columns if c not in set(cfg.drop)]
     if plan.time_col is not None and spec.task_type == "regression":
         non_mono = [c for c in cols if c != plan.time_col and not str(c).endswith(("__ord", "__year"))]
@@ -879,10 +1118,19 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
 
     n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
+    tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
+    w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight).astype(np.float32)
     y_lo = float(np.nanmin(y)) if spec.task_type == "regression" else None
     y_hi = float(np.nanmax(y)) if spec.task_type == "regression" else None
+    if spec.task_type == "regression":
+        loss_kind = "l1" if spec.metric in ("mae", "medae", "smape") else "mse"
+        d_out = 1
+    elif spec.task_type == "binary":
+        loss_kind, d_out = "bce", 1
+    else:
+        loss_kind, d_out = "ce", n_classes
 
-    def build_model(n_fit: int):
+    def build_pre(n_fit: int):
         tf = []
         if num_cols:
             tf.append(("num", make_pipeline(
@@ -894,22 +1142,34 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             tf.append(("cat", OneHotEncoder(
                 handle_unknown="ignore", min_frequency=10, max_categories=40, sparse_output=False,
             ), cat_cols))
-        pre = ColumnTransformer(tf, sparse_threshold=0.0)
-        bs = int(min(256, max(32, n_fit // 20)))
-        common = dict(hidden_layer_sizes=(128, 64), activation="relu", alpha=1e-2, batch_size=bs,
-                      learning_rate_init=1e-3, max_iter=80, early_stopping=True, validation_fraction=0.1,
-                      n_iter_no_change=10, random_state=seed)
-        if spec.task_type == "regression":
-            return make_pipeline(pre, TransformedTargetRegressor(regressor=MLPRegressor(**common),
-                                                                 transformer=StandardScaler()))
-        return make_pipeline(pre, MLPClassifier(**common))
+        return ColumnTransformer(tf, sparse_threshold=0.0)
 
-    def pred(m, df):
+    def fit_one(df_tr, y_tr, w_tr, ep_seed: int):
+        pre = build_pre(len(df_tr))
+        Z = np.asarray(pre.fit_transform(df_tr), dtype=np.float32)
+        Z = np.where(np.isfinite(Z), Z, 0.0)
         if spec.task_type == "regression":
-            return np.clip(inverse_target(m.predict(df), cfg.target_transform), y_lo, y_hi)
-        p = np.zeros((len(df), n_classes))
-        clf = m.steps[-1][1]
-        p[:, clf.classes_.astype(int)] = m.predict_proba(df)
+            y_med = float(np.median(y_tr))
+            y_sc = float(np.std(y_tr))
+            if not np.isfinite(y_sc) or y_sc < 1e-6:
+                y_sc = 1.0
+            y_norm = ((y_tr - y_med) / y_sc).astype(np.float32)
+        else:
+            y_med, y_sc = 0.0, 1.0
+            y_norm = y_tr.astype(np.float32) if spec.task_type == "binary" else y_tr.astype(np.int64)
+        bs = int(min(256, max(32, len(df_tr) // 30)))
+        max_ep = 40 if len(df_tr) > 40_000 else 65
+        net = _NumpyTabularResNet(Z.shape[1], d_out, loss_kind=loss_kind, seed=ep_seed)
+        net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=10, guard=guard, n_jobs=n_jobs)
+        return pre, net, y_med, y_sc
+
+    def pred_one(bundle, df):
+        pre, net, y_med, y_sc = bundle
+        Z = np.asarray(pre.transform(df), dtype=np.float32)
+        Z = np.where(np.isfinite(Z), Z, 0.0)
+        p = net.predict(Z)
+        if spec.task_type == "regression":
+            return np.clip(inverse_target(p * y_sc + y_med, cfg.target_transform), y_lo, y_hi)
         return p
 
     shape = (n, n_classes) if spec.task_type != "regression" else (n,)
@@ -918,19 +1178,20 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     for k, (tr, va) in enumerate(plan.folds):
         if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
             return None
-        m = build_model(len(tr)).fit(X_in.iloc[tr], yt[tr])
-        oof[va] = pred(m, X_in.iloc[va])
-        est = m.steps[-1][1]
-        est = getattr(est, "regressor_", est)
-        iters.append(int(getattr(est, "n_iter_", 1)))
+        bundle = fit_one(X_in.iloc[tr], yt[tr], w[tr], seed + 17 * k)
+        oof[va] = pred_one(bundle, X_in.iloc[va])
+        iters.append(int(bundle[1].n_iter_))
         if plan.mode == "cv" and Xt_in is not None:
-            test.append(pred(m, Xt_in))
+            test.append(pred_one(bundle, Xt_in))
         if k == 0 and _too_slow(t0, plan, time_limit, name):
             return None
+        if guard.expired() and k < len(plan.folds) - 1:
+            log(f"{name}: время вышло на фолде {k + 1}/{len(plan.folds)}")
+            return _finish(name, oof, None, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
     if plan.mode == "refit" and Xt_in is not None:
-        m = build_model(n).fit(X_in, yt)
-        test = pred(m, Xt_in)
-    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg)
+        bundle = fit_one(X_in, yt, w, seed + 99)
+        test = pred_one(bundle, Xt_in)
+    return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
 
 
 def _too_slow(t0, plan, time_limit, name) -> bool:

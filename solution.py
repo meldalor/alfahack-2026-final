@@ -246,9 +246,19 @@ def run(task_path: Path):
         db_train, db_test = enrich(tables[role_map["train"]], tables[role_map["test"]], tables,
                                    skip_names=role_map.values(), report=db_notes, meta=rel_meta)
         files = {k: v for k, v in files.items() if k in ("sample", "dictionary")}
+        dic_df = tables.get(role_map.get("dictionary"))
+        if dic_df is None and rel_meta.get("column_comments"):
+            try:
+                from ag_database import comments_to_dictionary
+                dic_df = comments_to_dictionary(
+                    rel_meta["column_comments"],
+                    main_tables=[role_map["train"], role_map["test"]],
+                )
+            except Exception:
+                log_exc("comments_to_dictionary")
         for role, frame in (("train", db_train), ("test", db_test),
                             ("sample", tables.get(role_map.get("sample"))),
-                            ("dictionary", tables.get(role_map.get("dictionary")))):
+                            ("dictionary", dic_df)):
             if frame is not None:
                 path = work / f"db_{role}.parquet"
                 frame.to_parquet(path, index=False)
@@ -389,7 +399,14 @@ def solve_target(spec, train, test, llm, hints, budget, writer, work, rel_meta=N
     if shift["auc"] is not None:
         researcher.shift_note = (f"train/test covariate shift: adversarial AUC={shift['auc']:.3f} "
                                  f"(0.5 = identical); most shifted features: {shift['top']}")
-    research_deadline = start + 0.35 * (budget.total - start)
+    try:
+        res_frac = float(os.environ.get("AGENT_RESEARCH_FRAC", "0.30"))
+    except Exception:
+        res_frac = 0.30
+    res_frac = min(0.60, max(0.10, res_frac))
+    research_deadline = start + res_frac * (budget.total - start)
+    log(f"бюджет AutoResearch: {int(round(res_frac * 100))}% (до {research_deadline:.0f}s), "
+        f"финальные модели: {int(round((1.0 - res_frac) * 100))}%")
 
     def on_baseline(r):
         ey, eplan = researcher.ey, researcher.eplan
@@ -732,7 +749,11 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     # и только ЗАТЕМ вторичные модели (lgb_et, xgb, cat_top, huber, lasso), чтобы при сжатом бюджете ансамбль всегда был полным!
     rich_cats = [c for c in prep.cat_cols if c in X.columns and X[c].nunique() >= 30]  # флаги и короткие списки не в счёт
     late_cat = spec.task_type == "multiclass" and len(spec.classes) > 3 and len(rich_cats) < 3
-    cat_kw = {"cat_cols": prep.cat_cols, "depth": 6,
+    mc_many = spec.task_type == "multiclass" and len(spec.classes) >= 10
+    mc_wide = spec.task_type == "multiclass" and len(spec.classes) >= 6
+    xgb_lr = 0.1 if big else (0.08 if mc_wide else 0.04)
+    xgb_depth = 6 if (X.shape[1] > 100 or mc_wide) else 7
+    cat_kw = {"cat_cols": prep.cat_cols, "depth": 5 if mc_many else 6,
               "lr": 0.12 if (big or (spec.task_type == "multiclass" and len(spec.classes) > 3)) else 0.06}
     cfg_x = cfg
     if spec.task_type == "regression" and cfg.target_transform == "log1p" and spec.metric in ("rmse", "mse", "r2"):
@@ -768,7 +789,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     if is_mae_task:
         fit_extra("xgb_ph", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6, "objective_override": "pseudohuber", "seed": 11}, min_need=40.0)
     else:
-        fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7}, min_need=40.0)
+        fit_extra("xgb", fit_xgb, {"lr": xgb_lr, "depth": xgb_depth}, min_need=40.0)
     fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=25.0)
     fit_extra("et", fit_et, {}, min_need=25.0)
     fit_extra("mlp", fit_mlp, {"top_cols": top_cols}, min_need=25.0, use_clean=True)
@@ -852,7 +873,8 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     def xgb_seed(k):
         depths = (6, 7, 5, 7, 6)
         return [safe_fit(fit_xgb, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45),
-                         lr=0.04 if not big else 0.1, depth=depths[k % len(depths)], seed=k, name=f"xgb_s{k}")]
+                         lr=xgb_lr, depth=min(depths[k % len(depths)], 6) if (mc_wide or X.shape[1] > 100) else depths[k % len(depths)],
+                         seed=k, name=f"xgb_s{k}")]
 
     def offset_seed(k):
         return [safe_fit(fit_lgb, Xo, y, Xto, plan, spec, cfg, N_JOBS, max(60.0, left() * 0.25), lr=lr_main, es=200,

@@ -60,10 +60,34 @@ def _is_time_col(name: str, series: pd.Series | None = None) -> bool:
     if pd.api.types.is_numeric_dtype(series):
         return _unix_epoch_unit(series) is not None
     sample = series.dropna().head(200)
-    if len(sample) < 3:
+    if len(sample) < 1:
         return False
     parsed = _parse_time_series(sample)
     return float(parsed.notna().mean()) >= 0.9
+
+
+def _is_irregular_timed_table(dim: pd.DataFrame, keys: list[str]) -> bool:
+    """Detect irregular event/transaction child tables (non-periodic timestamps) so they never do exact
+    simultaneous-timestamp many-to-one joins and instead route to strictly causal (< event_time) aggregation."""
+    times = [c for c in keys if c in dim.columns and _is_time_col(c, dim[c])]
+    if len(times) != 1:
+        return False
+    tc = times[0]
+    groups = [c for c in keys if c != tc and c in dim.columns]
+    if not groups:
+        return False
+    rt = _parse_time_series(dim[tc])
+    if rt.notna().mean() < 0.9:
+        return False
+    s = dim[groups].copy()
+    s['__t__'] = rt
+    s = s.dropna(subset=['__t__']).sort_values(groups + ['__t__'])
+    diffs = s.groupby(groups, dropna=False)['__t__'].diff()
+    diffs = diffs[diffs > pd.Timedelta(0)]
+    if len(diffs) < 3:
+        return False
+    cadence = diffs.median()
+    return cadence <= pd.Timedelta(0) or float((diffs == cadence).mean()) < 0.8
 
 
 def _norm_key_series(s: pd.Series) -> pd.Series:
@@ -105,12 +129,16 @@ def _align_key_dtypes(left: pd.DataFrame, right: pd.DataFrame, keys: list[str]):
 
 
 def _keys(dim, common):
-    """Prefer truly unique keys, then discard rare ambiguous keys in dirty dimensions."""
+    """Prefer truly unique keys, then discard rare ambiguous keys in dirty dimensions.
+    Never join solely on a bare timestamp column when a shared entity ID key also exists."""
     clean = dim.drop_duplicates()
+    has_non_time = any(not _is_time_col(c, clean[c]) for c in common if c in clean.columns)
     candidates = [list(c) for size in range(1, min(3, len(common)) + 1)
                   for c in itertools.combinations(common, size)]
     for allow_dirty in (False, True):
         for cols in candidates:
+            if has_non_time and len(cols) == 1 and _is_time_col(cols[0], clean[cols[0]]):
+                continue
             nonnull = clean[cols].notna().all(axis=1)
             valid = nonnull & ~clean.duplicated(cols, keep=False)
             if valid.all() or (allow_dirty and valid.mean() >= 0.95):
@@ -197,8 +225,11 @@ def _temporal_join(left, right, keys, marker, panels_out=None, table_name=None):
             extra[f'{c}__rm3'] = rm3.astype('float32')
             if add_sys:
                 # Cross-group (system-wide) aggregates strictly at the same completed timestamp rt <= ev - cadence.
-                sys_mean = b.groupby(key, sort=False)[c].transform('mean').astype('float32')
+                sys_grp = b.groupby(key, sort=False)[c]
+                sys_mean = sys_grp.transform('mean').astype('float32')
+                sys_max = sys_grp.transform('max').astype('float32')
                 extra[f'{c}__sys_mean'] = sys_mean
+                extra[f'{c}__sys_max'] = sys_max
                 extra[f'{c}__sys_dev'] = (s - sys_mean).astype('float32')
             # Strictly causal run-length of active binary state (binary check strictly on first temporal half).
             head = b.loc[early_mask, c].dropna()
@@ -305,6 +336,64 @@ def _interval_join(left, dim, name, targets):
     return out
 
 
+def _causal_window_cat_nunique(b_codes: np.ndarray, b_ts_ns: np.ndarray, b_cats: np.ndarray,
+                               q_codes: np.ndarray, q_ts_ns: np.ndarray, windows_ns: list[int]) -> np.ndarray:
+    """Strictly causal (< event_time) distinct category count per entity across rolling windows in O((N+M) log N)."""
+    n_q = len(q_codes)
+    n_w = len(windows_ns)
+    out = np.zeros((n_q, n_w), dtype=np.float32)
+    valid_q = (q_codes >= 0) & np.isfinite(q_ts_ns)
+    if not valid_q.any() or len(b_codes) == 0:
+        return out
+    q_idx = np.flatnonzero(valid_q)
+    q_ord = np.lexsort((q_ts_ns[q_idx], q_codes[q_idx]))
+    q_pos = q_idx[q_ord]
+    qs_g = q_codes[q_pos]
+    qs_t = q_ts_ns[q_pos]
+    valid_b = (b_codes >= 0) & (b_cats >= 0)
+    if not valid_b.any():
+        return out
+    b_idx = np.flatnonzero(valid_b)
+    b_ord = np.lexsort((b_ts_ns[b_idx], b_codes[b_idx]))
+    b_pos = b_idx[b_ord]
+    bs_g = b_codes[b_pos]
+    bs_t = b_ts_ns[b_pos].tolist()
+    bs_v = b_cats[b_pos].tolist()
+
+    uq_g, q_starts = np.unique(qs_g, return_index=True)
+    q_ends = np.r_[q_starts[1:], len(qs_g)]
+    ub_g, b_starts = np.unique(bs_g, return_index=True)
+    b_ends = np.r_[b_starts[1:], len(bs_g)]
+    b_map = {int(g): (int(s), int(e)) for g, s, e in zip(ub_g, b_starts, b_ends)}
+
+    qs_t_list = qs_t.tolist()
+    q_pos_list = q_pos.tolist()
+    for gi, g in enumerate(uq_g.tolist()):
+        span = b_map.get(int(g))
+        if span is None:
+            continue
+        bp, be = span
+        qp, qe = int(q_starts[gi]), int(q_ends[gi])
+        last_seen = {}
+        for qi in range(qp, qe):
+            qt = qs_t_list[qi]
+            while bp < be and bs_t[bp] < qt:
+                last_seen[bs_v[bp]] = bs_t[bp]
+                bp += 1
+            if not last_seen:
+                continue
+            r_out = q_pos_list[qi]
+            vals = last_seen.values()
+            for wi, w_ns in enumerate(windows_ns):
+                cut = qt - w_ns
+                cnt = 0
+                for tv in vals:
+                    if tv >= cut:
+                        cnt += 1
+                out[r_out, wi] = float(cnt)
+    return out
+
+
 def _aggregate_child(left, dim, name, targets):
     """Generic one-to-many child table aggregation (causal prefix-sum if timed, static groupby otherwise)."""
     if len(dim) == 0 or len(dim) > 2_000_000:
@@ -351,7 +440,8 @@ def _aggregate_child(left, dim, name, targets):
         lt = _parse_time_series(left[ltc])
         if dt.notna().mean() < 0.9 or lt.notna().mean() < 0.9:
             return None
-        b = dim_al[[best_key] + num_cols].copy()
+        use_cats = cat_cols[:2]
+        b = dim_al[[best_key] + num_cols + use_cats].copy()
         b['__t__'] = dt
         b = b.dropna(subset=[best_key, '__t__']).sort_values([best_key, '__t__']).reset_index(drop=True)
         if b.empty:
@@ -447,6 +537,18 @@ def _aggregate_child(left, dim, name, targets):
             rname = f'{name}__hist_ratio_7d_30d'
             out[rname] = (w_cnts['7d'] / (w_cnts['30d'] + 1.0)).astype('float32')
             win_cols.append(rname)
+            # Strictly causal (< t) rolling categorical nunique over 1d / 7d / 30d
+            if use_cats:
+                q_ts_f = np.where(v_np, l_ns.astype(np.float64), np.nan)
+                win_ns = [86400 * 1_000_000_000, 7 * 86400 * 1_000_000_000, 30 * 86400 * 1_000_000_000]
+                for cc in use_cats:
+                    b_cat_codes, _ = pd.factorize(b[cc].astype('string'), sort=False)
+                    nu_mat = _causal_window_cat_nunique(b_codes.astype(np.int64), b_ns, b_cat_codes.astype(np.int32),
+                                                        l_codes.astype(np.int64), q_ts_f, win_ns)
+                    for wi, tag in enumerate(('1d', '7d', '30d')):
+                        cname = f'{name}__{cc}__hist_nunique_{tag}'
+                        out[cname] = nu_mat[:, wi]
+                        win_cols.append(cname)
         except Exception:
             log_exc(f'windowed causal RFM {name}')
         feat_cols = [c for c in pref.columns if c not in (best_key, '__t__', '__first_t__', '__last_t__')] + [
@@ -522,6 +624,35 @@ def _match_pk_to_fk(combined: pd.DataFrame, dim: pd.DataFrame, name: str, target
     if overlap < 0.2:
         return None, None
     return dim.rename(columns={id_col: fk}), fk
+
+
+def _match_multi_role_pk_to_fk(combined: pd.DataFrame, dim: pd.DataFrame, name: str, targets: set) -> list[str]:
+    """Heuristic multi-role FK detection when dim has unique PK `id` and combined has multiple role `*_id`
+    columns (e.g., sender_id & receiver_id -> users.id) with strong value overlap."""
+    id_col = next((c for c in dim.columns if c.lower() == 'id'), None)
+    if id_col is None or len(dim) == 0:
+        return []
+    pk_s = _norm_key_vals(dim[id_col])
+    valid = pk_s.notna() & ~pk_s.duplicated(keep=False)
+    if valid.mean() < 0.95 or valid.sum() == 0:
+        return []
+    pk_set = set(pk_s.loc[valid].tolist())
+    # Only consider *_id columns not already matching dim columns and not obviously another table's stem
+    cands = []
+    for c in combined.columns:
+        cl = str(c).lower()
+        if c in targets or c in dim.columns or not cl.endswith('_id') or cl in ('event_id', 'row_id', 'id'):
+            continue
+        fk_s = _norm_key_vals(combined[c]).dropna()
+        if len(fk_s) == 0:
+            continue
+        ov = float(fk_s.isin(pk_set).mean())
+        if ov >= 0.5:
+            cands.append((ov, c))
+    if len(cands) < 2:
+        return []
+    cands.sort(reverse=True)
+    return [c for _, c in cands[:4]]
 
 
 def enrich(train, test, tables, skip_names=(), report=None, meta=None):
@@ -659,7 +790,8 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
                     elif len(panels) > p_before:
                         del panels[p_before:]
                 has_time_key = any(_is_time_col(k, dim_clean[k]) for k in keys if k in dim_clean.columns)
-                if candidate[marker].notna().mean() == 0 or (has_time_key and mode_tag == 'many-to-one' and coverage < 0.5):
+                irreg_child = bool(has_time_key and mode_tag == 'many-to-one' and _is_irregular_timed_table(dim, keys))
+                if candidate[marker].notna().mean() == 0 or (has_time_key and mode_tag == 'many-to-one' and coverage < 0.5) or irreg_child:
                     iv = _interval_join(combined, dim_clean, name, targets)
                     if iv is not None:
                         combined = pd.concat([combined, iv], axis=1)
@@ -712,6 +844,47 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
                 del remaining[name]
         except Exception:
             log_exc(f'one-to-many {name}')
+    # Heuristic multi-role PK->FK fallback for remaining unique-`id` dimensions (e.g. sender_id/receiver_id -> users.id)
+    for name in list(remaining):
+        try:
+            dim = remaining[name]
+            id_col = next((c for c in dim.columns if c.lower() == 'id'), None)
+            role_fks = _match_multi_role_pk_to_fk(combined, dim, name, targets) if id_col else []
+            if len(role_fks) < 2:
+                continue
+            joined_any = False
+            for src_c in role_fks:
+                dim_r = dim.rename(columns={id_col: src_c})
+                keys, dim_clean, _ = _keys(dim_r, [src_c])
+                if not keys:
+                    continue
+                role_tag = re.sub(r'_id$', '', str(src_c), flags=re.I)
+                pfx = f'{role_tag}__{name}' if (role_tag and role_tag.lower() != name.lower()) else f'{name}__{src_c}'
+                rename = {c: f'{pfx}__{c}' for c in dim_clean
+                          if c not in keys and c not in targets and not POST_FACTUM_RE.search(str(c))
+                          and f'{pfx}__{c}' not in combined.columns}
+                if not rename:
+                    continue
+                right = dim_clean[keys + list(rename)].rename(columns=rename)
+                marker = f'{pfx}__matched'
+                right[marker] = 1.0
+                before = len(combined)
+                left_m, right_m = _align_key_dtypes(combined, right, keys)
+                candidate = left_m.merge(right_m, on=keys, how='left', sort=False, validate='many_to_one')
+                for k in keys:
+                    candidate[k] = combined[k].values
+                cov = float(candidate[marker].notna().mean())
+                if cov > 0.0:
+                    combined = candidate
+                    assert len(combined) == before
+                    combined[marker] = combined[marker].fillna(0)
+                    log(f'join {name} (multi-role {src_c}->{id_col}, pfx={pfx}): coverage={cov:.3f}, features={len(rename)}')
+                    _rec(f'table {name} ({len(dim)} rows): multi-role {src_c}->{id_col}, cov={cov:.3f}, +{len(rename)} feats')
+                    joined_any = True
+            if joined_any:
+                del remaining[name]
+        except Exception:
+            log_exc(f'multi-role join {name}')
     for name in remaining:
         log(f'join skipped {name}: no unambiguous unique shared key')
     if isinstance(meta, dict):

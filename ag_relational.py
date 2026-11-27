@@ -509,7 +509,17 @@ def _aggregate_child(left, dim, name, targets):
                 vals_w = np.where(np.isfinite(vals_w), vals_w, 0.0)
                 csums[wc] = np.concatenate([[0.0], np.cumsum(vals_w)])
             w_cnts = {}
-            for tag, w_sec in (('1d', 86400), ('7d', 7 * 86400), ('30d', 30 * 86400)):
+            # Detect sub-daily child event stream (e.g. fraud/clickstream) -> add high-velocity 1h & 6h causal windows
+            sub_daily = False
+            if len(b_sec) >= 20:
+                b_sorted_sec = np.sort(b_sec)
+                pos_d = np.diff(b_sorted_sec)
+                pos_d = pos_d[pos_d > 0]
+                if len(pos_d) >= 10 and float(np.median(pos_d)) < 6 * 3600:
+                    sub_daily = True
+            win_defs = [('1h', 3600), ('6h', 6 * 3600)] if sub_daily else []
+            win_defs += [('1d', 86400), ('7d', 7 * 86400), ('30d', 30 * 86400)]
+            for tag, w_sec in win_defs:
                 lo_w = np.maximum(np.searchsorted(bk_s, q_key - w_sec, side='left'), g_lo)
                 cnt_w = (hi - lo_w).astype(np.float32)
                 arr_c = np.zeros(len(left), dtype=np.float32)
@@ -518,7 +528,7 @@ def _aggregate_child(left, dim, name, targets):
                 out[cname] = arr_c
                 win_cols.append(cname)
                 w_cnts[tag] = arr_c
-                if tag in ('7d', '30d'):
+                if tag in ('1h', '7d', '30d'):
                     for wc in top_wcols:
                         sw = (csums[wc][hi] - csums[wc][lo_w]).astype(np.float32)
                         arr_s = np.zeros(len(left), dtype=np.float32)
@@ -537,6 +547,10 @@ def _aggregate_child(left, dim, name, targets):
             rname = f'{name}__hist_ratio_7d_30d'
             out[rname] = (w_cnts['7d'] / (w_cnts['30d'] + 1.0)).astype('float32')
             win_cols.append(rname)
+            if sub_daily and '1h' in w_cnts and '1d' in w_cnts:
+                bname = f'{name}__hist_burst_1h_1d'
+                out[bname] = (w_cnts['1h'] / (w_cnts['1d'] / 24.0 + 0.5)).astype('float32')
+                win_cols.append(bname)
             # Strictly causal (< t) rolling categorical nunique over 1d / 7d / 30d
             if use_cats:
                 q_ts_f = np.where(v_np, l_ns.astype(np.float64), np.nan)
@@ -768,7 +782,8 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
                 if excluded:
                     log(f'join {name}: excluded {excluded} ambiguous/missing-key rows')
                 rename = {c: (c if c not in combined and c.endswith('_id') else f'{name}__{c}')
-                          for c in dim_clean if c not in keys and c not in targets}
+                          for c in dim_clean if c not in keys and c not in targets
+                          and not POST_FACTUM_RE.search(str(c))}
                 right = dim_clean[keys + list(rename)].rename(columns=rename)
                 marker = f'{name}__matched'; right[marker] = 1.0
                 before = len(combined)

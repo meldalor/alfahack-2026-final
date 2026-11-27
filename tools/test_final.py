@@ -1135,6 +1135,42 @@ class FinalTests(unittest.TestCase):
         self.assertEqual(len(r_dual.test), len(Xt))
         self.assertTrue(np.isfinite(r_dual.test).all())
 
+    def test_subdaily_1h_6h_causal_velocity_and_smoothed_entity_history(self):
+        from ag_features import op_entity_history
+        # 1) Sub-daily child transactions (every 15 min) -> strictly causal 1h/6h windows (< event_time)
+        ts_tx = pd.date_range('2025-03-01 00:00:00', periods=30, freq='15min')
+        tx = pd.DataFrame({
+            'client_id': ['c1'] * 30,
+            'created_at': ts_tx.astype(str),
+            'amt': [10.0] * 25 + [99999.0] * 5,  # index 25 is at 06:15:00 -> tie/future for 06:15:00 event!
+        })
+        tr = pd.DataFrame({'event_id': [1, 2], 'client_id': ['c1', 'c1'],
+                           'timestamp': ['2025-03-01 06:15:00', '2025-03-01 06:30:00'], 'y': [0, 1]})
+        te = pd.DataFrame({'event_id': [3], 'client_id': ['c1'], 'timestamp': ['2025-03-01 06:15:00']})
+        a, b = enrich(tr, te, {'tx': tx})
+        self.assertIn('tx__hist_cnt_1h', a.columns)
+        self.assertIn('tx__hist_cnt_6h', a.columns)
+        self.assertIn('tx__amt__hist_sum_1h', a.columns)
+        self.assertIn('tx__hist_burst_1h_1d', a.columns)
+        # At 06:15:00, strictly past 1h window is [05:15:00, 06:15:00) -> 05:15, 05:30, 05:45, 06:00 = 4 tx, sum=40 (NEVER 99999!)
+        self.assertEqual(float(a['tx__hist_cnt_1h'].iloc[0]), 4.0)
+        self.assertAlmostEqual(float(a['tx__amt__hist_sum_1h'].iloc[0]), 40.0, places=3)
+        self.assertAlmostEqual(float(b['tx__amt__hist_sum_1h'].iloc[0]), 40.0, places=3)
+        # 2) Bayesian-smoothed causal entity history never leaks future periods
+        X = pd.DataFrame({'uid': ['u1', 'u2'] * 10, 't': np.repeat(np.arange(5, dtype=float), 4)})
+        Xt = pd.DataFrame({'uid': ['u1', 'u_new'], 't': [5.0, 5.0]})
+        y1 = np.array([1.0 if i % 2 == 0 else 0.0 for i in range(20)])
+        y2 = y1.copy(); y2[12:] = 1.0 - y2[12:]  # flip periods 3 and 4
+        h1_tr, h1_te = op_entity_history(X, Xt, y1, ['uid'], 't')
+        h2_tr, _ = op_entity_history(X, Xt, y2, ['uid'], 't')
+        self.assertIn('hist__smooth', h1_tr.columns)
+        # Periods <= 3 must be identical under future target mutation!
+        np.testing.assert_allclose(h1_tr.loc[X['t'] <= 3.0, 'hist__smooth'].values,
+                                   h2_tr.loc[X['t'] <= 3.0, 'hist__smooth'].values, equal_nan=True)
+        # Unseen entity u_new gets the global past mean (0.5), u1 gets smoothed > 0.5
+        self.assertAlmostEqual(float(h1_te['hist__smooth'].iloc[1]), 0.5, places=3)
+        self.assertGreater(float(h1_te['hist__smooth'].iloc[0]), 0.65)
+
 
 class Pool5HarnessTests(unittest.TestCase):
     def test_synthetic_generators_deterministic_and_disjoint(self):

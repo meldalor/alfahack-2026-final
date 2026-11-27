@@ -543,6 +543,19 @@ def op_entity_history(X, Xt, y, key_cols, time_col, t_train=None, t_test=None):
     res.loc[m.row.values, "hist__gap"] = (m["t_join"] - m["t_last"]).values
     span = (m["t_last"] - m["first_t"]).replace(0, np.nan)
     res.loc[m.row.values, "hist__trend"] = ((m["last"] - m["first"]) / span).values
+    # Строго каузальное байесовски сглаженное среднее (m=20 к прошлому глобальному среднему по периодам < t)
+    g_per = hist.groupby("t", sort=True)["y"].agg(["sum", "size"]).reset_index().rename(columns={"t": "t_join"})
+    g_per["gmean"] = g_per["sum"].cumsum() / g_per["size"].cumsum()
+    mg = pd.merge_asof(left[["t_join", "row"]], g_per[["t_join", "gmean"]].sort_values("t_join"),
+                       on="t_join", allow_exact_matches=False).sort_values("row")
+    gmean = np.full(len(t), np.nan, dtype=np.float64)
+    gmean[mg.row.values] = mg["gmean"].values
+    csum_arr = np.zeros(len(t), dtype=np.float64)
+    ccnt_arr = np.zeros(len(t), dtype=np.float64)
+    csum_arr[m.row.values] = np.nan_to_num(m["csum"].to_numpy(dtype=np.float64), nan=0.0)
+    ccnt_arr[m.row.values] = np.nan_to_num(m["ccnt"].to_numpy(dtype=np.float64), nan=0.0)
+    prior_m = 20.0
+    res["hist__smooth"] = np.where(np.isfinite(gmean), (csum_arr + prior_m * gmean) / (ccnt_arr + prior_m), np.nan)
     res = res.astype("float32")
     return res.iloc[:n].reset_index(drop=True), res.iloc[n:].reset_index(drop=True)
 
@@ -551,7 +564,8 @@ _DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__min
                 "__len", "__words", "__digits", "__upper", "__matched", "__raw_nulls", "__lag", "__dlag",
                 "__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen",
                 "__sys_mean", "__sys_max", "__sys_dev", "__n_tags",
-                "__hist_nunique_1d", "__hist_nunique_7d", "__hist_nunique_30d")
+                "__hist_nunique_1d", "__hist_nunique_7d", "__hist_nunique_30d",
+                "__hist_cnt_1h", "__hist_cnt_6h", "__hist_burst_1h_1d")
 _DERIVED_PFX = ("stream__", "stream_grp__", "nc__", "nc_d1__", "nc_prof__", "nc_gb__", "nc_gbd__")
 
 

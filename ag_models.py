@@ -590,13 +590,14 @@ def fit_et(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_l
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)
-    params = dict(n_estimators=n_estimators, min_samples_leaf=3 if n < 200_000 else 10, max_features=0.5,
+    n_est_eff = min(n_estimators, 120) if n > 150_000 else n_estimators
+    params = dict(n_estimators=n_est_eff, min_samples_leaf=3 if n < 150_000 else 15, max_features=0.5,
                   n_jobs=n_jobs, random_state=seed)
 
     def make(n_fit: int):
         p = dict(params)
-        if n_fit > 300_000:
-            p.update(bootstrap=True, max_samples=300_000)  # память и время: деревья на подвыборках
+        if n_fit > 150_000:
+            p.update(bootstrap=True, max_samples=150_000)  # память и время: деревья на подвыборках
         return ExtraTreesRegressor(**p) if spec.task_type == "regression" else ExtraTreesClassifier(**p)
 
     def pred(m, a):
@@ -1162,7 +1163,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     else:
         loss_kind, d_out = "ce", n_classes
 
-    max_fit_rows = 120_000
+    max_fit_rows = 80_000 if n > 120_000 else 120_000
 
     def _cap_rows(tr_idx, ep_seed: int):
         if len(tr_idx) <= max_fit_rows:
@@ -1223,10 +1224,11 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         else:
             y_med, y_sc = 0.0, 1.0
             y_norm = y_tr.astype(np.float32) if spec.task_type == "binary" else y_tr.astype(np.int64)
-        bs = 512 if len(df_tr) > 60_000 else int(min(256, max(32, len(df_tr) // 30)))
-        max_ep = 30 if len(df_tr) > 60_000 else (45 if len(df_tr) > 30_000 else 65)
+        bs = 512 if len(df_tr) > 50_000 else int(min(256, max(32, len(df_tr) // 30)))
+        max_ep = 25 if len(df_tr) > 50_000 else (45 if len(df_tr) > 30_000 else 65)
+        pat = 8 if len(df_tr) > 50_000 else 12
         net = _NumpyTabularResNet(Z.shape[1], d_out, loss_kind=loss_kind, seed=ep_seed)
-        net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=12, guard=guard, n_jobs=n_jobs)
+        net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=pat, guard=guard, n_jobs=n_jobs)
         return pre, net, y_med, y_sc
 
     def pred_one(bundle, df):

@@ -791,7 +791,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     else:
         fit_extra("xgb", fit_xgb, {"lr": xgb_lr, "depth": xgb_depth}, min_need=40.0)
     fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=25.0)
-    fit_extra("et", fit_et, {}, min_need=25.0)
+    fit_extra("et", fit_et, {"top_cols": top_cols, "max_cols": 80} if len(X) > 100_000 else {}, min_need=25.0)
     fit_extra("mlp", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt"}, min_need=25.0)
     # Второе нейросетевое семейство Dual-View [Quantile + Standard] + дополнительные сиды при быстром обучении
     mlp_r = next((r for r in results if r is not None and r.name == "mlp" and r.test is not None), None)
@@ -855,8 +855,16 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 log(f"поправка и к истории по ключу {key} (в исследовании не принят)")
             except Exception:
                 log_exc("extra entity key")
+    # Быстрая отсечка бесполезных offset-моделей: если первый сид заметно хуже лучшей одиночной модели (>3%),
+    # не тратим 5-6 минут на дополнительные сиды и ключи offset.
+    best_single_so_far = None
+    for _r in results:
+        if _r is not None and np.isfinite(_r.score):
+            if best_single_so_far is None or better(_r.score, best_single_so_far, spec.metric):
+                best_single_so_far = _r.score
+    abort_offsets = False
     for nm, oc, Xo, Xto in offsets:
-        if left() < eval_t * 3 + 60:
+        if abort_offsets or left() < eval_t * 3 + 60:
             break
         for sd in (0, 1):
             if left() < eval_t * 3 + 60:
@@ -867,6 +875,14 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 log(f"{r.name} (поправка к {oc}): {spec.metric}={r.score:.5f} за {r.seconds:.0f}s")
                 results.append(r)
                 publish(r.name)
+                if sd == 0 and best_single_so_far is not None and not better(r.score, best_single_so_far, spec.metric):
+                    gap_rel = abs(r.score - best_single_so_far) / max(abs(best_single_so_far), 1e-9)
+                    if gap_rel > 0.05 and nm == "lgb_offset0":
+                        log(f"{r.name}: хуже лучшей модели на {100 * gap_rel:.1f}% — пропускаем остальные offset-модели")
+                        abort_offsets = True
+                        break
+                    if gap_rel > 0.03:
+                        break
     # 4.3 ещё сиды, пока есть время: сиды одного семейства усредняются до смешивания (см. publish),
     # поэтому каждый новый сид уменьшает разброс модели, а не добавляет шанс случайно удачного сида
     def lgb_seed(k):
@@ -890,8 +906,9 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 for nm, oc, Xo, Xto in offsets]
 
     def et_seed(k):
+        kw_et = {"top_cols": top_cols, "max_cols": 80} if len(X) > 100_000 else {}
         return [safe_fit(fit_et, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45), seed=k,
-                         name=f"et_s{k}")]
+                         name=f"et_s{k}", **kw_et)]
 
     def cat_seed(k):
         depths = (6, 7, 6, 7, 5)
@@ -986,7 +1003,12 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             picked.append((w_f, 1 if close else 0, fn))
     picked.sort(key=lambda x: (-x[0], -x[1]))
     seeders = [fn for _, _, fn in picked] or [lgb_seed]
-    if any(r is not None and r.name.startswith(("lgb_offset", "lgb_xoffset")) for r in results):
+    has_good_offset = any(
+        (f == "lgb_offset" or f.startswith("lgb_xoffset"))
+        and (fam_w.get(f, 0.0) >= 0.05 or (top is not None and abs(sc - top) <= 0.05 * max(abs(top), 1e-9)))
+        for f, sc in fam_best.items()
+    )
+    if has_good_offset:
         seeders.append(offset_seed)
     next_k = {fn: 1 for fn in seeders}
     # на быстрых данных сидов больше: семейство поправки на WiDS из 14 моделей 33.76, из 28 — 33.58; на медленных

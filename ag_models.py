@@ -860,17 +860,21 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
 
 class _NumpyTabularResNet:
     """Компактная табличная нейросеть ResNet/MLP на чистом NumPy/OpenBLAS с поддержкой
-    L1, SmoothL1 (Huber), MSE, BCEWithLogits и CrossEntropy, LayerNorm, SiLU, Dropout и AdamW."""
+    L1, SmoothL1 (Huber), MSE, BCEWithLogits и CrossEntropy, LayerNorm, SiLU, Dropout, AdamW,
+    bias-corrected EMA и Top-K SWA усреднения весов."""
 
     def __init__(self, d_in: int, d_out: int, loss_kind: str = "l1", hidden: int = 128,
                  h2: int = 64, dropout: float = 0.12, lr: float = 2.5e-3, wd: float = 1e-2,
-                 huber_delta: float = 0.35, seed: int = 0):
+                 huber_delta: float = 0.35, ema_decay: float = 0.985, topk_avg: int = 3,
+                 seed: int = 0):
         self.loss_kind = loss_kind
         self.d_out = d_out
         self.dropout = float(dropout)
         self.lr = float(lr)
         self.wd = float(wd)
         self.delta = float(huber_delta)
+        self.ema_decay = float(ema_decay)
+        self.topk_avg = int(topk_avg)
         self.rng = np.random.default_rng(seed)
 
         def _lin(a, b):
@@ -1000,14 +1004,17 @@ class _NumpyTabularResNet:
         Xtr, ytr, wtr = X[tr_i], y[tr_i], sw[tr_i]
         Xva, yva, wva = X[va_i], y[va_i], sw[va_i]
         best_val = float("inf")
-        best_p = {k: v.copy() for k, v in self.p.items()}
+        top_ckpts = []
+        ema_p = {k: v.copy() for k, v in self.p.items()} if self.ema_decay > 0 else None
         no_imp = 0
 
         with ctx:
             for ep in range(max_epochs):
                 if guard is not None and guard.stop_training():
                     break
-                lr_ep = self.lr * (0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * ep / max(max_epochs, 1))))
+                warm = min(1.0, (ep + 1) / 3.0)
+                cos_f = 0.01 + 0.99 * 0.5 * (1.0 + np.cos(np.pi * ep / max(max_epochs, 1)))
+                lr_ep = self.lr * warm * cos_f
                 perm = self.rng.permutation(len(Xtr))
                 for s in range(0, len(Xtr), batch_size):
                     bi = perm[s:s + batch_size]
@@ -1052,19 +1059,43 @@ class _NumpyTabularResNet:
                         mh = self.m[k] / bc1
                         vh = self.v[k] / bc2
                         self.p[k] -= lr_ep * mh / (np.sqrt(vh) + 1e-8)
+                    if ema_p is not None:
+                        d_e = min(self.ema_decay, (1.0 + self.step_t) / (10.0 + self.step_t))
+                        for k in ema_p:
+                            ema_p[k] = d_e * ema_p[k] + (1.0 - d_e) * self.p[k]
 
+                eval_p = ema_p if ema_p is not None else self.p
+                orig_p = self.p
+                self.p = eval_p
                 va_out, _ = self._forward(Xva, train=False)
+                self.p = orig_p
                 vloss, _ = self._loss_grad(va_out, yva, wva)
                 self.n_iter_ = ep + 1
-                if np.isfinite(vloss) and vloss < best_val - 1e-5:
-                    best_val = vloss
-                    best_p = {k: v.copy() for k, v in self.p.items()}
-                    no_imp = 0
+                if np.isfinite(vloss):
+                    if self.topk_avg > 1:
+                        if len(top_ckpts) < self.topk_avg or vloss < top_ckpts[-1][0]:
+                            top_ckpts.append((vloss, {k: v.copy() for k, v in eval_p.items()}))
+                            top_ckpts.sort(key=lambda t: t[0])
+                            top_ckpts = top_ckpts[:self.topk_avg]
+                    if vloss < best_val - 1e-5:
+                        best_val = vloss
+                        if self.topk_avg <= 1:
+                            top_ckpts = [(vloss, {k: v.copy() for k, v in eval_p.items()})]
+                        no_imp = 0
+                    else:
+                        no_imp += 1
+                        if no_imp >= patience:
+                            break
+            if top_ckpts:
+                if len(top_ckpts) == 1:
+                    self.p = top_ckpts[0][1]
                 else:
-                    no_imp += 1
-                    if no_imp >= patience:
-                        break
-        self.p = best_p
+                    avg_p = {k: sum(c[1][k] for c in top_ckpts) / len(top_ckpts) for k in self.p}
+                    self.p = avg_p
+                    vo_avg, _ = self._forward(Xva, train=False)
+                    vl_avg, _ = self._loss_grad(vo_avg, yva, wva)
+                    if not (np.isfinite(vl_avg) and vl_avg <= top_ckpts[0][0]):
+                        self.p = top_ckpts[0][1]
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -1081,13 +1112,14 @@ class _NumpyTabularResNet:
 
 def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float,
             seed: int = 0, name: str = "mlp", top_cols: list | None = None,
-            max_cols: int = 80) -> FitResult | None:
+            max_cols: int = 80, prep_mode: str = "qt", loss_override: str | None = None) -> FitResult | None:
     """Табличная нейросеть ResNet/MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
-    (QuantileTransformer) + OHE категорий, нативная поддержка L1 (под MAE), MSE, BCE и CrossEntropy."""
+    (QuantileTransformer или Dual [Quantile+Standard]) + OHE категорий, bias-corrected EMA + Top-3 SWA,
+    нативная поддержка L1 (под MAE), Huber, MSE, BCE и CrossEntropy, масштабирование до 600k строк."""
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import OneHotEncoder, QuantileTransformer
+    from sklearn.preprocessing import OneHotEncoder, QuantileTransformer, StandardScaler
 
     t0 = time.time()
     guard = _TimeGuard(time_limit)
@@ -1101,7 +1133,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         if len(chosen) >= 10:
             cols = chosen
     n = len(X)
-    if not cols or n < 100 or n > 120_000:
+    if not cols or n < 100 or n > 600_000:
         return None
     cat_cols = [c for c in cols if isinstance(X[c].dtype, pd.CategoricalDtype) or X[c].dtype == object or str(X[c].dtype) == "string"]
     num_cols = [c for c in cols if c not in cat_cols]
@@ -1123,21 +1155,53 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     y_lo = float(np.nanmin(y)) if spec.task_type == "regression" else None
     y_hi = float(np.nanmax(y)) if spec.task_type == "regression" else None
     if spec.task_type == "regression":
-        loss_kind = "l1" if spec.metric in ("mae", "medae", "smape") else "mse"
+        loss_kind = loss_override or ("l1" if spec.metric in ("mae", "medae", "smape") else "mse")
         d_out = 1
     elif spec.task_type == "binary":
         loss_kind, d_out = "bce", 1
     else:
         loss_kind, d_out = "ce", n_classes
 
+    max_fit_rows = 120_000
+
+    def _cap_rows(tr_idx, ep_seed: int):
+        if len(tr_idx) <= max_fit_rows:
+            return tr_idx
+        rng_s = np.random.default_rng(ep_seed)
+        if spec.task_type != "regression":
+            # Stratified subsample preserves rare classes & minority positives on large imbalanced datasets
+            yv = yt[tr_idx].astype(int)
+            parts = []
+            for cls in np.unique(yv):
+                ci = tr_idx[yv == cls]
+                k_take = max(1, int(round(max_fit_rows * len(ci) / len(tr_idx))))
+                parts.append(rng_s.choice(ci, size=min(len(ci), k_take), replace=False) if len(ci) > k_take else ci)
+            sel = np.concatenate(parts)
+            sel.sort()
+            return sel
+        if tvals is not None:
+            # Prefer recent chronological slice on huge temporal regression tables
+            ord_t = np.argsort(np.nan_to_num(tvals[tr_idx], nan=-1e18), kind="mergesort")
+            sel = tr_idx[ord_t[-max_fit_rows:]]
+            sel.sort()
+            return sel
+        sel = rng_s.choice(tr_idx, size=max_fit_rows, replace=False)
+        sel.sort()
+        return sel
+
     def build_pre(n_fit: int):
         tf = []
+        nq = max(10, min(500, n_fit // 2 if n_fit < 500 else max(50, n_fit // 10)))
         if num_cols:
             tf.append(("num", make_pipeline(
                 SimpleImputer(strategy="median", add_indicator=True),
-                QuantileTransformer(n_quantiles=max(10, min(500, n_fit // 2 if n_fit < 500 else max(50, n_fit // 10))),
-                                    output_distribution="normal", random_state=seed),
+                QuantileTransformer(n_quantiles=nq, subsample=50_000, output_distribution="normal", random_state=seed),
             ), num_cols))
+            if prep_mode == "dual":
+                tf.append(("num_std", make_pipeline(
+                    SimpleImputer(strategy="median"),
+                    StandardScaler(),
+                ), num_cols))
         if cat_cols:
             tf.append(("cat", OneHotEncoder(
                 handle_unknown="ignore", min_frequency=10, max_categories=40, sparse_output=False,
@@ -1148,6 +1212,8 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         pre = build_pre(len(df_tr))
         Z = np.asarray(pre.fit_transform(df_tr), dtype=np.float32)
         Z = np.where(np.isfinite(Z), Z, 0.0)
+        if prep_mode == "dual":
+            Z = np.clip(Z, -6.0, 6.0)
         if spec.task_type == "regression":
             y_med = float(np.median(y_tr))
             y_sc = float(np.std(y_tr))
@@ -1157,16 +1223,18 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         else:
             y_med, y_sc = 0.0, 1.0
             y_norm = y_tr.astype(np.float32) if spec.task_type == "binary" else y_tr.astype(np.int64)
-        bs = int(min(256, max(32, len(df_tr) // 30)))
-        max_ep = 40 if len(df_tr) > 40_000 else 65
+        bs = 512 if len(df_tr) > 60_000 else int(min(256, max(32, len(df_tr) // 30)))
+        max_ep = 30 if len(df_tr) > 60_000 else (45 if len(df_tr) > 30_000 else 65)
         net = _NumpyTabularResNet(Z.shape[1], d_out, loss_kind=loss_kind, seed=ep_seed)
-        net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=10, guard=guard, n_jobs=n_jobs)
+        net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=12, guard=guard, n_jobs=n_jobs)
         return pre, net, y_med, y_sc
 
     def pred_one(bundle, df):
         pre, net, y_med, y_sc = bundle
         Z = np.asarray(pre.transform(df), dtype=np.float32)
         Z = np.where(np.isfinite(Z), Z, 0.0)
+        if prep_mode == "dual":
+            Z = np.clip(Z, -6.0, 6.0)
         p = net.predict(Z)
         if spec.task_type == "regression":
             return np.clip(inverse_target(p * y_sc + y_med, cfg.target_transform), y_lo, y_hi)
@@ -1178,7 +1246,8 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     for k, (tr, va) in enumerate(plan.folds):
         if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
             return None
-        bundle = fit_one(X_in.iloc[tr], yt[tr], w[tr], seed + 17 * k)
+        tr_use = _cap_rows(tr, seed + 17 * k)
+        bundle = fit_one(X_in.iloc[tr_use], yt[tr_use], w[tr_use], seed + 17 * k)
         oof[va] = pred_one(bundle, X_in.iloc[va])
         iters.append(int(bundle[1].n_iter_))
         if plan.mode == "cv" and Xt_in is not None:
@@ -1189,8 +1258,18 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             log(f"{name}: время вышло на фолде {k + 1}/{len(plan.folds)}")
             return _finish(name, oof, None, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
     if plan.mode == "refit" and Xt_in is not None:
-        bundle = fit_one(X_in, yt, w, seed + 99)
-        test = pred_one(bundle, Xt_in)
+        all_idx = _cap_rows(np.arange(n), seed + 99)
+        t_ref0 = time.time()
+        b1 = fit_one(X_in.iloc[all_idx], yt[all_idx], w[all_idx], seed + 99)
+        p1 = pred_one(b1, Xt_in)
+        # On temporal refit, average a second complementary 90/10 bag if plenty of time remains (covers 100% of train)
+        dt_ref = time.time() - t_ref0
+        if not guard.expired() and (guard.deadline - time.time()) > max(12.0, 1.5 * dt_ref):
+            b2 = fit_one(X_in.iloc[all_idx], yt[all_idx], w[all_idx], seed + 199)
+            p2 = pred_one(b2, Xt_in)
+            test = 0.5 * (p1 + p2)
+        else:
+            test = p1
     return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
 
 

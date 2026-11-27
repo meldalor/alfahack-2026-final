@@ -475,7 +475,7 @@ def model_family(name: str) -> str:
     m = re.fullmatch(r"(lgb_xoffset\d+)_s\d+", name)
     if m:
         return m.group(1)
-    for f in ("xgb", "xgb_ph", "cat", "cat_rmse", "cat_top", "cat_d8", "et", "hgb", "mlp"):
+    for f in ("xgb", "xgb_ph", "cat", "cat_rmse", "cat_top", "cat_d8", "et", "hgb", "mlp_dual", "mlp"):
         if name == f or re.fullmatch(f + r"_s\d+", name):
             return f
     return name
@@ -777,11 +777,11 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             results.append(r)
             publish(name)
 
-    # Tier 1: базовые разнообразные семейства
+    # Tier 1: базовые разнообразные семейства (все видят принятые AutoResearch-признаки: text_oof, entity_history, LLM)
     if spec.task_type == "regression":
-        fit_extra("ridge", fit_linear, {"kind": "ridge", "top_cols": top_cols}, min_need=15.0, use_clean=True)
+        fit_extra("ridge", fit_linear, {"kind": "ridge", "top_cols": top_cols}, min_need=15.0)
     else:
-        fit_extra("logreg", fit_linear, {"kind": "logreg", "top_cols": top_cols}, min_need=20.0, use_clean=True)
+        fit_extra("logreg", fit_linear, {"kind": "logreg", "top_cols": top_cols}, min_need=20.0)
     if not late_cat:
         fit_extra("cat", fit_cat, cat_kw, min_need=40.0)
         if is_mae_task:
@@ -792,15 +792,23 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         fit_extra("xgb", fit_xgb, {"lr": xgb_lr, "depth": xgb_depth}, min_need=40.0)
     fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=25.0)
     fit_extra("et", fit_et, {}, min_need=25.0)
-    fit_extra("mlp", fit_mlp, {"top_cols": top_cols}, min_need=25.0, use_clean=True)
-    # Усредняем до 4 дополнительных сидов быстрого MLP для снижения дисперсии нейросети в ансамбле
+    fit_extra("mlp", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt"}, min_need=25.0)
+    # Второе нейросетевое семейство Dual-View [Quantile + Standard] + дополнительные сиды при быстром обучении
     mlp_r = next((r for r in results if r is not None and r.name == "mlp" and r.test is not None), None)
+    if mlp_r is not None and mlp_r.seconds <= 90.0 and left() > 140.0:
+        fit_extra("mlp_dual", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "seed": 100}, min_need=30.0)
     if mlp_r is not None and mlp_r.seconds <= 75.0 and left() > 180.0:
-        n_extra_mlp = 4 if (mlp_r.seconds <= 45.0 and left() > 360.0) else 2
+        n_extra_mlp = 3 if (mlp_r.seconds <= 45.0 and left() > 360.0) else 2
         for ms in range(1, n_extra_mlp + 1):
             if left() <= 120.0:
                 break
-            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "seed": ms}, min_need=35.0, use_clean=True)
+            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt", "seed": ms}, min_need=35.0)
+        md_r = next((r for r in results if r is not None and r.name == "mlp_dual" and r.test is not None), None)
+        if md_r is not None and md_r.seconds <= 60.0 and left() > 240.0:
+            for ms in range(1, 3):
+                if left() <= 140.0:
+                    break
+                fit_extra(f"mlp_dual_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "seed": 100 + ms}, min_need=35.0)
 
     # Tier 2: вторичные модели для усиления ансамбля (когда все базовые семейства уже обучены)
     if left() > min(90.0, eval_t * 2 + 30):
@@ -826,8 +834,8 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 results.append(r)
                 publish("cat_top")
     if spec.task_type == "regression":
-        fit_extra("huber", fit_linear, {"kind": "huber", "top_cols": top_cols}, min_need=25.0, use_clean=True)
-        fit_extra("lasso", fit_linear, {"kind": "lasso", "top_cols": top_cols}, min_need=25.0, use_clean=True)
+        fit_extra("huber", fit_linear, {"kind": "huber", "top_cols": top_cols}, min_need=25.0)
+        fit_extra("lasso", fit_linear, {"kind": "lasso", "top_cols": top_cols}, min_need=25.0)
 
     # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
     hist_cols = [c for c in X.columns if c.startswith("hist__last")] if spec.task_type == "regression" else []
@@ -926,9 +934,12 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          top_cols=top_cols, seed=40 + k, name=f"hgb_s{k}")]
 
     def mlp_seed(k):
-        cf_clean = ModelConfig(**{**cfg_x.to_dict(), "drop": []})
-        return [safe_fit(fit_mlp, prep.X, y, prep.Xt, plan, spec, cf_clean, N_JOBS, max(60.0, left() * 0.3),
-                         top_cols=top_cols, seed=10 + k, name=f"mlp_s{10 + k}")]
+        return [safe_fit(fit_mlp, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.3),
+                         top_cols=top_cols, prep_mode="qt", seed=10 + k, name=f"mlp_s{10 + k}")]
+
+    def mlp_dual_seed(k):
+        return [safe_fit(fit_mlp, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.3),
+                         top_cols=top_cols, prep_mode="dual", seed=110 + k, name=f"mlp_dual_s{10 + k}")]
 
     def lgb_et_seed(k):
         cfg2 = ModelConfig(**{**cfg.to_dict(), "lgb_params": {**cfg.lgb_params, "extra_trees": True}})
@@ -963,6 +974,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         ("hgb", hgb_seed, True),
         ("et", et_seed, True),
         ("mlp", mlp_seed, True),
+        ("mlp_dual", mlp_dual_seed, True),
     ]
     picked = []
     for f, fn, allowed in cand_map:

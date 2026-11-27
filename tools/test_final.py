@@ -1105,6 +1105,36 @@ class FinalTests(unittest.TestCase):
             self.assertEqual(r.llm_rounds, 2)
             self.assertEqual(r.no_gain_llm_rounds, 2)
 
+    def test_mlp_dual_ema_swa_and_refit_bagging(self):
+        from ag_models import ModelConfig, fit_mlp
+        from solution import model_family
+        self.assertEqual(model_family('mlp_dual'), 'mlp_dual')
+        self.assertEqual(model_family('mlp_dual_s2'), 'mlp_dual')
+        self.assertEqual(model_family('mlp_s3'), 'mlp')
+        rng = np.random.default_rng(123)
+        n = 360
+        X = pd.DataFrame({
+            't__ord': np.arange(n, dtype=np.float64),
+            'a': rng.normal(size=n),
+            'b': rng.exponential(2.0, size=n),
+            'c': pd.Categorical(rng.choice(['u', 'v', 'w'], size=n)),
+        })
+        Xt = pd.DataFrame({
+            't__ord': np.arange(n, n + 30, dtype=np.float64),
+            'a': rng.normal(size=30),
+            'b': rng.exponential(2.0, size=30),
+            'c': pd.Categorical(rng.choice(['u', 'v', 'w'], size=30)),
+        })
+        y = 10.0 + 3.0 * X['a'].values - 1.5 * X['b'].values + (X['c'] == 'u').astype(float).values * 2.0 + rng.normal(0, 0.3, n)
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        plan = make_plan(X, y, 'regression', time_col='t__ord')
+        r_dual = fit_mlp(X, y, Xt, plan, spec, ModelConfig(), n_jobs=2, time_limit=60, seed=0,
+                         name='mlp_dual', prep_mode='dual')
+        self.assertIsNotNone(r_dual)
+        self.assertLess(r_dual.score, 1.2)
+        self.assertEqual(len(r_dual.test), len(Xt))
+        self.assertTrue(np.isfinite(r_dual.test).all())
+
 
 class Pool5HarnessTests(unittest.TestCase):
     def test_synthetic_generators_deterministic_and_disjoint(self):

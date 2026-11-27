@@ -96,6 +96,9 @@ class SubmissionWriter:
         else:
             proba = np.asarray(test_pred, dtype=float)
             proba = np.where(np.isfinite(proba), proba, 1.0 / proba.shape[1])
+            proba = np.clip(proba, 0.0, 1.0)
+            rs = proba.sum(axis=1, keepdims=True)
+            proba = np.where(rs > 0, proba / np.where(rs > 0, rs, 1.0), 1.0 / proba.shape[1])
             if spec.output_kind == "proba":
                 values = {self.out_col(spec): proba[:, 1]}
             elif spec.output_kind == "proba_multi":
@@ -760,11 +763,11 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         cfg_x = ModelConfig(**{**cfg.to_dict(), "target_transform": "none"})
 
     def fit_extra(name, fn, kw, min_need=None, use_clean=False):
-        need = min(80.0, eval_t * 2 + 25) if min_need is None else min_need
-        if left() < need:
+        dyn_need = min(80.0, eval_t * 2 + 25) if min_need is None else min(min_need, max(6.0, eval_t * 3 + 6))
+        if left() < dyn_need:
             log(f"{name}: пропуск, мало времени ({left():.0f}s)")
             return
-        lim = max(30.0 if min_need is not None else 55.0, left() * 0.45)
+        lim = min(left(), max(12.0 if min_need is not None else 25.0, left() * 0.45))
         kwargs = dict(kw)
         Xf, Xtf = (prep.X, prep.Xt) if use_clean else (X, Xt)
         cf = ModelConfig(**{**cfg_x.to_dict(), "drop": []}) if use_clean else cfg_x

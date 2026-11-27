@@ -864,6 +864,12 @@ class FinalTests(unittest.TestCase):
         hur = apply_zero_mape_hurdle(X, Xt, y, oof, test_p, plan, plan.oof_mask, n_jobs=1)
         self.assertIsNotNone(hur)
         self.assertLess(hur['score'], base_mape * 1e-4)  # massive orders-of-magnitude reduction!
+        self.assertGreater(float(np.ptp(hur['test'])), 1e-6)
+        # Unpredictable random zeros MUST never produce a degenerate all-zero constant submission
+        y_rand0 = np.where(rng.random(n) < 0.18, 0.0, np.exp(1.5 + 0.8 * x))
+        hur_r = apply_zero_mape_hurdle(X, Xt, y_rand0, oof, np.linspace(1.0, 10.0, 30), plan, plan.oof_mask, n_jobs=1)
+        if hur_r is not None:
+            self.assertGreater(float(np.ptp(hur_r['test'])), 1e-6)
         # Also verify fit_et maps object columns consistently between train and test
         y_obj = np.where(X['obj'] == 'pos', 100.0, 10.0)
         spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
@@ -1170,6 +1176,70 @@ class FinalTests(unittest.TestCase):
         # Unseen entity u_new gets the global past mean (0.5), u1 gets smoothed > 0.5
         self.assertAlmostEqual(float(h1_te['hist__smooth'].iloc[1]), 0.5, places=3)
         self.assertGreater(float(h1_te['hist__smooth'].iloc[0]), 0.65)
+
+    def test_fast_bin_rank_score_exact_and_large_10model_stack_blend(self):
+        from sklearn.metrics import average_precision_score, roc_auc_score
+        from ag_ensemble import _fast_bin_rank_score, stack_blend
+        from ag_models import FitResult, FoldPlan
+        rng = np.random.default_rng(131)
+        # 1) Exact match vs sklearn including tied scores!
+        y = rng.binomial(1, 0.15, size=2000)
+        s = np.round(rng.normal(size=2000) + 0.8 * y, 1)  # deliberate ties
+        self.assertAlmostEqual(_fast_bin_rank_score('average_precision', y, s),
+                               float(average_precision_score(y, s)), places=11)
+        self.assertAlmostEqual(_fast_bin_rank_score('roc_auc', y, s),
+                               float(roc_auc_score(y, s)), places=11)
+        # 2) Large 10-model PR-AUC stack_blend must NOT collapse to uniform 0.1 weights
+        n = 40_000
+        y2 = rng.binomial(1, 0.12, size=n)
+        sig = 1.2 * y2 + rng.normal(0, 1.0, n)
+        def mk(z):
+            p = 1.0 / (1.0 + np.exp(-np.clip(z, -15, 15)))
+            return np.column_stack([1.0 - p, p])
+        rs = [FitResult('strong1', mk(sig + rng.normal(0, 0.4, n)), mk(rng.normal(size=50)), 0.5, [], [], None, 1.0),
+              FitResult('strong2', mk(sig + rng.normal(0, 0.5, n)), mk(rng.normal(size=50)), 0.48, [], [], None, 1.0)]
+        for j in range(8):
+            rs.append(FitResult(f'noise{j}', mk(rng.normal(0, 1.5, n)), mk(rng.normal(size=50)), 0.12, [], [], None, 1.0))
+        mask = np.zeros(n, bool); mask[10_000:] = True
+        plan = FoldPlan(folds=[(np.arange(10_000), np.arange(10_000, 25_000)),
+                               (np.arange(25_000), np.arange(25_000, n))],
+                        mode='refit', oof_mask=mask, time_col='t', desc='time')
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric='average_precision', classes=[0, 1])
+        sb = stack_blend(rs, y2, mask, spec, plan=plan)
+        self.assertIsNotNone(sb)
+        # Strong models must hold > 85% of total weight (previously collapsed to 0.1 each!)
+        w_strong = sb['weights'].get('strong1', 0.0) + sb['weights'].get('strong2', 0.0)
+        self.assertGreater(w_strong, 0.85, f'Unexpected weights: {sb["weights"]}')
+
+    def test_error_analysis_binary_ranking_and_regression_mae_bias(self):
+        from ag_features import Prepared
+        from ag_models import FitResult
+        from ag_research import Researcher
+        from ag_utils import Budget
+        rng = np.random.default_rng(149)
+        n = 500
+        X = pd.DataFrame({'seg': pd.Categorical(rng.choice(['A', 'B'], n)), 'x': rng.normal(size=n)})
+        Xt = X.iloc[:20].copy()
+        # 1) Binary imbalanced PR-AUC must report top-10% lift, NEVER misleading 0.5-threshold F1=0.000
+        yb = (rng.random(n) < 0.12).astype(int)
+        p1 = np.clip(0.08 + 0.25 * yb + rng.normal(0, 0.05, n), 0.01, 0.45)  # all < 0.5!
+        spec_b = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric='average_precision', classes=[0, 1])
+        plan_b = make_plan(X, yb, 'binary', n_folds=3)
+        with tempfile.TemporaryDirectory() as d:
+            rb = Researcher(spec_b, Prepared(X=X, Xt=Xt, y=yb, cat_cols=['seg']), plan_b, None, Budget(60.0), 1, Path(d))
+            rb.best = FitResult('b', np.column_stack([1.0 - p1, p1]), np.full((20, 2), 0.5), 0.7, [], [], None, 1.0)
+            ea_b = rb.error_analysis()
+            self.assertIn('top-10% lift=', ea_b)
+            self.assertNotIn('per-class F1:', ea_b)
+            # 2) Regression MAE must report mae and bias
+            yr = 10.0 + 2.0 * X['x'].values + rng.normal(0, 1.0, n)
+            spec_r = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+            plan_r = make_plan(X, yr, 'regression', n_folds=3)
+            rr = Researcher(spec_r, Prepared(X=X, Xt=Xt, y=yr, cat_cols=['seg']), plan_r, None, Budget(60.0), 1, Path(d))
+            rr.best = FitResult('r', yr + 0.5, np.full(20, 10.0), 0.5, [], [], None, 1.0)
+            ea_r = rr.error_analysis()
+            self.assertIn('median residual=', ea_r)
+            self.assertIn('mae=', ea_r)
 
 
 class Pool5HarnessTests(unittest.TestCase):

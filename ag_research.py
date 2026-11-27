@@ -708,13 +708,49 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         try:
             if self.spec.task_type == "regression":
                 err = r.oof[mask] - y
-                out.append(f"mean residual={err.mean():.4g}, |err| p50={np.median(np.abs(err)):.4g} p95={np.quantile(np.abs(err), 0.95):.4g}")
-                big = np.abs(err) > np.quantile(np.abs(err), 0.95)
-                out.append(f"top-5% errors: target mean {y[big].mean():.4g} vs overall {y.mean():.4g}")
+                abs_e = np.abs(err)
+                use_mae = self.spec.metric in ("mae", "medae", "smape")
+                out.append(f"mean residual={err.mean():+.4g}, median residual={np.median(err):+.4g}, "
+                           f"|err| p50={np.median(abs_e):.4g} p95={np.quantile(abs_e, 0.95):.4g}")
+                big = abs_e > np.quantile(abs_e, 0.95)
+                out.append(f"top-5% errors: target mean {y[big].mean():.4g} vs overall {y.mean():.4g}, "
+                           f"mean bias={err[big].mean():+.4g}")
                 for c in self.prep.cat_cols[:3]:
-                    g = pd.DataFrame({"c": X[c].astype(str).values, "e2": err ** 2}).groupby("c").e2.agg(["mean", "size"])
-                    g = g[g["size"] >= 30].sort_values("mean", ascending=False).head(4)
-                    out.append(f"worst {c}: " + ", ".join(f"{i} (rmse={math.sqrt(v):.3g}, n={n})" for i, (v, n) in g.iterrows()))
+                    if use_mae:
+                        g = pd.DataFrame({"c": X[c].astype(str).values, "ae": abs_e, "e": err}).groupby("c").agg(
+                            err_m=("ae", "mean"), bias=("e", "mean"), size=("ae", "size"))
+                        g = g[g["size"] >= 30].sort_values("err_m", ascending=False).head(4)
+                        out.append(f"worst {c}: " + ", ".join(
+                            f"{i} (mae={v:.3g}, bias={b:+.2g}, n={int(n)})" for i, (v, b, n) in g.iterrows()))
+                    else:
+                        g = pd.DataFrame({"c": X[c].astype(str).values, "e2": err ** 2}).groupby("c").e2.agg(["mean", "size"])
+                        g = g[g["size"] >= 30].sort_values("mean", ascending=False).head(4)
+                        out.append(f"worst {c}: " + ", ".join(f"{i} (rmse={math.sqrt(v):.3g}, n={int(n)})" for i, (v, n) in g.iterrows()))
+            elif self.spec.task_type == "binary" and self.spec.metric in PROBA_METRICS:
+                from ag_metrics import proba_score
+
+                p1 = np.asarray(r.oof[mask, 1], dtype=float)
+                yb = np.asarray(y, dtype=int)
+                base_r = float(yb.mean())
+                q50, q90, q99 = np.quantile(p1, [0.5, 0.9, 0.99])
+                top10 = p1 >= q90
+                top5 = p1 >= np.quantile(p1, 0.95)
+                lift10 = float(yb[top10].mean() / max(base_r, 1e-9)) if top10.any() else 1.0
+                prec5 = float(yb[top5].mean()) if top5.any() else base_r
+                out.append(f"binary ranking: pos_rate={base_r:.4f}, pred p50={q50:.4f} p90={q90:.4f} p99={q99:.4f}, "
+                           f"top-10% lift={lift10:.2f}x, top-5% precision={prec5:.4f} (NOTE: do NOT use 0.5 threshold; metric is {self.spec.metric})")
+                for c in self.prep.cat_cols[:3]:
+                    seg = []
+                    for val, grp in pd.DataFrame({"c": X[c].astype(str).values, "y": yb, "p": p1}).groupby("c"):
+                        if len(grp) >= 100 and grp["y"].nunique() == 2:
+                            pp = np.column_stack([1.0 - grp["p"].values, grp["p"].values])
+                            sc_g = proba_score(self.spec.metric, grp["y"].values, pp)
+                            if np.isfinite(sc_g):
+                                seg.append((sc_g, val, len(grp), float(grp["y"].mean())))
+                    if seg:
+                        seg.sort(reverse=(direction(self.spec.metric) == "min"))
+                        out.append(f"weakest {c}: " + ", ".join(
+                            f"{v} ({self.spec.metric}={s:.3f}, pos={pr:.3f}, n={n})" for s, v, n, pr in seg[:4]))
             else:
                 from sklearn.metrics import confusion_matrix, f1_score
 
@@ -780,7 +816,7 @@ Experiment journal (latest last):
 {chr(10).join(hist)}
 
 Propose up to {n} NEW hypotheses that were not tried yet. Allowed action types (use exactly these JSON shapes):
-- {{"type":"custom_features","code":"BLOCK_1"}}  the referenced python block must define make_features(train, test) that takes two pandas DataFrames with ONLY the base Columns listed above (no target, no already-accepted engineered features!) and returns (new_train_df, new_test_df) containing ONLY new numeric columns, same row order. Categorical columns have pandas "category" dtype (convert with .astype(str) or .cat.codes before arithmetic). pandas as pd and numpy as np are available; no other imports needed. Row-wise formulas, nonlinear interactions (combining event context, stream__*, nc__* nowcasts, __fcst, lags), ratios, differences, aggregates across related columns are good ideas. {'IMPORTANT: this is a chronological time split — NEVER use future rows or test statistics (NO concat(train, test) groupby/value_counts/quantiles, NO negative shifts, NO future lookahead)! Any group stats must be fit strictly on train and mapped to test, or computed strictly causally (< t).' if self.plan.time_col else 'Group statistics on categories are also fine.'} Keep it vectorized and fast.
+- {{"type":"custom_features","code":"BLOCK_1"}}  the referenced python block must define make_features(train, test) that takes two pandas DataFrames with ONLY the base Columns listed above (NEVER reference target `{spec.target}` or already-accepted engineered features — they are NOT in train/test!) and returns (new_train_df, new_test_df) containing ONLY new numeric columns, same row order. Categorical columns have pandas "category" dtype (convert with .astype(str) or .cat.codes before arithmetic). pandas as pd and numpy as np are available; no other imports needed. Row-wise formulas, nonlinear interactions (combining event context, stream__*, nc__* nowcasts, __fcst, lags), ratios, differences, aggregates across related columns are good ideas. {'IMPORTANT: this is a chronological time split — NEVER use future rows or test statistics (NO concat(train, test) groupby/value_counts/quantiles, NO negative shifts, NO future lookahead)! Any group stats must be fit strictly on train and mapped to test, or computed strictly causally (< t).' if self.plan.time_col else 'Group statistics on categories are also fine.'} Keep it vectorized and fast.
 - {{"type":"params","params":{{lightgbm params: num_leaves, min_child_samples, feature_fraction, bagging_fraction, lambda_l1, lambda_l2, max_depth, min_split_gain, max_bin, path_smooth, cat_smooth, extra_trees}}}}
 - {{"type":"drop_features","columns":[...]}}
 - {{"type":"frequency_encoding","columns":[...]}}

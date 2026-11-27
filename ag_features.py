@@ -884,7 +884,8 @@ def cross_impute_outages(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list) -> t
         X_str[c] = X_str[c].astype("string").fillna("__missing__").astype(str)
         Xt_str[c] = Xt_str[c].astype("string").fillna("__missing__").astype(str)
     reconstructed = 0
-    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen", "__sys_mean", "__sys_dev")
+    _lag_sfx = ("__d1", "__rm3", "__h7d_tgt", "__dow4_tgt", "__anom", "__fcst", "__runlen",
+                "__sys_mean", "__sys_max", "__sys_dev", "__ord", "__year")
     for nm in null_markers:
         prefix = nm[:-len("__raw_nulls")] + "__"
         t_cols = [c for c in num_all if c.startswith(prefix) and c != nm and c != prefix + "matched"

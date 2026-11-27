@@ -305,6 +305,12 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
         Z_df, cols, lag1 = _build_causal_design(panel, groups, slot_col, num_cols, cadence, early_cut=earliest_val)
         Z_vals = Z_df.to_numpy(dtype=np.float32)
         Y_vals = panel[cols].to_numpy(dtype=np.float32)
+        l1_arr = lag1[cols].to_numpy(dtype=np.float32)
+        if groups:
+            ok1_p = (panel.groupby(groups, sort=False)[slot_col].diff() == cadence).to_numpy()
+        else:
+            ok1_p = (panel[slot_col].diff() == cadence).to_numpy()
+        prev_idx = np.where(ok1_p, np.arange(len(panel)) - 1, -1)
         h_series = panel[slot_col]
         h_ns = h_series.astype("int64").to_numpy()
 
@@ -378,10 +384,18 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
             prof_all = _seasonal_profile(panel, groups, slot_col, cols, p_tr_mask, is_hourly)
             out_prof[ok_rows] = prof_all[ev_pidx]
 
-            # 2) Многовыходный Cholesky Ridge по остаткам (Y - profile) на недавних хронологических слотах ВСЕХ групп
+            # 2) Многовыходный Ridge по остаткам (Y - profile) с каузальной аномалией lag1 - prof(h - cadence)
+            # и покалоночным подбором регуляризации alpha по точному GCV (одно спектральное разложение G)
             tr_pos_all = np.flatnonzero(p_tr_mask)
             tr_pos_r = _recent_chrono_pos(tr_pos_all, h_ns, 150_000)
-            Z_tr = Z_vals[tr_pos_r]
+
+            def _design_with_anom(pos: np.ndarray) -> np.ndarray:
+                zb = Z_vals[pos]
+                p1 = prev_idx[pos]
+                a1 = np.where((p1 >= 0)[:, None], l1_arr[pos] - prof_all[np.maximum(p1, 0)], np.nan).astype(np.float32)
+                return np.hstack([zb, a1])
+
+            Z_tr = _design_with_anom(tr_pos_r)
             Y_raw_tr = Y_vals[tr_pos_r]
             # Strictly causal domain bounds from past train rows (eliminates impossible negative rainfall/probs)
             with np.errstate(all="ignore"):
@@ -411,15 +425,35 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                 _lim_ctx = nullcontext()
             with _lim_ctx:
                 G = (Zs.T @ Zs).astype(np.float64)
-                G[np.diag_indices_from(G)] += 300.0
                 R = (Zs.T @ Yc).astype(np.float64)
                 try:
-                    W = np.linalg.solve(G, R)
+                    eig_v, V = np.linalg.eigh(G)
+                    eig_v = np.maximum(eig_v, 0.0)
+                    VtR = V.T @ R
+                    y_norm2 = np.sum(Yc.astype(np.float64) ** 2, axis=0)
+                    n_obs = float(max(len(Zs), 1))
+                    ok_e = eig_v > 1e-9
+                    c2 = np.where(ok_e[:, None], (VtR ** 2) / np.where(ok_e[:, None], eig_v[:, None], 1.0), 0.0)
+                    best_gcv = np.full(n_c, np.inf)
+                    best_al = np.full(n_c, 300.0)
+                    for al in (25.0, 100.0, 300.0, 1000.0, 3500.0, 12000.0):
+                        shrink = eig_v / (eig_v + al)
+                        rss = np.maximum(y_norm2 - np.sum(c2 * (1.0 - (al / (eig_v + al)) ** 2)[:, None], axis=0), 1e-12)
+                        denom = max(1.0 - float(np.sum(shrink)) / n_obs, 1e-4)
+                        gcv = rss / (denom * denom)
+                        impr = gcv < best_gcv
+                        best_gcv = np.where(impr, gcv, best_gcv)
+                        best_al = np.where(impr, al, best_al)
+                    W = V @ (VtR / (eig_v[:, None] + best_al[None, :]))
                 except np.linalg.LinAlgError:
-                    W = np.linalg.lstsq(G, R, rcond=None)[0]
+                    G[np.diag_indices_from(G)] += 300.0
+                    try:
+                        W = np.linalg.solve(G, R)
+                    except np.linalg.LinAlgError:
+                        W = np.linalg.lstsq(G, R, rcond=None)[0]
 
                 # float64 prediction matmul guarantees bit-exact float32 invariance across test batch sizes
-                Z_ev = Z_vals[ev_pidx]
+                Z_ev = _design_with_anom(ev_pidx)
                 Z_ev_f = np.where(np.isfinite(Z_ev), Z_ev, col_fill[None, :])
                 Z_ev_s = ((Z_ev_f - mu) / sd).astype(np.float64)
                 pred_res = (Z_ev_s @ W + y_bias.astype(np.float64)).astype(np.float32)
@@ -435,8 +469,8 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                 import lightgbm as lgb
 
                 tr_pos = _recent_chrono_pos(tr_pos_all, h_ns, 40_000)
-                Z_g_tr = Z_vals[tr_pos]
-                Z_g_ev = Z_vals[ev_pidx]
+                Z_g_tr = _design_with_anom(tr_pos)
+                Z_g_ev = Z_ev
                 params_g = {
                     "objective": "regression",
                     "learning_rate": 0.1,

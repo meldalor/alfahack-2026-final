@@ -6,7 +6,7 @@ at dispatch time, while the panel itself often has 10x-50x more rows than the la
 
 This module learns strictly causal 1-step-ahead forecasts (from past lags <= slot - cadence to slot)
 using expanding temporal blocks whose boundaries align with validation folds and test start, so:
-1. No future or current-period panel observation ever leaks into features or model parameters.
+1. No future or current-period panel observation ever leaks into features, schema, or parameters.
 2. Train, validation, and test rows receive identically distributed out-of-sample nowcast features.
 """
 import time
@@ -17,7 +17,28 @@ import pandas as pd
 from ag_utils import log
 
 
-def _merge_panel_group(panel_list, groups, cadence):
+def _norm_key_series(s: pd.Series) -> pd.Series:
+    """Canonical string normalization for join keys (matches integer/float-int/string consistently)."""
+    if pd.api.types.is_integer_dtype(s):
+        return s.astype("Int64").astype("string")
+    if pd.api.types.is_float_dtype(s):
+        ok = s.dropna()
+        if len(ok) and np.all(np.isfinite(ok)) and np.all(ok == np.floor(ok)):
+            return s.round().astype("Int64").astype("string")
+    return s.astype("string").str.strip()
+
+
+def _recent_chrono_pos(tr_pos_all: np.ndarray, h_ns: np.ndarray, limit: int) -> np.ndarray:
+    """Selects up to `limit` most recent rows chronologically across ALL groups (never slices by group)."""
+    if len(tr_pos_all) <= limit:
+        return tr_pos_all
+    order = np.argsort(h_ns[tr_pos_all], kind="mergesort")
+    keep = tr_pos_all[order[-limit:]]
+    keep.sort()
+    return keep
+
+
+def _merge_panel_group(panel_list, groups, cadence, early_cut=None):
     """Объединяет несколько панелей с одинаковыми (groups, cadence) в единую мультивариатную сетку."""
     slot_col = "__ag_slot"
     merged = None
@@ -27,7 +48,19 @@ def _merge_panel_group(panel_list, groups, cadence):
         pfx = f"{p['name']}__"
         ren = {c: (c if str(c).startswith(pfx) else f"{pfx}{c}") for c in p["num_cols"]}
         df = df[[*groups, p["slot_col"], *p["num_cols"]]].rename(columns={p["slot_col"]: slot_col, **ren})
-        valid_c = [c for c in ren.values() if df[c].nunique(dropna=True) > 1]
+        df[slot_col] = pd.to_datetime(df[slot_col], errors="coerce", utc=True)
+        for g in groups:
+            df[g] = _norm_key_series(df[g])
+        # Schema-level non-constancy check strictly on early train history (immune to future poisoning)
+        if early_cut is not None:
+            early_m = df[slot_col] < early_cut
+            if int(early_m.sum()) < 50:
+                early_m = df[slot_col] <= df[slot_col].median()
+        else:
+            early_m = df[slot_col] <= df[slot_col].median()
+        valid_c = [c for c in ren.values() if df.loc[early_m, c].nunique(dropna=True) > 1]
+        if not valid_c:
+            continue
         df = df[[*groups, slot_col, *valid_c]]
         num_cols.extend(valid_c)
         merged = df if merged is None else merged.merge(df, on=[*groups, slot_col], how="outer")
@@ -38,11 +71,20 @@ def _merge_panel_group(panel_list, groups, cadence):
     return merged, num_cols
 
 
-def _build_causal_design(panel: pd.DataFrame, groups: list, slot_col: str, num_cols: list, cadence: pd.Timedelta):
+def _build_causal_design(panel: pd.DataFrame, groups: list, slot_col: str, num_cols: list,
+                         cadence: pd.Timedelta, early_cut=None):
     """Строит матрицу строго прошлых признаков Z(h) для прогноза состояния панели в слот h."""
     cols = num_cols[:55]
     is_hourly = cadence == pd.Timedelta(hours=1)
-    span_hours = (panel[slot_col].max() - panel[slot_col].min()).total_seconds() / 3600.0
+    if early_cut is not None:
+        early_m = (panel[slot_col] < early_cut).to_numpy()
+        if int(early_m.sum()) < 50:
+            early_m = (panel[slot_col] <= panel[slot_col].median()).to_numpy()
+    else:
+        early_m = (panel[slot_col] <= panel[slot_col].median()).to_numpy()
+
+    early_slots = panel.loc[early_m, slot_col]
+    span_hours = float((early_slots.max() - early_slots.min()).total_seconds() / 3600.0) if len(early_slots) >= 2 else 0.0
 
     if groups:
         grp = panel.groupby(groups, sort=False)
@@ -94,14 +136,36 @@ def _build_causal_design(panel: pd.DataFrame, groups: list, slot_col: str, num_c
         parts.append(lag168.add_suffix("__l168"))
         parts.append((lag168 - lag169).astype("float32").add_suffix("__step168"))
 
-    # Общесистемное (межгрупповое) среднее на предыдущем завершённом слоте h - cadence
+    # Строго каузальная длительность активного бинарного флага на слоте h - cadence (для hazard/survival прогноза)
+    rl_dict = {}
     if groups:
-        n_groups = int(panel[groups].drop_duplicates().shape[0])
+        grp_chg = panel[groups[0]].ne(panel[groups[0]].shift(1))
+        for gcol in groups[1:]:
+            grp_chg = grp_chg | panel[gcol].ne(panel[gcol].shift(1))
+        gap_break = grp_chg | (~ok1)
+    else:
+        gap_break = pd.Series(~ok1, index=panel.index)
+    for c in cols:
+        head = panel.loc[early_m, c].dropna()
+        if len(head) >= 10 and head.nunique() == 2 and head.isin([0, 1, 0.0, 1.0]).mean() >= 0.99:
+            v_bin = (panel[c] == 1).astype(np.int8)
+            reset = (v_bin == 0) | gap_break
+            rl_cur = v_bin.groupby(reset.cumsum(), sort=False).cumsum().astype("float32")
+            rl_prev = (rl_cur.groupby([panel[g] for g in groups], sort=False).shift(1)
+                       if groups else rl_cur.shift(1)).astype("float32")
+            rl_prev.loc[~ok1] = np.nan
+            rl_dict[f"{c}__rl1"] = rl_prev
+    if rl_dict:
+        parts.append(pd.DataFrame(rl_dict, index=panel.index, dtype="float32"))
+
+    # Общесистемное (межгрупповое) среднее по ВСЕМ колонкам на прошлом завершённом слоте h - cadence
+    if groups:
+        n_groups = int(panel.loc[early_m, groups].drop_duplicates().shape[0])
         if 2 <= n_groups <= 200:
-            sys_cols = cols[:25]
+            sys_cols = cols
             sys_by_h = panel.groupby(slot_col, sort=False)[sys_cols].mean().astype("float32")
-            prev_h = panel[slot_col] - cadence
-            sys_l1 = sys_by_h.reindex(prev_h).reset_index(drop=True)
+            prev_h1 = panel[slot_col] - cadence
+            sys_l1 = sys_by_h.reindex(prev_h1).reset_index(drop=True)
             sys_l1.columns = [f"sys__{c}" for c in sys_cols]
             parts.append(sys_l1)
 
@@ -126,11 +190,12 @@ def _build_causal_design(panel: pd.DataFrame, groups: list, slot_col: str, num_c
     parts.append(cal)
 
     if is_hourly:
-        parts.append(pd.get_dummies(hr, prefix="__hr", dtype=np.float32))
+        parts.append(pd.get_dummies(pd.Categorical(hr, categories=range(24)), prefix="__hr", dtype=np.float32))
     if groups and len(groups) == 1:
-        n_g = panel[groups[0]].nunique(dropna=True)
-        if 2 <= n_g <= 60:
-            parts.append(pd.get_dummies(panel[groups[0]].astype(str), prefix="__grp", dtype=np.float32))
+        known_g = sorted(panel.loc[early_m, groups[0]].dropna().astype(str).unique())
+        if 2 <= len(known_g) <= 60:
+            g_cat = pd.Categorical(panel[groups[0]].astype(str), categories=known_g)
+            parts.append(pd.get_dummies(g_cat, prefix="__grp", dtype=np.float32))
 
     Z = pd.concat(parts, axis=1).astype("float32")
     return Z, cols, lag1
@@ -160,7 +225,7 @@ def _seasonal_profile(panel: pd.DataFrame, groups: list, slot_col: str, cols: li
 
 
 def _select_top_targets(panel: pd.DataFrame, lag1: pd.DataFrame, cols: list, tr_pidx: np.ndarray,
-                        y_train: np.ndarray, tr_rows_mask: np.ndarray, k_top: int = 6) -> list:
+                        y_train: np.ndarray, tr_rows_mask: np.ndarray, k_top: int = 8) -> list:
     """Выбирает топ-K числовых колонок панели по |corr(lag1, y)| строго на обучающей части."""
     valid = tr_rows_mask & (tr_pidx >= 0) & np.isfinite(y_train)
     if valid.sum() < 100:
@@ -190,12 +255,15 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
     """
     if not rel_meta or not rel_meta.get("panels"):
         return None, None
-    tr_times = rel_meta.get("train_times")
-    te_times = rel_meta.get("test_times")
+    tr_times_raw = rel_meta.get("train_times")
+    te_times_raw = rel_meta.get("test_times")
     tr_groups = rel_meta.get("train_groups")
     te_groups = rel_meta.get("test_groups")
-    if tr_times is None or te_times is None or plan.time_col is None:
+    if tr_times_raw is None or te_times_raw is None or plan.time_col is None:
         return None, None
+
+    tr_times = pd.to_datetime(tr_times_raw, errors="coerce", utc=True).reset_index(drop=True)
+    te_times = pd.to_datetime(te_times_raw, errors="coerce", utc=True).reset_index(drop=True)
 
     t0 = time.time()
     n_tr, n_te = len(tr_times), len(te_times)
@@ -211,18 +279,8 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
         if time.time() - t0 > max_seconds:
             break
         groups = list(grp_tuple)
-        panel, num_cols = _merge_panel_group(plist, groups, cadence)
-        if panel is None or len(panel) < max(4000, 3 * n_tr) or len(panel) > 2_000_000:
+        if groups and (tr_groups is None or te_groups is None or not set(groups) <= set(tr_groups.columns)):
             continue
-        if groups and (tr_groups is None or not set(groups) <= set(tr_groups.columns)):
-            continue
-
-        slot_col = "__ag_slot"
-        is_hourly = cadence == pd.Timedelta(hours=1)
-        Z_df, cols, lag1 = _build_causal_design(panel, groups, slot_col, num_cols, cadence)
-        Z_vals = Z_df.to_numpy(dtype=np.float32)
-        Y_vals = panel[cols].to_numpy(dtype=np.float32)
-        h_series = panel[slot_col]
 
         try:
             tr_slots = tr_times.dt.floor(cadence)
@@ -231,11 +289,30 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
             tr_slots = tr_times.dt.floor("h")
             te_slots = te_times.dt.floor("h")
 
+        fold_starts = sorted({
+            tr_slots.iloc[va].min()
+            for _, va in plan.folds
+            if len(va) and tr_slots.iloc[va].notna().any()
+        })
+        earliest_val = fold_starts[0] if fold_starts else tr_slots.max()
+
+        panel, num_cols = _merge_panel_group(plist, groups, cadence, early_cut=earliest_val)
+        if panel is None or len(panel) < max(4000, 3 * n_tr) or len(panel) > 2_000_000:
+            continue
+
+        slot_col = "__ag_slot"
+        is_hourly = cadence == pd.Timedelta(hours=1)
+        Z_df, cols, lag1 = _build_causal_design(panel, groups, slot_col, num_cols, cadence, early_cut=earliest_val)
+        Z_vals = Z_df.to_numpy(dtype=np.float32)
+        Y_vals = panel[cols].to_numpy(dtype=np.float32)
+        h_series = panel[slot_col]
+        h_ns = h_series.astype("int64").to_numpy()
+
         if groups:
             p_index = pd.MultiIndex.from_frame(panel[[*groups, slot_col]])
-            tr_key_df = tr_groups[groups].reset_index(drop=True).copy()
+            tr_key_df = pd.DataFrame({g: _norm_key_series(tr_groups[g].reset_index(drop=True)) for g in groups})
             tr_key_df[slot_col] = tr_slots.reset_index(drop=True)
-            te_key_df = te_groups[groups].reset_index(drop=True).copy()
+            te_key_df = pd.DataFrame({g: _norm_key_series(te_groups[g].reset_index(drop=True)) for g in groups})
             te_key_df[slot_col] = te_slots.reset_index(drop=True)
             tr_pidx = p_index.get_indexer(pd.MultiIndex.from_frame(tr_key_df))
             te_pidx = p_index.get_indexer(pd.MultiIndex.from_frame(te_key_df))
@@ -247,21 +324,20 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
         if (tr_pidx >= 0).mean() < 0.5 or not (te_pidx >= 0).any():
             continue
 
-        fold_starts = sorted({
-            tr_slots.iloc[va].min()
-            for _, va in plan.folds
-            if len(va) and tr_slots.iloc[va].notna().any()
-        })
-        earliest_val = fold_starts[0] if fold_starts else tr_slots.max()
         tr_min_h = tr_slots.min()
         te_min_h = te_slots.min()
+        panel_burn = h_series.min() + (pd.Timedelta(hours=168) if is_hourly else 7 * cadence)
         pre_tr_slots = tr_slots[tr_slots < earliest_val].dropna()
         inner_cuts = []
+        if pd.notna(tr_min_h) and int(((h_series < tr_min_h) & (h_series >= panel_burn)).sum()) >= 1000:
+            inner_cuts.append(tr_min_h)
         if len(pre_tr_slots) >= 200:
-            for q_frac in (0.25, 0.60):
+            min_cut = max(tr_min_h, panel_burn) + 7 * cadence
+            for q_frac in (0.15, 0.55):
                 c_ts = pd.Timestamp(pre_tr_slots.quantile(q_frac))
-                if c_ts > tr_min_h + 7 * cadence and c_ts < earliest_val:
-                    inner_cuts.append(c_ts)
+                if c_ts > min_cut and c_ts < earliest_val:
+                    if int(((h_series < c_ts) & (h_series >= panel_burn)).sum()) >= 1000:
+                        inner_cuts.append(c_ts)
         cuts = sorted(set(inner_cuts + fold_starts))
         test_cutoff = te_min_h if pd.notna(te_min_h) else (tr_slots.max() + cadence)
 
@@ -272,14 +348,13 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
         te_prof_out = np.full((n_te, n_c), np.nan, dtype=np.float32)
 
         pre_val_mask = (tr_slots < earliest_val).to_numpy()
-        k_lgb = 6 if max_seconds >= 90.0 else 4
-        top_cols = _select_top_targets(panel, lag1, cols, tr_pidx, y_num, pre_val_mask, k_top=k_lgb) if (use_lgb_top and max_seconds >= 60.0) else []
+        k_lgb = 6 if max_seconds >= 75.0 else 4
+        top_cols = (_select_top_targets(panel, lag1, cols, tr_pidx, y_num, pre_val_mask, k_top=k_lgb)
+                    if (use_lgb_top and max_seconds >= 60.0) else [])
         top_idx = [cols.index(c) for c in top_cols]
         tr_pred_g = np.full((n_tr, len(top_cols)), np.nan, dtype=np.float32) if top_cols else None
         te_pred_g = np.full((n_te, len(top_cols)), np.nan, dtype=np.float32) if top_cols else None
         lgb_state = {"enabled": bool(top_cols and (time.time() - t0 < max_seconds * 0.85)), "all_ok": True}
-
-        panel_burn = h_series.min() + (pd.Timedelta(hours=168) if is_hourly else 7 * cadence)
 
         def _fit_and_predict_block(cutoff_ts, target_rows, target_pidx, out_r, out_prof, out_g, is_test=False):
             p_tr_mask = (h_series < cutoff_ts).to_numpy() & (h_series >= panel_burn).to_numpy()
@@ -294,12 +369,9 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
             prof_all = _seasonal_profile(panel, groups, slot_col, cols, p_tr_mask, is_hourly)
             out_prof[ok_rows] = prof_all[ev_pidx]
 
-            # 2) Быстрый многовыходный Cholesky Ridge по остаткам (Y - profile) на недавних прошлых слотах
+            # 2) Многовыходный Cholesky Ridge по остаткам (Y - profile) на недавних хронологических слотах ВСЕХ групп
             tr_pos_all = np.flatnonzero(p_tr_mask)
-            if len(tr_pos_all) > 150_000:
-                tr_pos_r = tr_pos_all[-150_000:]
-            else:
-                tr_pos_r = tr_pos_all
+            tr_pos_r = _recent_chrono_pos(tr_pos_all, h_ns, 150_000)
             Z_tr = Z_vals[tr_pos_r]
             Y_tr = Y_vals[tr_pos_r] - prof_all[tr_pos_r]
             col_fill = np.nanmean(Z_tr, axis=0)
@@ -313,7 +385,6 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
             y_bias = Y_f.mean(axis=0, dtype=np.float64).astype(np.float32)
             Yc = Y_f - y_bias
 
-            # Решаем нормальные уравнения (Zs^T Zs + alpha I) W = Zs^T Yc
             try:
                 from threadpoolctl import threadpool_limits
                 _lim_ctx = threadpool_limits(limits=min(4, max(1, n_jobs)))
@@ -325,16 +396,18 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                 G[np.diag_indices_from(G)] += 300.0
                 R = (Zs.T @ Yc).astype(np.float64)
                 try:
-                    W = np.linalg.solve(G, R).astype(np.float32)
+                    W = np.linalg.solve(G, R)
                 except np.linalg.LinAlgError:
-                    W = np.linalg.lstsq(G, R, rcond=None)[0].astype(np.float32)
+                    W = np.linalg.lstsq(G, R, rcond=None)[0]
 
+                # float64 prediction matmul guarantees bit-exact float32 invariance across test batch sizes
                 Z_ev = Z_vals[ev_pidx]
                 Z_ev_f = np.where(np.isfinite(Z_ev), Z_ev, col_fill[None, :])
-                pred_res = (((Z_ev_f - mu) / sd) @ W + y_bias).astype(np.float32)
+                Z_ev_s = ((Z_ev_f - mu) / sd).astype(np.float64)
+                pred_res = (Z_ev_s @ W + y_bias.astype(np.float64)).astype(np.float32)
             out_r[ok_rows] = prof_all[ev_pidx] + pred_res
 
-            # 3) Нелинейный LightGBM nowcaster для топ-K ключевых сенсорных колонок
+            # 3) Нелинейный LightGBM nowcaster для топ-K ключевых сенсорных колонок по недавним слотам ВСЕХ групп
             if lgb_state["enabled"] and out_g is not None:
                 if not is_test and (time.time() - t0 > max_seconds * 0.95):
                     lgb_state["enabled"] = False
@@ -342,15 +415,14 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                     return
                 import lightgbm as lgb
 
-                tr_pos = np.flatnonzero(p_tr_mask)
-                if len(tr_pos) > 50_000:
-                    tr_pos = tr_pos[-50_000:]
+                tr_pos = _recent_chrono_pos(tr_pos_all, h_ns, 40_000)
                 Z_g_tr = Z_vals[tr_pos]
                 Z_g_ev = Z_vals[ev_pidx]
                 params_g = {
                     "objective": "regression",
                     "learning_rate": 0.1,
                     "num_leaves": 31,
+                    "max_bin": 63,
                     "min_child_samples": 60,
                     "feature_fraction": 0.65,
                     "bagging_fraction": 0.8,
@@ -366,7 +438,7 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                     if ok_y.sum() < 500:
                         continue
                     ds = lgb.Dataset(Z_g_tr[ok_y], yj[ok_y], free_raw_data=True)
-                    m_g = lgb.train(params_g, ds, num_boost_round=60)
+                    m_g = lgb.train(params_g, ds, num_boost_round=55)
                     out_g[ok_rows, j] = prof_all[ev_pidx, ci] + m_g.predict(Z_g_ev).astype(np.float32)
 
         for bi, start_ts in enumerate(cuts):

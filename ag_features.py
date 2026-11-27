@@ -609,31 +609,76 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
     for name, (sa, sb) in raw_text.items():
         sa_s = sa.astype(str)
         sb_s = sb.astype(str)
+        if periods is not None:
+            # Strictly causal temporal TF-IDF: fit fresh word/char vectorizers INSIDE each fold on periods < p
+            # (zero future-period AND zero test vocabulary/IDF leakage), and on train-only for test.
+            per = np.asarray(periods, dtype=float)
+            if len(per) != len(y):
+                raise ValueError("Text periods must align with target rows")
+            total_chars = float(sa_s.str.len().sum())
+            big = len(sa_s) > 150_000 or total_chars > 1.5e8
+            if task_type == "regression":
+                mk = lambda: Ridge(alpha=3.0)  # noqa: E731
+                k_out = 1
+            else:
+                mk = lambda: LogisticRegression(C=4.0, max_iter=300 if len(sa_s) < 150_000 else 100, n_jobs=n_jobs)  # noqa: E731
+                k_out = 1 if n_classes == 2 else n_classes
+            folds = [(np.flatnonzero(per < value), np.flatnonzero(per == value))
+                     for value in np.sort(np.unique(per[np.isfinite(per)]))]
+
+            def _fit_transform_pair(tr_texts, ev_texts):
+                w = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
+                                    max_features=200_000 if not big else 100_000, sublinear_tf=True, dtype=np.float32)
+                tr_m = [w.fit_transform(tr_texts)]
+                ev_m = [w.transform(ev_texts)]
+                if not big:
+                    ch = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
+                                         sublinear_tf=True, dtype=np.float32)
+                    tr_m.append(ch.fit_transform(tr_texts))
+                    ev_m.append(ch.transform(ev_texts))
+                return sparse.hstack(tr_m).tocsr(), sparse.hstack(ev_m).tocsr()
+
+            def _pred_causal(tr_idx, ev_texts):
+                n_ev = len(ev_texts)
+                if not len(tr_idx):
+                    return np.full((n_ev, k_out), 0.0 if task_type == "regression" else 1 / n_classes)
+                if task_type != "regression" and len(np.unique(y[tr_idx])) < 2:
+                    p = np.zeros((n_ev, n_classes))
+                    p[:, int(y[tr_idx][0])] = 1.0
+                    return p[:, 1:] if n_classes == 2 else p
+                try:
+                    Atr, Aev = _fit_transform_pair(sa_s.iloc[tr_idx], ev_texts)
+                except ValueError:
+                    return np.full((n_ev, k_out), 0.0 if task_type == "regression" else 1 / n_classes)
+                m = mk().fit(Atr, y[tr_idx])
+                if task_type == "regression":
+                    return m.predict(Aev).reshape(-1, 1)
+                p = np.zeros((n_ev, n_classes))
+                p[:, m.classes_.astype(int)] = m.predict_proba(Aev)
+                return p[:, 1:] if n_classes == 2 else p
+
+            oof = np.full((len(sa_s), k_out), 0.0 if task_type == "regression" else 1 / n_classes)
+            for tr, va in folds:
+                oof[va] = _pred_causal(tr, sa_s.iloc[va])
+            tp = _pred_causal(np.arange(len(y)), sb_s)
+            for j in range(k_out):
+                out_a[f"{name}__tfidf{j}"] = oof[:, j].astype("float32")
+                out_b[f"{name}__tfidf{j}"] = tp[:, j].astype("float32")
+            continue
+
         both = pd.concat([sa_s, sb_s], ignore_index=True)
         total_chars = float(both.str.len().sum())
         big = len(both) > 150_000 or total_chars > 1.5e8
         word = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
                                max_features=200_000 if not big else 100_000, sublinear_tf=True, dtype=np.float32)
-        if periods is not None:
-            # On temporal splits fit TF-IDF vocabulary/IDF strictly on train (zero test leakage)
-            a_mats = [word.fit_transform(sa_s)]
-            b_mats = [word.transform(sb_s)]
-            if not big:
-                char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
-                                       sublinear_tf=True, dtype=np.float32)
-                a_mats.append(char.fit_transform(sa_s))
-                b_mats.append(char.transform(sb_s))
-            A = sparse.hstack(a_mats).tocsr()
-            B = sparse.hstack(b_mats).tocsr()
-        else:
-            mats = [word.fit_transform(both)]
-            if not big:
-                # символьные n-граммы ловят опечатки и морфологию, но дороги на больших корпусах
-                char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
-                                       sublinear_tf=True, dtype=np.float32)
-                mats.append(char.fit_transform(both))
-            M = sparse.hstack(mats).tocsr()
-            A, B = M[: len(sa)], M[len(sa):]
+        mats = [word.fit_transform(both)]
+        if not big:
+            # символьные n-граммы ловят опечатки и морфологию, но дороги на больших корпусах
+            char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
+                                   sublinear_tf=True, dtype=np.float32)
+            mats.append(char.fit_transform(both))
+        M = sparse.hstack(mats).tocsr()
+        A, B = M[: len(sa)], M[len(sa):]
         if task_type == "regression":
             mk = lambda: Ridge(alpha=3.0)  # noqa: E731
             folds = KFold(5, shuffle=True, random_state=seed).split(A)
@@ -642,12 +687,6 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
             mk = lambda: LogisticRegression(C=4.0, max_iter=300 if len(sa) < 150_000 else 100, n_jobs=n_jobs)  # noqa: E731
             folds = StratifiedKFold(5, shuffle=True, random_state=seed).split(A, y)
             k_out = 1 if n_classes == 2 else n_classes
-        if periods is not None:
-            per = np.asarray(periods, dtype=float)
-            if len(per) != len(y):
-                raise ValueError("Text periods must align with target rows")
-            folds = [(np.flatnonzero(per < value), np.flatnonzero(per == value))
-                     for value in np.sort(np.unique(per[np.isfinite(per)]))]
 
         def predict_from(tr, target):
             if not len(tr):
@@ -954,12 +993,12 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
     span_pad = int(ts_rel_v.max()) + 2 * 86400 * 7 + 10_000 if len(ts_rel_v) else 1_000_000
     hr_rel_v = np.round((ts_v.dt.floor("h").values.astype("int64") - ts_ns[0]) / 1e9).astype(np.int64)
     for _, _, gc in grp_cands[:3]:
+        if int(train[gc].notna().sum()) < 50:
+            continue
         g_vals = comb[gc].iloc[v_idx].astype("string")
         codes_v, _ = pd.factorize(g_vals, sort=False)
         codes_v = codes_v.astype(np.int64)
         ok_g = codes_v >= 0
-        if int(ok_g.sum()) < 50:
-            continue
         g_idx = np.flatnonzero(ok_g)
         keys = (codes_v[g_idx] + 1) * span_pad + ts_rel_v[g_idx]
         g_ord = np.argsort(keys, kind="mergesort")

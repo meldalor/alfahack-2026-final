@@ -101,7 +101,9 @@ class SubmissionWriter:
             elif spec.output_kind == "proba_multi":
                 values = {}
                 for i, c in enumerate(spec.classes):
-                    cs = str(c).strip().lower()
+                    cs = (str(int(round(float(c))))
+                          if isinstance(c, (float, np.floating)) and np.isfinite(c) and float(c).is_integer()
+                          else str(c).strip().lower())
                     for col in self.cols:
                         if col == self.id_name or col in values:
                             continue
@@ -442,6 +444,8 @@ def model_family(name: str) -> str:
         return "lgb"
     if name == "lgb_huber" or re.fullmatch(r"lgb_huber_s\d+", name):
         return "lgb_huber"
+    if name == "lgb_l1" or re.fullmatch(r"lgb_l1_s\d+", name):
+        return "lgb_l1"
     if name.startswith("lgb_offset"):
         return "lgb_offset"
     m = re.fullmatch(r"(lgb_xoffset\d+)_s\d+", name)
@@ -688,16 +692,21 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             log(f"lgb_fast: {spec.metric}={r.score:.5f} за {r.seconds:.0f}s")
             results.append(r)
             publish("lgb_fast")
-    # 4.1в смесь функций потерь для MAE-задач: Huber-LightGBM с ранней остановкой по L1
+    # 4.1в смесь функций потерь для MAE-задач: Huber-LightGBM и L1-LightGBM (всегда обе потери для разнообразия)
     is_mae_task = spec.task_type == "regression" and spec.metric in ("mae", "medae", "smape")
-    if is_mae_task and cfg.objective_variant != "huber" and left() > eval_t * 3 + 60:
-        cfg_hub = ModelConfig(**{**cfg.to_dict(), "objective_variant": "huber"})
-        r = safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg_hub, N_JOBS, max(60.0, left() * 0.3), lr=lr_main,
-                     es=200, seed=13, name="lgb_huber")
+    if is_mae_task and left() > eval_t * 3 + 60:
+        if cfg.objective_variant != "huber":
+            cfg_alt = ModelConfig(**{**cfg.to_dict(), "objective_variant": "huber"})
+            alt_name = "lgb_huber"
+        else:
+            cfg_alt = ModelConfig(**{**cfg.to_dict(), "objective_variant": None})
+            alt_name = "lgb_l1"
+        r = safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg_alt, N_JOBS, max(60.0, left() * 0.3), lr=lr_main,
+                     es=200, seed=13, name=alt_name)
         if r is not None and r.test is not None:
-            log(f"lgb_huber: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
+            log(f"{alt_name}: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
             results.append(r)
-            publish("lgb_huber")
+            publish(alt_name)
 
     top_cols = None
     imp_src = next((r.importance for r in results if r is not None and r.importance is not None), None)
@@ -743,12 +752,20 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         fit_extra("cat", fit_cat, cat_kw)
         if is_mae_task:
             fit_extra("cat_rmse", fit_cat, {**cat_kw, "loss_override": "RMSE", "seed": 2})
-    fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7})
     if is_mae_task:
         fit_extra("xgb_ph", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6, "objective_override": "pseudohuber", "seed": 11})
+    fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7})
     fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=30.0)
     fit_extra("et", fit_et, {})
     fit_extra("mlp", fit_mlp, {"top_cols": top_cols}, min_need=30.0, use_clean=True)
+    # Усредняем до 4 дополнительных сидов быстрого MLP для снижения дисперсии нейросети в ансамбле
+    mlp_r = next((r for r in results if r is not None and r.name == "mlp" and r.test is not None), None)
+    if mlp_r is not None and mlp_r.seconds <= 75.0 and left() > 240.0:
+        n_extra_mlp = 4 if (mlp_r.seconds <= 45.0 and left() > 360.0) else 2
+        for ms in range(1, n_extra_mlp + 1):
+            if left() <= 180.0:
+                break
+            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "seed": ms}, min_need=40.0, use_clean=True)
 
     # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
     hist_cols = [c for c in X.columns if c.startswith("hist__last")] if spec.task_type == "regression" else []
@@ -806,10 +823,22 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          name=f"et_s{k}")]
 
     def cat_seed(k):
-        depths = (6, 6, 7, 6, 5)
+        depths = (6, 7, 6, 7, 5)
         kw_k = {**cat_kw, "depth": depths[k % len(depths)]}
         return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_x, kw_k.pop("cat_cols"), N_JOBS,
                          max(60.0, left() * 0.45), seed=k, name=f"cat_s{k}", **kw_k)]
+
+    def cat_rmse_seed(k):
+        depths = (6, 7, 6, 5)
+        kw_k = {**cat_kw, "depth": depths[k % len(depths)], "loss_override": "RMSE"}
+        return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_x, kw_k.pop("cat_cols"), N_JOBS,
+                         max(60.0, left() * 0.45), seed=20 + k, name=f"cat_rmse_s{k}", **kw_k)]
+
+    def xgb_ph_seed(k):
+        depths = (6, 7, 5)
+        return [safe_fit(fit_xgb, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45),
+                         lr=0.04 if not big else 0.1, depth=depths[k % len(depths)],
+                         objective_override="pseudohuber", seed=30 + k, name=f"xgb_ph_s{k}")]
 
     def lgb_huber_seed(k):
         cfg2 = ModelConfig(**{**cfg.to_dict(), "objective_variant": "huber"})
@@ -821,15 +850,21 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          seed=100 + k, name=f"lgb_huber_s{k}")]
 
     seeders = [lgb_seed]
+    done = [r for r in results if r is not None and r.test is not None and np.isfinite(r.score)]
+    top = max(done, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score if done else None
+    xgb_ph_r = next((r for r in done if r.name == "xgb_ph"), None)
+    if xgb_ph_r is not None and top is not None and abs(xgb_ph_r.score - top) <= 0.05 * abs(top):
+        seeders.append(xgb_ph_seed)
     if any(r is not None and r.name == "xgb" for r in results):
         seeders.append(xgb_seed)
     if any(r is not None and r.name.startswith(("lgb_offset", "lgb_xoffset")) for r in results):
         seeders.append(offset_seed)
-    done = [r for r in results if r is not None and r.test is not None and np.isfinite(r.score)]
-    top = max(done, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score if done else None
     hub_r = next((r for r in done if r.name == "lgb_huber"), None)
     if hub_r is not None and top is not None and abs(hub_r.score - top) <= 0.05 * abs(top):
         seeders.insert(0, lgb_huber_seed)
+    cat_rmse_r = next((r for r in done if r.name == "cat_rmse"), None)
+    if cat_rmse_r is not None and not late_cat and top is not None and abs(cat_rmse_r.score - top) <= 0.05 * abs(top):
+        seeders.insert(0, cat_rmse_seed)
     cat_r = next((r for r in done if r.name == "cat"), None)
     if cat_r is not None and not late_cat and top is not None and abs(cat_r.score - top) <= 0.05 * abs(top):
         seeders.insert(0, cat_seed)  # CatBoost часто сильнейшее семейство на плотных временных таблицах

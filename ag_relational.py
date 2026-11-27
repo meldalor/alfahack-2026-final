@@ -228,9 +228,17 @@ def _interval_join(left, dim, name, targets):
     if len(starts) != 1 or len(ends) != 1:
         return None
     sc, ec = starts[0], ends[0]
-    groups = [c for c in dim.columns if c in left.columns and c not in targets
-              and (c.lower().endswith('_id') or c.lower() == 'id')
-              and not (c.lower() == 'event_id' and left[c].nunique() > 0.9 * len(left))]
+    groups = []
+    for c in dim.columns:
+        if c not in left.columns or c in targets or not (c.lower().endswith('_id') or c.lower() == 'id'):
+            continue
+        if c.lower() == 'event_id' and left[c].nunique() > 0.9 * len(left):
+            continue
+        ls = _norm_key_vals(left[c])
+        ds = _norm_key_vals(dim[c])
+        dvals = set(ds.dropna().unique())
+        if dvals and float(ls.isin(dvals).mean()) > 0.0:
+            groups.append(c)
     if not groups or len(dim) > 50_000:
         return None
     lt = pd.to_datetime(left[ltc], errors='coerce', utc=True)
@@ -268,6 +276,11 @@ def _aggregate_child(left, dim, name, targets):
     """Generic one-to-many child table aggregation (causal prefix-sum if timed, static groupby otherwise)."""
     if len(dim) == 0 or len(dim) > 2_000_000:
         return None
+    # Never aggregate interval tables (start_*, end_*) via static groupby (prevents future/post-factum leakage).
+    _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+    _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+    if _st_c and _en_c:
+        return None
     l_id_cols = [c for c in left.columns if c in dim.columns and c not in targets
                  and (c.lower().endswith('_id') or c.lower() == 'id')
                  and not (c.lower() == 'event_id' and left[c].nunique() > 0.9 * len(left))]
@@ -291,9 +304,11 @@ def _aggregate_child(left, dim, name, targets):
     l_times = [c for c in left.columns if _is_time_col(c, left[c])]
     num_cols = [c for c in dim_al.columns if c != best_key and c not in targets and c not in d_times
                 and not c.lower().endswith('_id') and c.lower() != 'id'
+                and not POST_FACTUM_RE.search(str(c))
                 and pd.api.types.is_numeric_dtype(dim_al[c])][:8]
     cat_cols = [c for c in dim_al.columns if c != best_key and c not in targets and c not in d_times
                 and c not in num_cols and not c.lower().endswith('_id') and c.lower() != 'id'
+                and not POST_FACTUM_RE.search(str(c))
                 and 2 <= dim_al[c].nunique(dropna=True) <= 200][:4]
     if d_times:
         if len(d_times) != 1 or len(l_times) != 1:
@@ -365,10 +380,62 @@ def _aggregate_child(left, dim, name, targets):
     return merged[feat_cols].reset_index(drop=True), best_key, 'static'
 
 
+def _table_stems(name: str) -> list:
+    """Generic plural-to-singular stem candidates for matching table PK `id` to `<stem>_id`."""
+    low = name.lower().strip()
+    stems = [low]
+    if low.endswith('ies') and len(low) > 4:
+        stems.append(low[:-3] + 'y')
+    if low.endswith(('ses', 'xes', 'zes', 'ches', 'shes')) and len(low) > 4:
+        stems.append(low[:-2])
+    if low.endswith('s') and len(low) > 2:
+        stems.append(low[:-1])
+    return list(dict.fromkeys(stems))
+
+
+def _norm_key_vals(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_integer_dtype(s):
+        return s.astype('Int64').astype('string')
+    if pd.api.types.is_float_dtype(s):
+        ok = s.dropna()
+        if len(ok) and np.all(np.isfinite(ok)) and np.all(ok == np.floor(ok)):
+            return s.round().astype('Int64').astype('string')
+    return s.astype('string').str.strip()
+
+
+def _match_pk_to_fk(combined: pd.DataFrame, dim: pd.DataFrame, name: str, targets: set):
+    """When dim has unique primary key `id` and combined has `<stem>_id`, match `dim.id` -> `combined.<stem>_id`."""
+    id_col = next((c for c in dim.columns if c.lower() == 'id'), None)
+    if id_col is None:
+        return None, None
+    stems = _table_stems(name)
+    want = {f'{st}_id' for st in stems}
+    fk_cands = [c for c in combined.columns if c not in targets and c not in dim.columns and c.lower() in want]
+    if len(fk_cands) != 1:
+        return None, None
+    fk = fk_cands[0]
+    pk_s = _norm_key_vals(dim[id_col])
+    nonnull = pk_s.notna()
+    valid = nonnull & ~pk_s.duplicated(keep=False)
+    if valid.mean() < 0.95 or valid.sum() == 0:
+        return None, None
+    fk_s = _norm_key_vals(combined[fk]).dropna()
+    if len(fk_s) == 0:
+        return None, None
+    pk_set = set(pk_s.loc[valid].tolist())
+    overlap = float(fk_s.isin(pk_set).mean())
+    if overlap < 0.2:
+        return None, None
+    return dim.rename(columns={id_col: fk}), fk
+
+
 def enrich(train, test, tables, skip_names=(), report=None, meta=None):
-    targets = set(train) - set(test)
+    target_cols = [c for c in train.columns if c not in test.columns]
+    targets = set(target_cols)
     n = len(train)
-    combined = pd.concat([train, test], ignore_index=True)
+    # Keep targets completely outside combined concat so integer targets never upcast to float via test NaNs!
+    train_targets = train[target_cols].reset_index(drop=True).copy()
+    combined = pd.concat([train.drop(columns=target_cols), test], ignore_index=True)
     skip = {'train', 'test', 'sample_submission', 'data_dictionary'} | set(skip_names)
     remaining = {k: v for k, v in tables.items() if k not in skip}
     panels = []
@@ -384,14 +451,20 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
                 _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
                 _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
                 if len(_st_c) == 1 and len(_en_c) == 1:
-                    _stem = name.lower().rstrip('s')
+                    _stems = _table_stems(name)
                     _own_pk = [c for c in dim.columns if c in combined and c not in targets
-                               and c.lower() in (f'{_stem}_id', f'{name.lower()}_id')]
+                               and c.lower() in {f'{st}_id' for st in _stems}]
                     if not (_own_pk and dim[_own_pk[0]].notna().all() and not dim[_own_pk[0]].duplicated().any()):
                         continue
                 common = [c for c in dim if c in combined and c not in targets and
                           (c.lower().endswith('_id') or c.lower() == 'id' or c.lower() in TIME_NAMES or _is_time_col(c, dim[c]))]
-                keys, dim_clean, excluded = _keys(dim, common)
+                keys, dim_clean, excluded = None, None, 0
+                if not common or [c.lower() for c in common] == ['id']:
+                    dim_fk, fk_col = _match_pk_to_fk(combined, dim, name, targets)
+                    if dim_fk is not None:
+                        keys, dim_clean, excluded = _keys(dim_fk, [fk_col])
+                if not keys:
+                    keys, dim_clean, excluded = _keys(dim, common)
                 if not keys:
                     continue
                 if excluded:
@@ -485,4 +558,6 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
             if gcols_all:
                 meta['train_groups'] = combined[gcols_all].iloc[:n].reset_index(drop=True)
                 meta['test_groups'] = combined[gcols_all].iloc[n:].reset_index(drop=True)
-    return combined.iloc[:n].reset_index(drop=True), combined.iloc[n:].drop(columns=list(targets)).reset_index(drop=True)
+    tr_out = pd.concat([combined.iloc[:n].reset_index(drop=True), train_targets], axis=1)
+    te_out = combined.iloc[n:].reset_index(drop=True)
+    return tr_out, te_out

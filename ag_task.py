@@ -363,7 +363,11 @@ def build_spec(task_path: Path, train: pd.DataFrame, test: pd.DataFrame, sample,
     if spec.task_type == "regression":
         spec.output_kind = "value"
     else:
-        class_strs = {str(k).strip().lower() for k in spec.classes}
+        def _canon_cls(v) -> str:
+            if isinstance(v, (float, np.floating)) and np.isfinite(v) and float(v).is_integer():
+                return str(int(round(float(v))))
+            return str(v).strip().lower()
+        class_strs = {_canon_cls(k) for k in spec.classes}
         def _matches_class_col(col):
             s = str(col).strip().lower()
             if s in class_strs:

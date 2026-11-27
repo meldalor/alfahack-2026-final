@@ -566,4 +566,213 @@ class FinalTests(unittest.TestCase):
         for bad in ('city_events__actual_duration','city_events__final_cost','city_events__outcome_code'):
             self.assertNotIn(bad,a.columns)
 
+    def test_nowcast_chrono_slicing_all_groups_key_mismatch_and_bit_exact_stream(self):
+        from ag_features import detect_time_split, prepare
+        from ag_nowcast import _recent_chrono_pos, build_nowcast_features
+        # 1) Chronological slicing MUST preserve ALL groups even when panel is sorted by (group, time)
+        n_g, n_t = 10, 500
+        g_arr = np.repeat(np.arange(n_g), n_t)
+        h_ns = np.tile(np.arange(n_t, dtype=np.int64) * 3600_000_000_000, n_g)
+        picked = _recent_chrono_pos(np.arange(n_g * n_t), h_ns, limit=1000)
+        self.assertEqual(len(picked), 1000)
+        self.assertEqual(set(g_arr[picked].tolist()), set(range(n_g)))  # all 10 groups represented equally!
+        self.assertEqual(int(h_ns[picked].min()), 400 * 3600_000_000_000)  # strictly last 100 timestamps
+        # 2) Key dtype mismatch (int64 in train/test vs str in panel) + binary runlen + online-stream bit-exactness
+        rng = np.random.default_rng(41)
+        n_hr = 24 * 35  # 35 days x 6 groups = 5040 rows
+        stamps = pd.date_range('2025-01-01 00:00:00', periods=n_hr, freq='h')
+        rows = []
+        for d in range(6):
+            hr = stamps.hour.values
+            flag = ((hr >= 12) & (hr <= 15)).astype(int)
+            sig = 10.0 + 4.0 * flag + 2.0 * np.sin(2 * np.pi * hr / 24.0) + d + rng.normal(0, 0.2, n_hr)
+            rows.append(pd.DataFrame({'district_id': str(d), 'timestamp': stamps.astype(str), 'spd': sig, 'storm': flag}))
+        panel = pd.concat(rows, ignore_index=True)
+        ev_tr_ts = pd.date_range('2025-01-10 00:30:00', periods=600, freq='45min')
+        ev_te_ts = pd.date_range('2025-02-01 00:30:00', periods=60, freq='1h')
+        tr = pd.DataFrame({'event_id': range(600), 'district_id': [i % 6 for i in range(600)],
+                           'timestamp': ev_tr_ts.astype(str), 'y': rng.normal(20, 3, 600)})
+        te = pd.DataFrame({'event_id': range(600, 660), 'district_id': [i % 6 for i in range(60)],
+                           'timestamp': ev_te_ts.astype(str)})
+        meta1 = {}
+        a1, b1 = enrich(tr, te, {'weather': panel}, meta=meta1)
+        spec = TaskSpec('', '', id_col='event_id', target='y', task_type='regression', metric='mae')
+        prep = prepare(a1, b1, spec)
+        tcol = detect_time_split(prep.X, prep.Xt, prep.cat_cols)
+        plan = make_plan(prep.X, prep.y, 'regression', time_col=tcol)
+        nc_tr1, nc_te1 = build_nowcast_features(meta1, prep.y, plan, 'regression', n_jobs=2, use_lgb_top=False, max_seconds=30.0)
+        self.assertIsNotNone(nc_tr1)
+        self.assertEqual(int(nc_te1.isna().sum().sum()), 0)
+        # Drop future test rows (> 25): online-stream predictions for rows <= 25 MUST be bit-exact!
+        te_cut = te.iloc[:26].copy()
+        meta2 = {}
+        a2, b2 = enrich(tr, te_cut, {'weather': panel}, meta=meta2)
+        nc_tr2, nc_te2 = build_nowcast_features(meta2, prep.y, plan, 'regression', n_jobs=2, use_lgb_top=False, max_seconds=30.0)
+        np.testing.assert_array_equal(nc_te1.iloc[:26].to_numpy(), nc_te2.to_numpy())
+
+    def test_hgb_object_col_consistent_mapping(self):
+        from ag_models import ModelConfig, fit_hgb
+        rng = np.random.default_rng(53)
+        n = 300
+        # Pure object column (not pd.Categorical) with strong signal, reversed order in test
+        lbl_tr = rng.choice(['alpha', 'beta', 'gamma'], size=n)
+        lbl_te = np.array(['gamma', 'beta', 'alpha'] * 10, dtype=object)
+        val_map = {'alpha': 10.0, 'beta': 50.0, 'gamma': 90.0}
+        X = pd.DataFrame({'x': rng.normal(size=n), 'obj': pd.Series(lbl_tr, dtype=object)})
+        Xt = pd.DataFrame({'x': np.zeros(30), 'obj': pd.Series(lbl_te, dtype=object)})
+        y = np.array([val_map[v] for v in lbl_tr]) + rng.normal(0, 0.5, n)
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        plan = make_plan(X, y, 'regression', n_folds=3)
+        r = fit_hgb(X, y, Xt, plan, spec, ModelConfig(), n_jobs=2, time_limit=30, max_iter=80, name='hgb_obj')
+        self.assertIsNotNone(r)
+        # Predictions on test MUST follow gamma > beta > alpha!
+        self.assertGreater(float(r.test[0]), 80.0)
+        self.assertLess(float(r.test[2]), 20.0)
+
+    def test_multiclass_int_target_preserved_and_float_class_cols_matched(self):
+        from ag_task import build_spec
+        from solution import SubmissionWriter
+        tr = pd.DataFrame({'row_id': range(24), 'x': np.linspace(0, 1, 24), 'target': [i % 12 for i in range(24)]})
+        te = pd.DataFrame({'row_id': range(24, 30), 'x': np.linspace(0, 1, 6)})
+        a, b = enrich(tr, te, {})
+        # enrich MUST keep integer target intact (not float64 from concat NaNs)
+        self.assertTrue(pd.api.types.is_integer_dtype(a['target']))
+        sample = pd.DataFrame({'row_id': list(range(24, 30)), **{f'class_{i}': 0.0 for i in range(12)}})
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / 'task.md'
+            tp.write_text('ID: row_id. Target: target. Multiclass classification. Metric: LogLoss.\n', encoding='utf-8')
+            spec = build_spec(tp, a, b, sample, None, {})
+            self.assertEqual(spec.output_kind, 'proba_multi')
+            self.assertEqual(len(spec.classes), 12)
+            # Also verify integer-like float targets (e.g. from CSV with NaNs) still match class_0..class_11
+            a_flt = a.copy(); a_flt['target'] = a_flt['target'].astype(float)
+            spec2 = build_spec(tp, a_flt, b, sample, None, {})
+            self.assertEqual(spec2.output_kind, 'proba_multi')
+            out_csv = Path(d) / 'submission.csv'
+            w = SubmissionWriter(out_csv, spec2, b, sample)
+            w.write(np.full((6, 12), 1.0 / 12.0))
+            sub = pd.read_csv(out_csv)
+            self.assertEqual(list(sub.columns), list(sample.columns))
+            self.assertEqual(len(sub), 6)
+
+    def test_mismatched_pk_fk_join_clients_id(self):
+        # Case 1: train has row_id + client_id, clients has id
+        tr = pd.DataFrame({'row_id': [10, 11, 12], 'client_id': [1, 2, 1], 'y': [0, 1, 0]})
+        te = pd.DataFrame({'row_id': [13, 14], 'client_id': [2, 3]})
+        clients = pd.DataFrame({'id': [1, 2, 3], 'risk_band': [0.1, 0.9, 0.5]})
+        a, b = enrich(tr, te, {'clients': clients})
+        self.assertIn('clients__risk_band', a.columns)
+        self.assertEqual(a['clients__risk_band'].tolist(), [0.1, 0.9, 0.1])
+        self.assertEqual(b['clients__risk_band'].tolist(), [0.9, 0.5])
+        # Case 2: train ALSO has its own `id` column (must NOT wrongly join train.id == clients.id!)
+        tr2 = pd.DataFrame({'id': [1, 2, 3], 'client_id': [3, 1, 2], 'y': [0, 1, 0]})
+        te2 = pd.DataFrame({'id': [4, 5], 'client_id': [2, 1]})
+        a2, b2 = enrich(tr2, te2, {'clients': clients})
+        self.assertEqual(a2['clients__risk_band'].tolist(), [0.5, 0.1, 0.9])
+        self.assertEqual(b2['clients__risk_band'].tolist(), [0.9, 0.1])
+
+    def test_temporal_tfidf_zero_future_vocab_leakage(self):
+        from ag_features import op_text_oof
+        rng = np.random.default_rng(77)
+        n = 160
+        periods = np.repeat(np.arange(4), 40)
+        y = rng.integers(0, 2, n)
+        sa = pd.Series([f'{"fraud alert charge" if yi else "normal address update"} doc_{i}' for i, yi in enumerate(y)])
+        sb = pd.Series(['fraud alert charge test'] * 20)
+        oa1, _ = op_text_oof({'txt': (sa, sb)}, y, 'binary', 2, periods=periods)
+        # Mutate BOTH future train text (periods >= 2) AND all test text: period 1 OOF MUST be bit-identical!
+        sa_p = sa.mask(periods >= 2, 'completely_different_future_vocabulary_xyz ' * 8)
+        sb_p = pd.Series(['brand_new_test_tokens_abc ' * 8] * 20)
+        oa2, _ = op_text_oof({'txt': (sa_p, sb_p)}, y, 'binary', 2, periods=periods)
+        delta = float(np.max(np.abs(oa1.loc[periods == 1].to_numpy() - oa2.loc[periods == 1].to_numpy())))
+        self.assertLess(delta, 1e-7)
+
+
+class Pool5HarnessTests(unittest.TestCase):
+    def test_synthetic_generators_deterministic_and_disjoint(self):
+        from tools.stress_private import generate, CASES
+        for name in CASES:
+            with self.subTest(name=name):
+                a, b, aux, sample, y = generate(name, 600, 42)
+                aa, bb, aux2, sample2, y2 = generate(name, 600, 42)
+                self.assertEqual(len(a) + len(b), 600)
+                self.assertTrue(set(a.row_id).isdisjoint(b.row_id))
+                self.assertNotIn('target', b)
+                pd.testing.assert_frame_equal(a, aa)
+                pd.testing.assert_frame_equal(sample, sample2)
+                np.testing.assert_array_equal(y, y2)
+                if name == 'multiclass':
+                    self.assertEqual(a.target.nunique(), 12)
+                    self.assertEqual(len(sample.columns), 13)
+                if name == 'regression':
+                    self.assertTrue((y == 0).any())
+
+    def test_stress_contract_rejects_bad_order_and_probabilities(self):
+        from tools.stress_private import generate, validate
+        a, b, aux, sample, y = generate('multiclass', 600)
+        good = sample.copy(); good.iloc[:, 1:] = 1 / 12
+        scores, constant = validate(good, sample, b, y, 'multiclass')
+        self.assertTrue(constant); self.assertAlmostEqual(scores['LogLoss'], np.log(12))
+        with self.assertRaises(ValueError): validate(good.iloc[::-1], sample, b, y, 'multiclass')
+        bad = good.copy(); bad.iloc[0, 1] = 2
+        with self.assertRaises(ValueError): validate(bad, sample, b, y, 'multiclass')
+        bad = good.copy(); bad.iloc[0, 1] = 0
+        with self.assertRaises(ValueError): validate(bad, sample, b, y, 'multiclass')
+
+    def test_release_whitelist_rejects_unapproved_versions(self):
+        from tools.release_check import check_requirements
+        reg = 'Approved packages:\nnumpy==1.26.4\npandas==2.2.3\n'
+        self.assertEqual(check_requirements('numpy==1.26.4\n', reg)['used'], 1)
+        for wrong in ['numpy==2.0.0', 'torch==1.0', 'numpy>=1.0', 'numpy==1.26.4\nnumpy==1.26.4']:
+            with self.subTest(wrong=wrong), self.assertRaises(ValueError):
+                check_requirements(wrong, reg)
+
+    def test_dual_poison_audit_with_synthetic_public_fixture(self):
+        from tools.release_check import poison_audit
+        from unittest.mock import patch
+        from ag_features import causal_stream_features
+        cutoff = pd.Timestamp('2025-08-01 06:50:00')
+        times = pd.date_range(cutoff - pd.Timedelta(minutes=6500), periods=750, freq='10min')
+        rng = np.random.default_rng(4)
+        df = pd.DataFrame({'event_id': np.arange(750) + 10512, 'timestamp': times,
+                           'district_id': 'D06', 'flag': rng.integers(0, 2, 750),
+                           'kind': rng.choice(['A', 'B'], 750)})
+        tr = df.iloc[:600].copy(); tr['target'] = rng.normal(size=600)
+        te = df.iloc[600:].reset_index(drop=True)
+        sensor_times = pd.date_range(times.min().floor('h') - pd.Timedelta(hours=12), times.max().ceil('h') + pd.Timedelta(hours=2), freq='h')
+        tables = {'train': tr, 'test': te}
+        for name in ('weather', 'traffic', 'air_quality', 'power_grid', 'public_transport'):
+            tables[name] = pd.DataFrame({'timestamp': sensor_times, 'district_id': 'D06', 'v': rng.normal(size=len(sensor_times))})
+        report = poison_audit(tables)
+        self.assertEqual(set(report), {'sensors', 'events', 'combined'})
+        self.assertTrue(all(v['compared'] > 0 and not v['changed'] for v in report.values()))
+        def leaky(a, b, exclude=()):
+            x, z = causal_stream_features(a, b, exclude=exclude)
+            x['deliberate_leak'] = a.flag.to_numpy(); z['deliberate_leak'] = b.flag.to_numpy()
+            return x, z
+        with patch('ag_features.causal_stream_features', side_effect=leaky):
+            report = poison_audit(tables)
+        self.assertIn('deliberate_leak', report['events']['changed'])
+        self.assertIn('deliberate_leak', report['combined']['changed'])
+
+    def test_release_zip_rejects_bad_content(self):
+        import zipfile
+        from tools.release_check import audit_zip
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); (root / 'solution.py').write_text('print(1)\n'); (root / 'requirements.txt').write_text('numpy==1.26.4\n')
+            archive = root / 'test.zip'
+            def pack(extra=None):
+                with zipfile.ZipFile(archive, 'w') as z:
+                    for n in ('solution.py', 'requirements.txt'): z.write(root / n, n)
+                    if extra: z.writestr(extra, 'extra')
+            pack(); self.assertEqual(audit_zip(archive, root)['files'], 2)
+            pack('nested/a.py')
+            with self.assertRaises(ValueError): audit_zip(archive, root)
+            (root / 'solution.py').write_bytes(b'print(1)\r\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive, root)
+            (root / 'solution.py').write_text('import sys\nsys.path.append("/x")\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive, root)
+            (root / 'solution.py').write_text('token="sk-' + 'x' * 20 + '"\n'); pack()
+            with self.assertRaises(ValueError): audit_zip(archive, root)
+
 if __name__=='__main__': unittest.main()

@@ -733,9 +733,11 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         elif pd.api.types.is_numeric_dtype(X_in[c]):
             cat_mask.append(False)
         else:
-            X_in[c] = pd.factorize(X_in[c])[0].astype("float32")
+            codes, uniques = pd.factorize(X_in[c].astype("string"), sort=False)
+            X_in[c] = codes.astype("float32")
             if Xt_in is not None:
-                Xt_in[c] = pd.factorize(Xt_in[c])[0].astype("float32")
+                umap = {v: i for i, v in enumerate(uniques)}
+                Xt_in[c] = Xt_in[c].astype("string").map(umap).fillna(-1.0).astype("float32")
             cat_mask.append(False)
     n = len(X_in)
     if n > 100_000:
@@ -765,41 +767,48 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     shape = (n, n_classes) if spec.task_type != "regression" else (n,)
     oof = np.full(shape, np.nan)
     test, iters = [], []
-    for k, (tr, va) in enumerate(plan.folds):
-        if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
-            return None
-        m = make(max_iter)
-        m.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
-        best_it, best_sc, best_p = m.n_iter_, None, None
-        step = max(5, m.n_iter_ // 25)
-        staged = m.staged_predict(X_in.iloc[va]) if spec.task_type == "regression" else m.staged_predict_proba(X_in.iloc[va])
-        for idx_it, sp in enumerate(staged, 1):
-            if idx_it % step != 0 and idx_it != m.n_iter_:
-                continue
-            if spec.task_type == "regression":
-                cand = inverse_target(sp, cfg.target_transform)
-            else:
-                cand = np.zeros((len(va), n_classes))
-                cand[:, m.classes_.astype(int)] = sp
-            sc = score(spec.metric, spec.task_type, y[va], cand)
-            if best_sc is None or better(sc, best_sc, spec.metric):
-                best_sc, best_it, best_p = sc, idx_it, cand
-        iters.append(best_it)
-        oof[va] = best_p if best_p is not None else pred(m, X_in.iloc[va])
-        if plan.mode == "cv" and Xt_in is not None:
-            if best_it >= m.n_iter_:
-                test.append(pred(m, Xt_in))
-            else:
-                m_cv = make(best_it)
-                m_cv.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
-                test.append(pred(m_cv, Xt_in))
-        if k == 0 and _too_slow(t0, plan, time_limit, name):
-            return None
-    if plan.mode == "refit" and Xt_in is not None:
-        n_round = refit_rounds(iters, plan, len(X))
-        m = make(min(max_iter, n_round))
-        m.fit(X_in, yt, sample_weight=w)
-        test = pred(m, Xt_in)
+    try:
+        from threadpoolctl import threadpool_limits
+        _omp_ctx = lambda: threadpool_limits(limits=max(1, min(8, n_jobs)))  # noqa: E731
+    except Exception:
+        from contextlib import nullcontext
+        _omp_ctx = nullcontext
+    with _omp_ctx():
+        for k, (tr, va) in enumerate(plan.folds):
+            if spec.task_type != "regression" and len(np.unique(yt[tr])) < 2:
+                return None
+            m = make(max_iter)
+            m.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
+            best_it, best_sc, best_p = m.n_iter_, None, None
+            step = max(5, m.n_iter_ // 25)
+            staged = m.staged_predict(X_in.iloc[va]) if spec.task_type == "regression" else m.staged_predict_proba(X_in.iloc[va])
+            for idx_it, sp in enumerate(staged, 1):
+                if idx_it % step != 0 and idx_it != m.n_iter_:
+                    continue
+                if spec.task_type == "regression":
+                    cand = inverse_target(sp, cfg.target_transform)
+                else:
+                    cand = np.zeros((len(va), n_classes))
+                    cand[:, m.classes_.astype(int)] = sp
+                sc = score(spec.metric, spec.task_type, y[va], cand)
+                if best_sc is None or better(sc, best_sc, spec.metric):
+                    best_sc, best_it, best_p = sc, idx_it, cand
+            iters.append(best_it)
+            oof[va] = best_p if best_p is not None else pred(m, X_in.iloc[va])
+            if plan.mode == "cv" and Xt_in is not None:
+                if best_it >= m.n_iter_:
+                    test.append(pred(m, Xt_in))
+                else:
+                    m_cv = make(best_it)
+                    m_cv.fit(X_in.iloc[tr], yt[tr], sample_weight=w[tr])
+                    test.append(pred(m_cv, Xt_in))
+            if k == 0 and _too_slow(t0, plan, time_limit, name):
+                return None
+        if plan.mode == "refit" and Xt_in is not None:
+            n_round = refit_rounds(iters, plan, len(X))
+            m = make(min(max_iter, n_round))
+            m.fit(X_in, yt, sample_weight=w)
+            test = pred(m, Xt_in)
     return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg)
 
 
@@ -850,7 +859,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         if num_cols:
             tf.append(("num", make_pipeline(
                 SimpleImputer(strategy="median", add_indicator=True),
-                QuantileTransformer(n_quantiles=min(500, max(50, n_fit // 10)),
+                QuantileTransformer(n_quantiles=max(10, min(500, n_fit // 2 if n_fit < 500 else max(50, n_fit // 10))),
                                     output_distribution="normal", random_state=seed),
             ), num_cols))
         if cat_cols:

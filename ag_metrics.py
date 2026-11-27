@@ -121,18 +121,32 @@ def label_score(metric: str, y, labels, n_classes: int, sample_weight=None) -> f
 
 
 def proba_score(metric: str, y, proba: np.ndarray) -> float:
+    y = np.asarray(y, dtype=int)
     n_classes = proba.shape[1]
     if metric == "roc_auc":
         if n_classes == 2:
+            if len(np.unique(y)) < 2:
+                return float("nan")
             return float(skm.roc_auc_score(y, proba[:, 1]))
-        p = np.clip(proba, 1e-12, None)
+        present = np.unique(y)
+        if len(present) < 2:
+            return float("nan")
+        p = np.clip(proba[:, present], 1e-12, None)
         p = p / p.sum(1, keepdims=True)
-        return float(skm.roc_auc_score(y, p, multi_class="ovr", labels=np.arange(n_classes)))
+        if len(present) == 2:
+            return float(skm.roc_auc_score((y == present[1]).astype(int), p[:, 1]))
+        ym = np.searchsorted(present, y)
+        return float(skm.roc_auc_score(ym, p, multi_class="ovr", labels=np.arange(len(present))))
     if metric == "average_precision":
         if n_classes == 2:
+            if len(np.unique(y)) < 2:
+                return float("nan")
             return float(skm.average_precision_score(y, proba[:, 1]))
-        onehot = np.eye(n_classes)[y]
-        return float(skm.average_precision_score(onehot, proba, average="macro"))
+        present = np.unique(y)
+        if len(present) < 2:
+            return float("nan")
+        onehot = np.eye(len(present))[np.searchsorted(present, y)]
+        return float(skm.average_precision_score(onehot, proba[:, present], average="macro"))
     if metric == "logloss":
         p = np.clip(proba, 1e-15, 1)
         p = p / p.sum(1, keepdims=True)

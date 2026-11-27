@@ -493,6 +493,8 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         worker = Path(__file__).resolve().parent / "ag_worker.py"
         env = dict(os.environ)
         env.update({"OMP_NUM_THREADS": str(self.n_jobs), "PYTHONIOENCODING": "utf-8"})
+        if self.plan.time_col is not None:
+            env["AG_CHECK_TEMPORAL_LEAK"] = "1"
         timeout = max(30.0, min(300.0, self.budget.left() * 0.05))
         try:
             res = subprocess.run([python_exe(), "-u", str(worker), str(d)], capture_output=True, text=True,
@@ -599,6 +601,10 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
             # два фолда (валидация по времени): нужны оба, либо явный выигрыш на последнем периоде
             last_better = n_f > 0 and gain(r.fold_scores[0], self.best.fold_scores[0], self.spec.metric) > 0
             accepted = d > tol and (wins == n_f or (not strict and last_better and d > 3 * tol))
+        elif n_f == 3 and strict:
+            # на 3 фолдах: либо 3/3, либо крупный выигрыш (>3*tol) на 2/3 без заметной просадки на 3-м фолде
+            fold_deltas = [gain(a, b, self.spec.metric) for a, b in zip(r.fold_scores, self.best.fold_scores)]
+            accepted = d > tol and (wins == 3 or (wins == 2 and d > 3 * tol and min(fold_deltas) > -2 * tol))
         else:
             accepted = d > tol and wins >= math.ceil(n_f / 2) + (1 if strict else 0)
         s_seed1 = None
@@ -621,9 +627,8 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         self.journal.append(entry)
         log(f"#{hid} [{h.get('source')}] {entry['title']}: {self.spec.metric}={s:.5f} "
             f"Δ={d:+.5f} фолды {wins}/{len(r.fold_scores)} -> {'ПРИНЯТО' if accepted else 'отклонено'}")
-        # другой ключ объекта перепроверяется, даже если сначала проиграл: его польза сильно зависит от потерь и
-        # признаков, найденных позже (WiDS: ключ с типом здания в начале −0.50, а в финальных моделях смесь −0.08)
-        retry_ok = d > 0 or (h["kind"] == "entity_history" and d > -0.02 * abs(self.best_score or 0.0))
+        # Повторяем в конце только реально перспективные гипотезы (положительный прирост на >= половине фолдов)
+        retry_ok = d > 0 and wins >= math.ceil(max(1, n_f) / 2)
         if not accepted and retry_ok and block is not None and not h.get("retried"):
             # почти прошла: перепроверим в конце, когда конфигурация модели уже изменится
             self.retry.append({**h, "retried": True, "title": h.get("title", h["kind"]) + " (повтор)"})

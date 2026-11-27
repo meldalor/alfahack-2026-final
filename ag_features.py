@@ -9,6 +9,49 @@ import pandas as pd
 from ag_utils import log, log_exc
 
 DATE_RE = re.compile(r"^\s*(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})([ T]\d{1,2}:\d{2}(:\d{2})?)?")
+DMY_DOT_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}\.\d{2,4}([ T]\d{1,2}:\d{2}(:\d{2})?)?\s*$")
+_NA_TOKS = {"", "na", "n/a", "nan", "null", "none", "nil", "-", "--", "?", "unknown", "missing", "inf", "-inf"}
+
+
+def _parse_dirty_numeric(s: pd.Series):
+    """Parse numeric strings with whitespace, NA tokens, trailing '%', or European decimal comma ('12,5')."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        num = pd.to_numeric(s, errors="coerce")
+        return num, int(num.notna().sum())
+    st = s.astype("string").str.strip()
+    clean = st.mask(st.str.lower().isin(_NA_TOKS))
+    num = pd.to_numeric(clean, errors="coerce")
+    nn_c = int(clean.notna().sum())
+    if nn_c > 0 and num.notna().sum() >= 0.95 * nn_c:
+        return num, nn_c
+    alt = clean.str.replace(r"%$", "", regex=True).str.strip()
+    if nn_c > 0 and alt.dropna().str.match(r"^-?\d+,\d+$").mean() > 0.5:
+        alt = alt.str.replace(",", ".", regex=False)
+    num2 = pd.to_numeric(alt, errors="coerce")
+    return num2, nn_c
+
+
+def _unix_epoch_unit(name: str, a: pd.Series) -> str | None:
+    low = str(name).lower()
+    if not (low in ("timestamp", "ts", "dt", "time", "date", "epoch")
+            or low.endswith(("_time", "_timestamp", "_date", "_datetime", "_at", "_ts", "_dt", "_epoch"))
+            or low.startswith(("timestamp_", "datetime_", "event_time", "unix_"))):
+        return None
+    if not pd.api.types.is_numeric_dtype(a) or pd.api.types.is_bool_dtype(a):
+        return None
+    s = pd.to_numeric(a, errors="coerce").dropna()
+    if len(s) < 5 or s.nunique() < 3:
+        return None
+    vals = s.to_numpy(dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 5:
+        return None
+    lo, hi = float(np.quantile(vals, 0.05)), float(np.quantile(vals, 0.95))
+    if 9e8 <= lo and hi <= 2.6e9:
+        return "s"
+    if 9e11 <= lo and hi <= 2.6e12:
+        return "ms"
+    return None
 
 
 @dataclass
@@ -45,11 +88,17 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        pa = pd.to_datetime(a, errors="coerce", utc=True)
-        pb = pd.to_datetime(b, errors="coerce", utc=True)
-        if pa.notna().mean() < 0.5 and a.notna().any():
-            pa = pd.to_datetime(a, errors="coerce", format="mixed", utc=True)
-            pb = pd.to_datetime(b, errors="coerce", format="mixed", utc=True)
+        if pd.api.types.is_datetime64_any_dtype(a):
+            pa = pd.to_datetime(a, errors="coerce", utc=True)
+            pb = pd.to_datetime(b, errors="coerce", utc=True)
+        else:
+            sa_smp = a.dropna().astype(str).head(100)
+            dayfirst = bool(len(sa_smp) and sa_smp.map(lambda v: bool(DMY_DOT_RE.match(v))).mean() > 0.7)
+            pa = pd.to_datetime(a, errors="coerce", utc=True, dayfirst=dayfirst)
+            pb = pd.to_datetime(b, errors="coerce", utc=True, dayfirst=dayfirst)
+            if pa.notna().mean() < 0.5 and a.notna().any():
+                pa = pd.to_datetime(a, errors="coerce", format="mixed", utc=True, dayfirst=dayfirst)
+                pb = pd.to_datetime(b, errors="coerce", format="mixed", utc=True, dayfirst=dayfirst)
     both = pd.concat([pa, pb], ignore_index=True)
     out = pd.DataFrame(index=both.index)
     out[f"{name}__year"] = both.dt.year
@@ -76,14 +125,15 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
 
 
 def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
-    train = train[train[spec.target].notna()].reset_index(drop=True)
-    test = test.reset_index(drop=True)
-    exclude = {spec.target, spec.id_col}
-    feats = [c for c in test.columns if c in train.columns and c not in exclude]
-
     if spec.task_type == "regression":
-        y = pd.to_numeric(train[spec.target], errors="coerce").astype(float).values
+        y_num, _ = _parse_dirty_numeric(train[spec.target])
+        y_all = y_num.to_numpy(dtype=float)
+        valid_y_mask = np.isfinite(y_all)
+        train = train.loc[valid_y_mask].reset_index(drop=True)
+        y = y_all[valid_y_mask]
     else:
+        valid_y_mask = train[spec.target].notna().to_numpy()
+        train = train.loc[valid_y_mask].reset_index(drop=True)
         mapping = {c: i for i, c in enumerate(spec.classes)}
         y = train[spec.target].map(mapping).values
         if pd.isna(y).any():
@@ -91,6 +141,9 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
             smap = {str(c): i for i, c in enumerate(spec.classes)}
             y = train[spec.target].astype(str).map(smap).values
         y = np.asarray(y, dtype=int)
+    test = test.reset_index(drop=True)
+    exclude = {spec.target, spec.id_col}
+    feats = [c for c in test.columns if c in train.columns and c not in exclude]
 
     X_parts, T_parts = [], []
     cat_cols, text_cols, raw_text, dropped = [], [], {}, []
@@ -111,9 +164,20 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 T_parts.append(xb)
                 continue
             if pd.api.types.is_numeric_dtype(a) and pd.api.types.is_numeric_dtype(b):
+                ep_u = _unix_epoch_unit(name, a)
+                if ep_u is not None:
+                    xa, xb = _expand_datetime(
+                        name,
+                        pd.to_datetime(pd.to_numeric(a, errors="coerce"), unit=ep_u, errors="coerce", utc=True),
+                        pd.to_datetime(pd.to_numeric(b, errors="coerce"), unit=ep_u, errors="coerce", utc=True),
+                    )
+                    date_origins[f"{name}__ord"] = xa.attrs.get("origin")
+                    X_parts.append(xa)
+                    T_parts.append(xb)
+                    continue
                 nu_a = a.nunique(dropna=True)
                 is_bin01 = nu_a <= 2 and set(np.round(a.dropna().astype(float).unique(), 6)) <= {0.0, 1.0}
-                if name in cat_hint and not is_bin01 and pd.concat([a, b]).nunique() <= 1000 and _codes_seen(name, a, b):
+                if name in cat_hint and not is_bin01 and nu_a <= 1000 and _codes_seen(name, a, b):
                     cat_cols.append(name)
 
                     def fmt(s):
@@ -126,23 +190,9 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                     T_parts.append(pd.to_numeric(b, errors="coerce").astype("float32").rename(name).to_frame())
                 continue
             sa, sb = a.astype("string"), b.astype("string")
-            _NA_TOKS = {"", "na", "n/a", "nan", "null", "none", "nil", "-", "--", "?", "unknown", "missing", "inf", "-inf"}
-            def _try_num(s: pd.Series):
-                st = s.str.strip()
-                clean = st.mask(st.str.lower().isin(_NA_TOKS))
-                num = pd.to_numeric(clean, errors="coerce")
-                nn_c = int(clean.notna().sum())
-                if nn_c > 0 and num.notna().sum() >= 0.95 * nn_c:
-                    return num, nn_c
-                # European decimal comma ("12,5") or trailing "%" ("45.2%")
-                alt = clean.str.replace(r"%$", "", regex=True).str.strip()
-                if alt.dropna().str.match(r"^-?\d+,\d+$").mean() > 0.5 if nn_c > 0 else False:
-                    alt = alt.str.replace(",", ".", regex=False)
-                num2 = pd.to_numeric(alt, errors="coerce")
-                return num2, nn_c
-            na, nn = _try_num(sa)
+            na, nn = _parse_dirty_numeric(sa)
             if nn > 0 and na.notna().sum() >= 0.95 * nn and (name not in cat_hint or not _codes_seen(name, sa, sb)):
-                nb, _ = _try_num(sb)
+                nb, _ = _parse_dirty_numeric(sb)
                 X_parts.append(na.astype("float32").rename(name).to_frame())
                 T_parts.append(nb.astype("float32").rename(name).to_frame())
                 continue
@@ -294,7 +344,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
 
     prep = Prepared(X=X, Xt=Xt, y=y, cat_cols=final_cats, text_cols=text_cols, raw_text=raw_text)
     prep.info = {"n_train": len(X), "n_test": len(Xt), "n_features": X.shape[1], "cat_cols": final_cats,
-                 "text_cols": text_cols, "dropped": dropped,
+                 "text_cols": text_cols, "dropped": dropped, "valid_y_mask": valid_y_mask,
                  "rename": {k: v for k, v in rename.items() if k != v}}
     return prep
 

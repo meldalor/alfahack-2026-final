@@ -22,8 +22,8 @@ import threading  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from ag_ensemble import (LabelShift, blend, choose_shrink_power, decide_on_test, finalize_classification,  # noqa: E402
-                         rank_blend, stack_blend)
+from ag_ensemble import (LabelShift, apply_zero_mape_hurdle, blend, choose_shrink_power, decide_on_test,  # noqa: E402
+                         finalize_classification, rank_blend, stack_blend)
 from ag_features import (causal_stream_features, cross_impute_outages, detect_time_split, entity_periods,  # noqa: E402
                          op_entity_history, prepare)
 from ag_llm import LLM  # noqa: E402
@@ -235,7 +235,10 @@ def run(task_path: Path):
     if os.environ.get("PGDATABASE") or "train" not in files or "test" not in files:
         from ag_database import extract
         from ag_relational import enrich
-        tables = extract(work)
+        try:
+            tables = extract(work, meta=rel_meta)
+        except TypeError:
+            tables = extract(work)
         role_map = _resolve_db_tables(tables, text)
         if "train" not in role_map or "test" not in role_map:
             raise RuntimeError(f"Database must expose train and test tables (found: {sorted(tables)})")
@@ -345,7 +348,9 @@ def solve_target(spec, train, test, llm, hints, budget, writer, work, rel_meta=N
         try:
             from ag_nowcast import build_nowcast_features
 
-            valid_y = train[spec.target].notna().to_numpy()
+            valid_y = prep.info.get("valid_y_mask")
+            if valid_y is None:
+                valid_y = train[spec.target].notna().to_numpy()
             rm = dict(rel_meta)
             if rm.get("train_times") is not None and len(rm["train_times"]) == len(valid_y):
                 rm["train_times"] = rm["train_times"].loc[valid_y].reset_index(drop=True)
@@ -384,7 +389,7 @@ def solve_target(spec, train, test, llm, hints, budget, writer, work, rel_meta=N
     if shift["auc"] is not None:
         researcher.shift_note = (f"train/test covariate shift: adversarial AUC={shift['auc']:.3f} "
                                  f"(0.5 = identical); most shifted features: {shift['top']}")
-    research_deadline = start + 0.45 * (budget.total - start)
+    research_deadline = start + 0.35 * (budget.total - start)
 
     def on_baseline(r):
         ey, eplan = researcher.ey, researcher.eplan
@@ -446,12 +451,14 @@ def model_family(name: str) -> str:
         return "lgb_huber"
     if name == "lgb_l1" or re.fullmatch(r"lgb_l1_s\d+", name):
         return "lgb_l1"
+    if name == "lgb_et" or re.fullmatch(r"lgb_et_s\d+", name):
+        return "lgb_et"
     if name.startswith("lgb_offset"):
         return "lgb_offset"
     m = re.fullmatch(r"(lgb_xoffset\d+)_s\d+", name)
     if m:
         return m.group(1)
-    for f in ("xgb", "xgb_ph", "cat", "cat_rmse", "cat_d8", "et", "hgb", "mlp"):
+    for f in ("xgb", "xgb_ph", "cat", "cat_rmse", "cat_top", "cat_d8", "et", "hgb", "mlp"):
         if name == f or re.fullmatch(f + r"_s\d+", name):
             return f
     return name
@@ -537,9 +544,6 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     def publish(note):
         usable = [r for r in results if r is not None and r.test is not None
                   and not np.isnan(r.oof[mask]).reshape(int(mask.sum()), -1).any()]
-        # модель с недоученным по времени фолдом портит среднее своего семейства — только если есть другие
-        if any(not r.config.get("time_cut") for r in usable):
-            usable = [r for r in usable if not r.config.get("time_cut")]
         if not usable:
             partial = [r for r in results if r is not None and r.test is not None]
             if partial and state["best_val"] is None and not state.get("partial") and not shift.get("base_written"):
@@ -573,13 +577,19 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                 state["label_shift"] = label_shift(spec, prep, y, mask & ~np.isnan(ref.oof).reshape(len(y), -1).any(1),
                                                    ref.oof, ref.test, shift.get("auc"), plan.time_col)
                 state["label_shift_done"] = True
-        # сиды одной модели сначала усредняются: выбор «удачного» сида по OOF переобучается на валидацию
-        # (на регрессии с проверкой по годам смесь из средних по сидам честнее: 33.44 против 33.62)
+        # сиды одной модели сначала усредняются: выбор «удачного» сида по OOF переобучается на валидацию;
+        # внутри одного семейства недоученный по времени сид не портит среднее полных сидов, но сильная
+        # модель собственного семейства (например, lgb_huber, прошедшая все фолды) никогда не выбрасывается!
         fams = {}
         for r in usable:
             fams.setdefault(model_family(r.name), []).append(r)
-        pooled = [rs[0] if len(rs) == 1 else pool_results(f"{f}x{len(rs)}", rs, y, mask, spec, plan=plan)
-                  for f, rs in fams.items()]
+        pooled = []
+        for f, rs in fams.items():
+            uncut = [r for r in rs if not r.config.get("time_cut")]
+            if uncut:
+                best_uncut = max(uncut, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score
+                rs = [r for r in rs if (not r.config.get("time_cut")) or better(r.score, best_uncut, spec.metric)]
+            pooled.append(rs[0] if len(rs) == 1 else pool_results(f"{f}x{len(rs)}", rs, y, mask, spec, plan=plan))
         scored = []
 
         def add(name, oof, test, weights):
@@ -652,8 +662,11 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                                               "class_weights": [round(x, 3) for x in decision["weights"]]}}
             writer.write(test_adj, decision=decision, note=f"{note}: {name}; OOF {spec.metric}={val:.5f}; веса {weights}")
         state["written"] = (name, weights)
+        state["written_weights"] = dict(weights) if isinstance(weights, dict) else {}
         if top is None or better(val, top, spec.metric):
             state["best_val"] = val
+            state["best_oof"] = oof
+            state["best_test"] = test
         try:
             np.save(work / "blend_oof.npy", oof)
             np.save(work / "blend_test.npy", test)
@@ -694,14 +707,14 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             publish("lgb_fast")
     # 4.1в смесь функций потерь для MAE-задач: Huber-LightGBM и L1-LightGBM (всегда обе потери для разнообразия)
     is_mae_task = spec.task_type == "regression" and spec.metric in ("mae", "medae", "smape")
-    if is_mae_task and left() > eval_t * 3 + 60:
+    if is_mae_task and left() > min(90.0, eval_t * 2 + 30):
         if cfg.objective_variant != "huber":
             cfg_alt = ModelConfig(**{**cfg.to_dict(), "objective_variant": "huber"})
             alt_name = "lgb_huber"
         else:
             cfg_alt = ModelConfig(**{**cfg.to_dict(), "objective_variant": None})
             alt_name = "lgb_l1"
-        r = safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg_alt, N_JOBS, max(60.0, left() * 0.3), lr=lr_main,
+        r = safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg_alt, N_JOBS, max(60.0, left() * 0.40), lr=lr_main,
                      es=200, seed=13, name=alt_name)
         if r is not None and r.test is not None:
             log(f"{alt_name}: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
@@ -715,7 +728,8 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     if imp_src is not None:
         top_cols = list(imp_src.sort_values(ascending=False).index)
 
-    # 4.2 Разнообразие семейств: быстрые линейные (на top_cols), приоритетный CatBoost, XGBoost (+PseudoHuber), HGB, ET, MLP
+    # 4.2 Разнообразие семейств — СНАЧАЛА все 7 быстрых/сильных базовых семейств (Ridge/LogReg, CatBoost, XGB-PH, HGB, ET, MLP),
+    # и только ЗАТЕМ вторичные модели (lgb_et, xgb, cat_top, huber, lasso), чтобы при сжатом бюджете ансамбль всегда был полным!
     rich_cats = [c for c in prep.cat_cols if c in X.columns and X[c].nunique() >= 30]  # флаги и короткие списки не в счёт
     late_cat = spec.task_type == "multiclass" and len(spec.classes) > 3 and len(rich_cats) < 3
     cat_kw = {"cat_cols": prep.cat_cols, "depth": 6,
@@ -725,11 +739,11 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         cfg_x = ModelConfig(**{**cfg.to_dict(), "target_transform": "none"})
 
     def fit_extra(name, fn, kw, min_need=None, use_clean=False):
-        need = (eval_t * 3 + 60) if min_need is None else min_need
+        need = min(80.0, eval_t * 2 + 25) if min_need is None else min_need
         if left() < need:
             log(f"{name}: пропуск, мало времени ({left():.0f}s)")
             return
-        lim = max(30.0 if min_need is not None else 60.0, left() * 0.45)
+        lim = max(30.0 if min_need is not None else 55.0, left() * 0.45)
         kwargs = dict(kw)
         Xf, Xtf = (prep.X, prep.Xt) if use_clean else (X, Xt)
         cf = ModelConfig(**{**cfg_x.to_dict(), "drop": []}) if use_clean else cfg_x
@@ -742,30 +756,57 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             results.append(r)
             publish(name)
 
+    # Tier 1: базовые разнообразные семейства
     if spec.task_type == "regression":
-        fit_extra("ridge", fit_linear, {"kind": "ridge", "top_cols": top_cols}, min_need=20.0, use_clean=True)
-        fit_extra("lasso", fit_linear, {"kind": "lasso", "top_cols": top_cols}, min_need=25.0, use_clean=True)
-        fit_extra("huber", fit_linear, {"kind": "huber", "top_cols": top_cols}, min_need=25.0, use_clean=True)
+        fit_extra("ridge", fit_linear, {"kind": "ridge", "top_cols": top_cols}, min_need=15.0, use_clean=True)
     else:
-        fit_extra("logreg", fit_linear, {"kind": "logreg", "top_cols": top_cols}, min_need=25.0, use_clean=True)
+        fit_extra("logreg", fit_linear, {"kind": "logreg", "top_cols": top_cols}, min_need=20.0, use_clean=True)
     if not late_cat:
-        fit_extra("cat", fit_cat, cat_kw)
+        fit_extra("cat", fit_cat, cat_kw, min_need=40.0)
         if is_mae_task:
-            fit_extra("cat_rmse", fit_cat, {**cat_kw, "loss_override": "RMSE", "seed": 2})
+            fit_extra("cat_rmse", fit_cat, {**cat_kw, "loss_override": "RMSE", "seed": 2}, min_need=40.0)
     if is_mae_task:
-        fit_extra("xgb_ph", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6, "objective_override": "pseudohuber", "seed": 11})
-    fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7})
-    fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=30.0)
-    fit_extra("et", fit_et, {})
-    fit_extra("mlp", fit_mlp, {"top_cols": top_cols}, min_need=30.0, use_clean=True)
+        fit_extra("xgb_ph", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6, "objective_override": "pseudohuber", "seed": 11}, min_need=40.0)
+    else:
+        fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7}, min_need=40.0)
+    fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=25.0)
+    fit_extra("et", fit_et, {}, min_need=25.0)
+    fit_extra("mlp", fit_mlp, {"top_cols": top_cols}, min_need=25.0, use_clean=True)
     # Усредняем до 4 дополнительных сидов быстрого MLP для снижения дисперсии нейросети в ансамбле
     mlp_r = next((r for r in results if r is not None and r.name == "mlp" and r.test is not None), None)
-    if mlp_r is not None and mlp_r.seconds <= 75.0 and left() > 240.0:
+    if mlp_r is not None and mlp_r.seconds <= 75.0 and left() > 180.0:
         n_extra_mlp = 4 if (mlp_r.seconds <= 45.0 and left() > 360.0) else 2
         for ms in range(1, n_extra_mlp + 1):
-            if left() <= 180.0:
+            if left() <= 120.0:
                 break
-            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "seed": ms}, min_need=40.0, use_clean=True)
+            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "seed": ms}, min_need=35.0, use_clean=True)
+
+    # Tier 2: вторичные модели для усиления ансамбля (когда все базовые семейства уже обучены)
+    if left() > min(90.0, eval_t * 2 + 30):
+        cfg_et = ModelConfig(**{**cfg.to_dict(), "lgb_params": {**cfg.lgb_params, "extra_trees": True}})
+        r = safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg_et, N_JOBS, max(60.0, left() * 0.35), lr=lr_main,
+                     es=200, seed=19, name="lgb_et")
+        if r is not None and r.test is not None:
+            log(f"lgb_et: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
+            results.append(r)
+            publish("lgb_et")
+    if is_mae_task:
+        fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7}, min_need=45.0)
+    if not late_cat and top_cols and X.shape[1] > 350 and left() > 90.0:
+        # На широких БД (>350 колонок): дополнительный CatBoost на очищенном top-250 (меньше шума, быстрее)
+        keep250 = [c for c in top_cols if c in X.columns][:250]
+        if len(keep250) >= 80:
+            drop_rest = [c for c in X.columns if c not in set(keep250)]
+            cfg_top = ModelConfig(**{**cfg_x.to_dict(), "drop": sorted(set(cfg_x.drop) | set(drop_rest))})
+            r = safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_top, prep.cat_cols, N_JOBS,
+                         max(55.0, left() * 0.4), lr=cat_kw["lr"], depth=7, seed=5, name="cat_top")
+            if r is not None and r.test is not None:
+                log(f"cat_top: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
+                results.append(r)
+                publish("cat_top")
+    if spec.task_type == "regression":
+        fit_extra("huber", fit_linear, {"kind": "huber", "top_cols": top_cols}, min_need=25.0, use_clean=True)
+        fit_extra("lasso", fit_linear, {"kind": "lasso", "top_cols": top_cols}, min_need=25.0, use_clean=True)
 
     # 4.2б регрессия с историей объекта: модель-поправка к прошлому значению (после базовых семейств)
     hist_cols = [c for c in X.columns if c.startswith("hist__last")] if spec.task_type == "regression" else []
@@ -849,29 +890,70 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         return [safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg2, N_JOBS, max(60.0, left() * 0.4), lr=lr_main, es=200,
                          seed=100 + k, name=f"lgb_huber_s{k}")]
 
-    seeders = [lgb_seed]
+    def lgb_l1_seed(k):
+        cfg2 = ModelConfig(**{**cfg.to_dict(), "objective_variant": None})
+        p = dict(cfg2.lgb_params)
+        p["feature_fraction"] = max(0.3, p.get("feature_fraction", 0.7) * 0.85)
+        p["bagging_fraction"] = 0.75
+        cfg2.lgb_params = p
+        return [safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg2, N_JOBS, max(60.0, left() * 0.4), lr=lr_main, es=200,
+                         seed=120 + k, name=f"lgb_l1_s{k}")]
+
+    def hgb_seed(k):
+        return [safe_fit(fit_hgb, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.35),
+                         top_cols=top_cols, seed=40 + k, name=f"hgb_s{k}")]
+
+    def mlp_seed(k):
+        cf_clean = ModelConfig(**{**cfg_x.to_dict(), "drop": []})
+        return [safe_fit(fit_mlp, prep.X, y, prep.Xt, plan, spec, cf_clean, N_JOBS, max(60.0, left() * 0.3),
+                         top_cols=top_cols, seed=10 + k, name=f"mlp_s{10 + k}")]
+
+    def lgb_et_seed(k):
+        cfg2 = ModelConfig(**{**cfg.to_dict(), "lgb_params": {**cfg.lgb_params, "extra_trees": True}})
+        return [safe_fit(fit_lgb, X, y, Xt, plan, spec, cfg2, N_JOBS, max(60.0, left() * 0.35), lr=lr_main, es=200,
+                         seed=60 + k, name=f"lgb_et_s{k}")]
+
+    # Вес-ориентированный отбор семейств для мультисидирования: доучиваем сиды КАЖДОМУ семейству с весом >= 5% в бленде
+    # или близкому к лидеру (<= 5%), упорядочивая по текущему весу в ансамбле!
     done = [r for r in results if r is not None and r.test is not None and np.isfinite(r.score)]
     top = max(done, key=lambda r: r.score if direction(spec.metric) == "max" else -r.score).score if done else None
-    xgb_ph_r = next((r for r in done if r.name == "xgb_ph"), None)
-    if xgb_ph_r is not None and top is not None and abs(xgb_ph_r.score - top) <= 0.05 * abs(top):
-        seeders.append(xgb_ph_seed)
-    if any(r is not None and r.name == "xgb" for r in results):
-        seeders.append(xgb_seed)
+    cur_w = state.get("written_weights") or {}
+    fam_w = {}
+    for wk, wv in cur_w.items():
+        base_f = re.sub(r"x\d+$", "", str(wk))
+        f = model_family(base_f)
+        fam_w[f] = fam_w.get(f, 0.0) + float(wv)
+    fam_best = {}
+    for r in done:
+        f = model_family(r.name)
+        if f not in fam_best or better(r.score, fam_best[f], spec.metric):
+            fam_best[f] = r.score
+
+    cand_map = [
+        ("cat", cat_seed, not late_cat),
+        ("cat_rmse", cat_rmse_seed, not late_cat),
+        ("lgb_huber", lgb_huber_seed, True),
+        ("lgb_l1", lgb_l1_seed, True),
+        ("lgb", lgb_seed, True),
+        ("lgb_et", lgb_et_seed, True),
+        ("xgb_ph", xgb_ph_seed, True),
+        ("xgb", xgb_seed, True),
+        ("hgb", hgb_seed, True),
+        ("et", et_seed, True),
+        ("mlp", mlp_seed, True),
+    ]
+    picked = []
+    for f, fn, allowed in cand_map:
+        if not allowed or f not in fam_best:
+            continue
+        w_f = fam_w.get(f, 0.0)
+        close = top is not None and abs(fam_best[f] - top) <= 0.05 * max(abs(top), 1e-9)
+        if f == "lgb" or w_f >= 0.05 or close:
+            picked.append((w_f, 1 if close else 0, fn))
+    picked.sort(key=lambda x: (-x[0], -x[1]))
+    seeders = [fn for _, _, fn in picked] or [lgb_seed]
     if any(r is not None and r.name.startswith(("lgb_offset", "lgb_xoffset")) for r in results):
         seeders.append(offset_seed)
-    hub_r = next((r for r in done if r.name == "lgb_huber"), None)
-    if hub_r is not None and top is not None and abs(hub_r.score - top) <= 0.05 * abs(top):
-        seeders.insert(0, lgb_huber_seed)
-    cat_rmse_r = next((r for r in done if r.name == "cat_rmse"), None)
-    if cat_rmse_r is not None and not late_cat and top is not None and abs(cat_rmse_r.score - top) <= 0.05 * abs(top):
-        seeders.insert(0, cat_rmse_seed)
-    cat_r = next((r for r in done if r.name == "cat"), None)
-    if cat_r is not None and not late_cat and top is not None and abs(cat_r.score - top) <= 0.05 * abs(top):
-        seeders.insert(0, cat_seed)  # CatBoost часто сильнейшее семейство на плотных временных таблицах
-    et_r = next((r for r in done if r.name == "et"), None)
-    if et_r is not None and top is not None:
-        if abs(et_r.score - top) <= 0.03 * abs(top):
-            seeders.append(et_seed)
     next_k = {fn: 1 for fn in seeders}
     # на быстрых данных сидов больше: семейство поправки на WiDS из 14 моделей 33.76, из 28 — 33.58; на медленных
     # данных раньше кончится время
@@ -898,6 +980,23 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         fit_extra("cat", fit_cat, cat_kw)
         # CatBoost пропущен или закончил раньше — оставшееся время снова на сиды (UNSW-NB15: иначе ~45 минут простоя)
         seed_rounds(1.0)
+    # Zero-aware MAPE hurdle: при наличии точных нулей в таргете обнуляем прогноз там, где P(y=0) высока
+    if (spec.task_type == "regression" and spec.metric == "mape" and state.get("best_oof") is not None
+            and state.get("best_test") is not None and (np.abs(y) < 1e-12).mean() >= 0.01):
+        try:
+            hur = apply_zero_mape_hurdle(X, Xt, y, state["best_oof"], state["best_test"], plan, mask, n_jobs=N_JOBS)
+            if hur is not None and better(hur["score"], state["best_val"], spec.metric):
+                writer.write(hur["test"], train_y=y,
+                             note=f"zero-MAPE hurdle (thr={hur['threshold']:.4f}); OOF mape={hur['score']:.5f}")
+                state["best_val"] = hur["score"]
+                save_json(work / "final.json", {
+                    "oof_score": hur["score"], "choice": "zero_mape_hurdle",
+                    "weights": state.get("written_weights", {}), "info": {"threshold": hur["threshold"]},
+                    "models": [{"name": r.name, "score": r.score, "iters": r.iters,
+                                "seconds": round(r.seconds, 1)} for r in results if r],
+                })
+        except Exception:
+            log_exc("apply_zero_mape_hurdle")
     if not results:
         log("финальные модели не обучились — остаётся предыдущий submission")
 

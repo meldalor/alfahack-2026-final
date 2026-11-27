@@ -287,13 +287,19 @@ def fit_lgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             log(f"{name}: время вышло на фолде {k + 1}/{len(plan.folds)}")
             break
     if predict_test and plan.mode == "refit" and Xt is not None:
-        n_round = refit_rounds(iters, plan, len(X))
-        guard.deadline = max(guard.deadline, time.time() + max(30.0, 0.3 * time_limit))
-        fill = float(np.median(yt)) if use_offset else None
-        m = lgb.train(params, lgb.Dataset(X, yt, weight=w, init_score=offset(raw_off, fill) if use_offset else None),
-                      n_round, callbacks=[stopper])
-        pt = m.predict(Xt) + (offset(raw_off_t, fill) if use_offset else 0.0)
-        test = _as_proba(pt, spec.task_type) if spec.task_type != "regression" else inverse_target(pt, cfg.target_transform)
+        if len(iters) == len(plan.folds) or name in ("base", "lgb_main"):
+            n_round = refit_rounds(iters, plan, len(X))
+            guard.deadline = max(guard.deadline, time.time() + max(45.0, 0.45 * time_limit))
+            fill = float(np.median(yt)) if use_offset else None
+            m = lgb.train(params, lgb.Dataset(X, yt, weight=w, init_score=offset(raw_off, fill) if use_offset else None),
+                          n_round, callbacks=[stopper])
+            if m.current_iteration() >= max(1, int(0.5 * n_round)):
+                pt = m.predict(Xt) + (offset(raw_off_t, fill) if use_offset else 0.0)
+                test = _as_proba(pt, spec.task_type) if spec.task_type != "regression" else inverse_target(pt, cfg.target_transform)
+            else:
+                test = None
+        else:
+            test = None
     return _finish(name, oof, test, plan, spec, y, iters, imps, t0, cfg, cut=guard.cut)
 
 
@@ -340,7 +346,9 @@ def fit_cat(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, cat_cols, n_jobs: 
     guard = _TimeGuard(time_limit)
     n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     cols = [c for c in X.columns if c not in set(cfg.drop)]
-    cats = [c for c in cat_cols if c in cols]
+    cat_set = set(cat_cols)
+    cats = [c for c in cols if c in cat_set or isinstance(X[c].dtype, pd.CategoricalDtype)
+            or not pd.api.types.is_numeric_dtype(X[c])]
 
     def conv(df):
         df = df[cols].copy()
@@ -528,31 +536,49 @@ def fit_xgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
 # ---------------------------------------------------------------- ExtraTrees
 
 
-def _matrix(df: pd.DataFrame) -> np.ndarray:
-    """Таблица -> float32 для sklearn: категории — коды, пропуски — отдельное значение."""
-    cols = []
-    for c in df.columns:
-        s = df[c]
-        if isinstance(s.dtype, pd.CategoricalDtype):
-            cols.append(s.cat.codes.to_numpy(np.float32))
-        elif pd.api.types.is_numeric_dtype(s):
-            cols.append(s.to_numpy(np.float32, na_value=np.nan))
+def _matrix_pair(X: pd.DataFrame, Xt: pd.DataFrame | None):
+    """Таблицы (X, Xt) -> float32 для sklearn с единым словарём кодирования категорий строго по X."""
+    a_cols, b_cols = [], []
+    for c in X.columns:
+        sa = X[c]
+        sb = Xt[c] if Xt is not None else None
+        if isinstance(sa.dtype, pd.CategoricalDtype):
+            a_cols.append(sa.cat.codes.to_numpy(np.float32))
+            if sb is not None:
+                b_cols.append(sb.cat.codes.to_numpy(np.float32))
+        elif pd.api.types.is_numeric_dtype(sa):
+            a_cols.append(sa.to_numpy(np.float32, na_value=np.nan))
+            if sb is not None:
+                b_cols.append(pd.to_numeric(sb, errors="coerce").to_numpy(np.float32, na_value=np.nan))
         else:
-            cols.append(pd.factorize(s)[0].astype(np.float32))
-    a = np.column_stack(cols) if cols else np.zeros((len(df), 1), np.float32)
-    return np.where(np.isfinite(a), a, -1e9).astype(np.float32)
+            codes, uniques = pd.factorize(sa.astype("string"), sort=False)
+            a_cols.append(codes.astype(np.float32))
+            if sb is not None:
+                umap = {v: i for i, v in enumerate(uniques)}
+                b_cols.append(sb.astype("string").map(umap).fillna(-1.0).to_numpy(np.float32))
+    A = np.column_stack(a_cols) if a_cols else np.zeros((len(X), 1), np.float32)
+    A = np.where(np.isfinite(A), A, -1e9).astype(np.float32)
+    if Xt is None:
+        return A, None
+    B = np.column_stack(b_cols) if b_cols else np.zeros((len(Xt), 1), np.float32)
+    B = np.where(np.isfinite(B), B, -1e9).astype(np.float32)
+    return A, B
 
 
 def fit_et(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_limit: float, seed: int = 0,
-           name: str = "et", n_estimators: int = 200) -> FitResult | None:
+           name: str = "et", n_estimators: int = 200, top_cols: list | None = None,
+           max_cols: int | None = None) -> FitResult | None:
     """ExtraTrees: другая индуктивная предвзятость, чем у бустинга, — полезна в смеси (на UNSW-NB15 под долями
     классов теста одна почти не хуже LightGBM, а четвертью в смеси даёт +0.005 macro-F1)."""
     from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 
     t0 = time.time()
     cols = [c for c in X.columns if c not in set(cfg.drop)]
-    A = _matrix(X[cols])
-    B = _matrix(Xt[cols]) if Xt is not None else None
+    if top_cols and max_cols and len(cols) > max_cols:
+        chosen = [c for c in top_cols if c in cols][:max_cols]
+        if len(chosen) >= 15:
+            cols = chosen
+    A, B = _matrix_pair(X[cols], Xt[cols] if Xt is not None else None)
     n = len(A)
     n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
@@ -657,9 +683,9 @@ def fit_linear(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, ti
         pre = ColumnTransformer(transformers, sparse_threshold=0.0 if dense else 0.3)
         if spec.task_type == "regression":
             if kind == "huber":
-                reg = HuberRegressor(alpha=10.0, epsilon=1.2, max_iter=1500, tol=1e-4)
+                reg = HuberRegressor(alpha=10.0, epsilon=1.2, max_iter=500, tol=1e-3)
             elif kind == "lasso":
-                reg = LassoCV(cv=5, max_iter=3000, random_state=seed, n_jobs=min(n_jobs, 4))
+                reg = LassoCV(cv=3, n_alphas=25, max_iter=500, tol=1e-3, random_state=seed, n_jobs=min(n_jobs, 4))
             else:
                 reg = RidgeCV(alphas=np.logspace(-1, 4, 11))
             return make_pipeline(pre, TransformedTargetRegressor(regressor=reg, transformer=StandardScaler()))
@@ -740,9 +766,11 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
                 Xt_in[c] = Xt_in[c].astype("string").map(umap).fillna(-1.0).astype("float32")
             cat_mask.append(False)
     n = len(X_in)
+    n_classes = len(spec.classes) if spec.task_type != "regression" else 1
     if n > 100_000:
         max_iter = min(max_iter, 300)
-    n_classes = len(spec.classes) if spec.task_type != "regression" else 1
+    if spec.task_type == "multiclass" and n_classes > 5:
+        max_iter = min(max_iter, 250)
     yt = transform_target(y, cfg.target_transform) if spec.task_type == "regression" else y
     tvals = X[plan.time_col].values if plan.time_col and plan.time_col in X.columns else None
     w = sample_weights(y, spec.task_type, cfg, tvals, plan.row_weight)

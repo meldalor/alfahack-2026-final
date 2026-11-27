@@ -687,6 +687,238 @@ class FinalTests(unittest.TestCase):
         delta = float(np.max(np.abs(oa1.loc[periods == 1].to_numpy() - oa2.loc[periods == 1].to_numpy())))
         self.assertLess(delta, 1e-7)
 
+    def test_pg_boolean_conversion_and_sql_fk_multi_role_join(self):
+        from ag_database import _convert_pg_booleans
+        df_b = pd.DataFrame({'is_storm': ['t', 'f', None, 't'], 'val': [1.0, 2.0, 3.0, 4.0]})
+        df_b = _convert_pg_booleans(df_b, ['is_storm'])
+        self.assertTrue(pd.api.types.is_numeric_dtype(df_b['is_storm']))
+        self.assertEqual(df_b['is_storm'].iloc[0], 1.0)
+        self.assertEqual(df_b['is_storm'].iloc[1], 0.0)
+        self.assertTrue(pd.isna(df_b['is_storm'].iloc[2]))
+        # Explicit SQL FKs: arbitrary key name + multi-role sender_id/receiver_id -> users.acc_code
+        tr = pd.DataFrame({'event_id': [1, 2], 'sender_id': ['U1', 'U2'], 'receiver_id': ['U2', 'U3'], 'y': [0, 1]})
+        te = pd.DataFrame({'event_id': [3], 'sender_id': ['U3'], 'receiver_id': ['U1']})
+        users = pd.DataFrame({'acc_code': ['U1', 'U2', 'U3'], 'tier': [10, 20, 30]})
+        meta = {'foreign_keys': [
+            {'src_table': 'train', 'src_col': 'sender_id', 'dst_table': 'users', 'dst_col': 'acc_code'},
+            {'src_table': 'train', 'src_col': 'receiver_id', 'dst_table': 'users', 'dst_col': 'acc_code'},
+        ]}
+        a, b = enrich(tr, te, {'users': users}, meta=meta)
+        self.assertIn('sender__users__tier', a.columns)
+        self.assertIn('receiver__users__tier', a.columns)
+        self.assertEqual(a['sender__users__tier'].tolist(), [10, 20])
+        self.assertEqual(a['receiver__users__tier'].tolist(), [20, 30])
+        self.assertEqual(b['sender__users__tier'].iloc[0], 30)
+        self.assertEqual(b['receiver__users__tier'].iloc[0], 10)
+
+    def test_windowed_causal_rfm_1d_7d_30d_zero_future_leak(self):
+        tr = pd.DataFrame({'event_id': [1, 2, 3], 'user_id': ['u1', 'u1', 'u1'],
+                           'timestamp': ['2025-01-20 12:00:00', '2025-01-25 12:00:00', '2025-02-01 12:00:00'],
+                           'y': [1.0, 2.0, 3.0]})
+        te = pd.DataFrame({'event_id': [4], 'user_id': ['u1'], 'timestamp': ['2025-02-02 12:00:00']})
+        tx = pd.DataFrame({
+            'user_id': ['u1'] * 5,
+            'timestamp': [
+                '2025-01-15 12:00:00',  # 18d before test (inside 30d, outside 7d)
+                '2025-01-30 12:00:00',  # 3d before test (inside 7d, outside 1d)
+                '2025-02-02 06:00:00',  # 6h before test (inside 1d)
+                '2025-02-02 12:00:00',  # exact tie with test (MUST be excluded!)
+                '2025-02-05 00:00:00',  # future (MUST be excluded!)
+            ],
+            'amt': [100.0, 20.0, 5.0, 9999.0, 8888.0],
+        })
+        _, b = enrich(tr, te, {'tx': tx})
+        self.assertEqual(float(b['tx__hist_cnt_1d'].iloc[0]), 1.0)
+        self.assertEqual(float(b['tx__hist_cnt_7d'].iloc[0]), 2.0)
+        self.assertEqual(float(b['tx__hist_cnt_30d'].iloc[0]), 3.0)
+        self.assertAlmostEqual(float(b['tx__amt__hist_sum_7d'].iloc[0]), 25.0, places=3)
+        self.assertAlmostEqual(float(b['tx__amt__hist_sum_30d'].iloc[0]), 125.0, places=3)
+
+    def test_dirty_regression_target_unix_epoch_and_dmy_dates(self):
+        from ag_features import detect_time_split, prepare
+        ep_tr = np.arange(1700000000, 1700000000 + 20 * 86400, 86400)
+        ep_te = np.arange(1700000000 + 25 * 86400, 1700000000 + 30 * 86400, 86400)
+        tr = pd.DataFrame({
+            'id': range(20),
+            'created_at': ep_tr,
+            'ru_date': ['01.08.2025' if i < 10 else '15.09.2025' for i in range(20)],
+            'x': np.arange(20, dtype=float),
+            'y': ['N/A' if i == 0 else f'{10 + i},5' for i in range(20)],
+        })
+        te = pd.DataFrame({'id': range(20, 25), 'created_at': ep_te, 'ru_date': ['20.09.2025'] * 5, 'x': np.arange(5, dtype=float)})
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        prep = prepare(tr, te, spec)
+        self.assertEqual(len(prep.y), 19)  # dirty 'N/A' row dropped cleanly; no NaN in y!
+        self.assertTrue(np.isfinite(prep.y).all())
+        self.assertAlmostEqual(float(prep.y[0]), 11.5, places=4)
+        self.assertIn('created_at__ord', prep.X.columns)
+        self.assertEqual(int(prep.X['ru_date__month'].iloc[0]), 8)  # 01.08.2025 -> August, NOT January!
+        self.assertEqual(int(prep.X['ru_date__month'].iloc[-1]), 9)
+        tcol = detect_time_split(prep.X, prep.Xt, prep.cat_cols)
+        self.assertEqual(tcol, 'created_at__ord')
+
+    def test_worker_auto_rejects_temporal_llm_leakage(self):
+        import os, subprocess
+        worker = Path(__file__).resolve().parent.parent / 'ag_worker.py'
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d)
+            rng = np.random.default_rng(11)
+            tr = pd.DataFrame({'a': rng.normal(size=100), 'b': rng.normal(size=100)})
+            te = pd.DataFrame({'a': rng.normal(size=80), 'b': rng.normal(size=80)})
+            tr.to_pickle(dp / 'train.pkl'); te.to_pickle(dp / 'test.pkl')
+            env = {**os.environ, 'AG_CHECK_TEMPORAL_LEAK': '1'}
+            # 1) Leaky code (concat train+test global mean) MUST be rejected!
+            (dp / 'code.py').write_text(
+                'def make_features(train, test):\n'
+                '    m = pd.concat([train["a"], test["a"]]).mean()\n'
+                '    return pd.DataFrame({"z": train["a"] - m}), pd.DataFrame({"z": test["a"] - m})\n',
+                encoding='utf-8',
+            )
+            r_bad = subprocess.run([sys.executable, str(worker), str(dp)], capture_output=True, text=True, env=env)
+            self.assertNotEqual(r_bad.returncode, 0)
+            self.assertIn('temporal leakage detected', r_bad.stderr)
+            # 2) Clean train-only code MUST pass!
+            (dp / 'code.py').write_text(
+                'def make_features(train, test):\n'
+                '    m = train["a"].mean()\n'
+                '    return pd.DataFrame({"z": train["a"] - m}), pd.DataFrame({"z": test["a"] - m})\n',
+                encoding='utf-8',
+            )
+            r_ok = subprocess.run([sys.executable, str(worker), str(dp)], capture_output=True, text=True, env=env)
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+
+    def test_calibrated_nowcast_binary_and_nonneg_bounds(self):
+        from ag_features import detect_time_split, prepare
+        from ag_nowcast import build_nowcast_features
+        rng = np.random.default_rng(61)
+        n_hr = 24 * 35
+        stamps = pd.date_range('2025-01-01 00:00:00', periods=n_hr, freq='h')
+        rows = []
+        for d in range(6):
+            hr = stamps.hour.values
+            storm = ((hr >= 14) & (hr <= 16)).astype(float)
+            rain = np.maximum(0.0, 8.0 * storm + rng.normal(0, 0.2, n_hr))
+            rows.append(pd.DataFrame({'district_id': f'D{d}', 'timestamp': stamps.astype(str), 'rain': rain, 'storm': storm}))
+        panel = pd.concat(rows, ignore_index=True)
+        ev_tr_ts = pd.date_range('2025-01-10 00:30:00', periods=600, freq='45min')
+        ev_te_ts = pd.date_range('2025-02-01 00:30:00', periods=60, freq='1h')
+        tr = pd.DataFrame({'event_id': range(600), 'district_id': [f'D{i%6}' for i in range(600)],
+                           'timestamp': ev_tr_ts.astype(str), 'y': 10.0 + 5.0 * (ev_tr_ts.hour >= 14) + rng.normal(0, 0.5, 600)})
+        te = pd.DataFrame({'event_id': range(600, 660), 'district_id': [f'D{i%6}' for i in range(60)],
+                           'timestamp': ev_te_ts.astype(str)})
+        meta = {}
+        a, b = enrich(tr, te, {'weather': panel}, meta=meta)
+        spec = TaskSpec('', '', id_col='event_id', target='y', task_type='regression', metric='mae')
+        prep = prepare(a, b, spec)
+        tcol = detect_time_split(prep.X, prep.Xt, prep.cat_cols)
+        plan = make_plan(prep.X, prep.y, 'regression', time_col=tcol)
+        nc_tr, nc_te = build_nowcast_features(meta, prep.y, plan, 'regression', n_jobs=2, use_lgb_top=True, max_seconds=90.0)
+        self.assertIsNotNone(nc_te)
+        # Non-negative rain & [0, 1] storm probabilities MUST respect causal bounds!
+        self.assertGreaterEqual(float(nc_te['nc__weather__rain'].min()), 0.0)
+        self.assertGreaterEqual(float(nc_te['nc__weather__storm'].min()), 0.0)
+        self.assertLessEqual(float(nc_te['nc__weather__storm'].max()), 1.0)
+        if 'nc_gb__weather__storm' in nc_te.columns:
+            self.assertGreaterEqual(float(nc_te['nc_gb__weather__storm'].min()), 0.0)
+            self.assertLessEqual(float(nc_te['nc_gb__weather__storm'].max()), 1.0)
+
+    def test_cls_simplex_log_odds_and_rare_class_proba_score(self):
+        from ag_ensemble import blend
+        from ag_metrics import proba_score
+        from ag_models import FitResult
+        rng = np.random.default_rng(73)
+        # Rare class missing from a fold: proba_score MUST NOT crash
+        y_fold = np.array([0, 0, 1, 1, 2, 2])  # class 3 absent out of 4 classes
+        p_fold = np.array([[0.7, 0.1, 0.1, 0.1], [0.6, 0.2, 0.1, 0.1], [0.1, 0.7, 0.1, 0.1],
+                           [0.1, 0.6, 0.2, 0.1], [0.1, 0.1, 0.7, 0.1], [0.1, 0.1, 0.6, 0.2]])
+        self.assertTrue(np.isfinite(proba_score('roc_auc', y_fold, p_fold)))
+        self.assertTrue(np.isfinite(proba_score('average_precision', y_fold, p_fold)))
+        # Continuous classification simplex blend improves logloss over single models
+        n = 300
+        s = rng.normal(size=n)
+        y = (s + rng.normal(0, 0.8, n) > 0).astype(int)
+        p1 = 1 / (1 + np.exp(-(s + rng.normal(0, 0.9, n))))
+        p2 = 1 / (1 + np.exp(-(s + rng.normal(0, 0.9, n))))
+        r1 = FitResult('m1', np.column_stack([1 - p1, p1]), np.full((10, 2), 0.5), 0.5, [], [], None, 1.0)
+        r2 = FitResult('m2', np.column_stack([1 - p2, p2]), np.full((10, 2), 0.5), 0.5, [], [], None, 1.0)
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric='logloss', classes=[0, 1])
+        b = blend([r1, r2], y, np.ones(n, bool), spec)
+        self.assertIsNotNone(b)
+        ll_b = proba_score('logloss', y, b['oof'])
+        self.assertLess(ll_b, min(proba_score('logloss', y, r1.oof), proba_score('logloss', y, r2.oof)))
+
+    def test_zero_mape_hurdle_and_et_object_col_consistency(self):
+        from ag_ensemble import apply_zero_mape_hurdle
+        from ag_metrics import score
+        from ag_models import ModelConfig, fit_et
+        rng = np.random.default_rng(89)
+        n = 400
+        x = rng.normal(size=n)
+        X = pd.DataFrame({'x': x, 'obj': pd.Series(np.where(x > 0, 'pos', 'neg'), dtype=object)})
+        Xt = pd.DataFrame({'x': np.array([-2.0, 2.0] * 15), 'obj': pd.Series(['neg', 'pos'] * 15, dtype=object)})
+        y = np.where(x < -0.3, 0.0, np.exp(1.5 + 0.8 * x))
+        plan = make_plan(X, y, 'regression', n_folds=3)
+        oof = np.maximum(0.5, y + rng.normal(0, 0.5, n))  # never predicts exact 0 -> huge MAPE
+        test_p = np.full(30, 5.0)
+        base_mape = score('mape', 'regression', y, oof)
+        hur = apply_zero_mape_hurdle(X, Xt, y, oof, test_p, plan, plan.oof_mask, n_jobs=1)
+        self.assertIsNotNone(hur)
+        self.assertLess(hur['score'], base_mape * 1e-4)  # massive orders-of-magnitude reduction!
+        # Also verify fit_et maps object columns consistently between train and test
+        y_obj = np.where(X['obj'] == 'pos', 100.0, 10.0)
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        r_et = fit_et(X, y_obj, Xt, plan, spec, ModelConfig(), n_jobs=1, time_limit=30, n_estimators=30)
+        self.assertIsNotNone(r_et)
+        self.assertLess(float(r_et.test[0]), 25.0)  # 'neg' -> ~10
+        self.assertGreater(float(r_et.test[1]), 85.0)  # 'pos' -> ~100
+
+    def test_fast_cls_simplex_and_rank_blend_large(self):
+        import time
+        from ag_ensemble import blend, rank_blend
+        from ag_models import FitResult, FoldPlan
+        rng = np.random.default_rng(101)
+        n = 65_000
+        y = rng.binomial(1, 0.15, size=n)
+        s = rng.normal(size=n) + 0.6 * y
+        p1 = 1 / (1 + np.exp(-(s + rng.normal(0, 1.0, n))))
+        p2 = 1 / (1 + np.exp(-(s + rng.normal(0, 1.0, n))))
+        p3 = 1 / (1 + np.exp(-(s + rng.normal(0, 1.2, n))))
+        mask = np.zeros(n, bool); mask[30_000:] = True
+        plan = FoldPlan(folds=[(np.arange(30_000), np.arange(30_000, 47_500)),
+                               (np.arange(47_500), np.arange(47_500, n))],
+                        mode='refit', oof_mask=mask, time_col='t', desc='time')
+        rs = [FitResult(f'm{i}', np.column_stack([1 - p, p]), np.full((100, 2), 0.5), 0.3, [], [], None, 1.0)
+              for i, p in enumerate((p1, p2, p3), 1)]
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric='average_precision', classes=[0, 1])
+        t0 = time.time()
+        b = blend(rs, y, mask, spec, plan=plan)
+        rb = rank_blend(rs, y, mask, spec, plan=plan)
+        dt = time.time() - t0
+        self.assertIsNotNone(b)
+        self.assertIsNotNone(rb)
+        self.assertLess(dt, 10.0, f'Large rank_blend+blend took {dt:.2f}s (expected <10s)')
+
+    def test_time_cut_policy_preserves_unique_family(self):
+        from ag_metrics import better, direction
+        from ag_models import FitResult
+        from solution import model_family
+        r_main = FitResult('lgb_main', np.zeros(10), np.zeros(5), 2.25, [], [], None, 10.0, config={})
+        r_hub = FitResult('lgb_huber', np.zeros(10), np.zeros(5), 2.20, [], [], None, 10.0, config={'time_cut': True})
+        r_s1 = FitResult('lgb_s1', np.zeros(10), np.zeros(5), 2.35, [], [], None, 10.0, config={'time_cut': True})
+        fams = {}
+        for r in (r_main, r_hub, r_s1):
+            fams.setdefault(model_family(r.name), []).append(r)
+        kept = {}
+        for f, rs in fams.items():
+            uncut = [r for r in rs if not r.config.get('time_cut')]
+            if uncut:
+                best_u = max(uncut, key=lambda r: r.score if direction('mae') == 'max' else -r.score).score
+                rs = [r for r in rs if (not r.config.get('time_cut')) or better(r.score, best_u, 'mae')]
+            kept[f] = [r.name for r in rs]
+        # Unique family lgb_huber (2.20) MUST survive even with time_cut=True; worse lgb_s1 seed MUST be dropped!
+        self.assertEqual(kept['lgb_huber'], ['lgb_huber'])
+        self.assertEqual(kept['lgb'], ['lgb_main'])
+
 
 class Pool5HarnessTests(unittest.TestCase):
     def test_synthetic_generators_deterministic_and_disjoint(self):

@@ -73,8 +73,156 @@ def _simplex_reg_weights(M: np.ndarray, y: np.ndarray, metric: str, init_w=None)
     return (best_w / s) if s > 0 else np.full(k, 1.0 / k)
 
 
-def blend(results, y, mask, spec, max_steps: int = 30, plan=None):
-    """Жадный отбор с возвращением (Caruana) + для регрессии доуточнение на неотрицательном симплексе."""
+def _mix_cls_proba(probs: list[np.ndarray], w: np.ndarray, log_odds: bool = False) -> np.ndarray:
+    if not log_odds:
+        out = sum(float(wi) * p for wi, p in zip(w, probs) if wi > 0)
+        return out
+    eps = 1e-6
+    logits = sum(float(wi) * np.log(np.clip(p, eps, 1.0)) for wi, p in zip(w, probs) if wi > 0)
+    logits = logits - np.max(logits, axis=1, keepdims=True)
+    e = np.exp(np.clip(logits, -40.0, 0.0))
+    return e / np.maximum(e.sum(axis=1, keepdims=True), 1e-12)
+
+
+def _simplex_cls_weights(oofs: list[np.ndarray], y: np.ndarray, metric: str, spec, plan=None, mask=None,
+                         init_w=None, log_odds: bool = False) -> tuple[np.ndarray, float]:
+    """Оптимизация весов классификации на неотрицательном симплексе (линейные вероятности или log-odds).
+    Предварительно срезает OOF по mask и кеширует log(p), для k=2 делает точный 1D-поиск,
+    а для крупных RANK_METRICS (>12k) оптимизирует на стратифицированной подвыборке с проверкой на полном OOF."""
+    from scipy.optimize import minimize
+
+    k = len(oofs)
+    sign = 1.0 if direction(metric) == "max" else -1.0
+    if k == 1:
+        p = _mix_cls_proba(oofs, np.ones(1), log_odds=log_odds)
+        return np.ones(1, dtype=float), sign * _eval(spec, metric, y, p, plan=plan, mask=mask)
+
+    y_arr = np.asarray(y)
+    idx = np.arange(len(y_arr)) if mask is None else np.where(mask)[0]
+    if len(idx) == 0:
+        return np.full(k, 1.0 / k), float("nan")
+
+    pos = {int(g): i for i, g in enumerate(idx)}
+    fold_groups = None
+    if plan is not None and metric in RANK_METRICS and len(getattr(plan, "folds", [])) >= 2:
+        gs = []
+        for _, va in plan.folds:
+            g = np.array([pos[int(v)] for v in va if int(v) in pos], dtype=int)
+            if len(g):
+                gs.append(g)
+        if gs:
+            fold_groups = gs
+
+    y_m = y_arr[idx]
+    eps = 1e-6
+    mats_full = [np.log(np.clip(o[idx], eps, 1.0)) if log_odds else o[idx] for o in oofs]
+
+    def _mix_pre(mats, w):
+        if not log_odds:
+            out = None
+            for wi, m in zip(w, mats):
+                if wi > 0:
+                    out = (wi * m) if out is None else (out + wi * m)
+            return out
+        logits = None
+        for wi, m in zip(w, mats):
+            if wi > 0:
+                logits = (wi * m) if logits is None else (logits + wi * m)
+        logits = logits - np.max(logits, axis=1, keepdims=True)
+        e = np.exp(np.clip(logits, -40.0, 0.0))
+        return e / np.maximum(e.sum(axis=1, keepdims=True), 1e-12)
+
+    def _score_pre(mats, yy, groups, w):
+        p = _mix_pre(mats, w)
+        if groups is not None:
+            vals = [proba_score(metric, yy[g], p[g]) for g in groups]
+            vals = [v for v in vals if np.isfinite(v)]
+            return (sign * float(np.mean(vals))) if vals else float("nan")
+        v = proba_score(metric, yy, p) if metric in PROBA_METRICS else score(metric, spec.task_type, yy, p)
+        return (sign * float(v)) if np.isfinite(v) else float("nan")
+
+    best_w = np.asarray(init_w, dtype=float) if (init_w is not None and len(init_w) == k) else np.full(k, 1.0 / k)
+    best_w = np.clip(best_w, 0.0, None)
+    best_w = best_w / max(best_w.sum(), 1e-12)
+    best_s = _score_pre(mats_full, y_m, fold_groups, best_w)
+
+    # Для 2 моделей 1D-сетка + локальное уточнение даёт глобальный оптимум за <= 30 оценок (<0.3s на 65k строк)
+    if k == 2:
+        best_a = float(best_w[0])
+        for a in np.linspace(0.0, 1.0, 21):
+            s = _score_pre(mats_full, y_m, fold_groups, np.array([a, 1.0 - a]))
+            if np.isfinite(s) and (not np.isfinite(best_s) or s > best_s + 1e-12):
+                best_s, best_a = s, float(a)
+        lo, hi = max(0.0, best_a - 0.05), min(1.0, best_a + 0.05)
+        for a in np.linspace(lo, hi, 11):
+            s = _score_pre(mats_full, y_m, fold_groups, np.array([a, 1.0 - a]))
+            if np.isfinite(s) and (not np.isfinite(best_s) or s > best_s + 1e-12):
+                best_s, best_a = s, float(a)
+        best_w = np.array([best_a, 1.0 - best_a], dtype=float)
+        best_w = np.where(best_w < 1e-3, 0.0, best_w)
+        best_w = best_w / max(best_w.sum(), 1e-12)
+        return best_w, float(_score_pre(mats_full, y_m, fold_groups, best_w))
+
+    big_rank = metric in RANK_METRICS and len(idx) > 12_000
+    opt_mats, opt_y, opt_groups = mats_full, y_m, fold_groups
+    if big_rank:
+        rng = np.random.default_rng(42)
+        if fold_groups is not None:
+            per_g = max(500, 12_000 // len(fold_groups))
+            sub_parts, new_groups = [], []
+            off = 0
+            for g in fold_groups:
+                sg = rng.choice(g, size=min(len(g), per_g), replace=False) if len(g) > per_g else g
+                sub_parts.append(sg)
+                new_groups.append(np.arange(off, off + len(sg), dtype=int))
+                off += len(sg)
+            sub = np.concatenate(sub_parts)
+            opt_groups = new_groups
+        else:
+            sub = rng.choice(len(idx), size=12_000, replace=False)
+            opt_groups = None
+        opt_mats = [m[sub] for m in mats_full]
+        opt_y = y_m[sub]
+
+    def _softmax(z):
+        z = np.asarray(z, dtype=float)
+        z = z - np.max(z)
+        e = np.exp(np.clip(z, -40.0, 0.0))
+        return e / np.sum(e)
+
+    def _loss(z):
+        s = _score_pre(opt_mats, opt_y, opt_groups, _softmax(z))
+        return (-s) if np.isfinite(s) else 1e9
+
+    starts = [np.log(np.clip(best_w, 1e-3, 1.0))]
+    if not big_rank:
+        starts.append(np.zeros(k))
+    maxfev = 120 if big_rank else (200 if len(idx) > 20_000 else 350)
+    cand_ws = []
+    for z0 in starts:
+        try:
+            res = minimize(_loss, z0, method="Powell", options={"maxfev": maxfev})
+            if np.isfinite(res.fun):
+                cand_ws.append(_softmax(res.x))
+        except Exception:
+            continue
+    for cw in cand_ws:
+        cw = np.where(cw < 1e-3, 0.0, cw)
+        sw = cw.sum()
+        if sw <= 0:
+            continue
+        cw = cw / sw
+        s_full = _score_pre(mats_full, y_m, fold_groups, cw)
+        if np.isfinite(s_full) and (not np.isfinite(best_s) or s_full > best_s + 1e-12):
+            best_s, best_w = s_full, cw
+    best_w = np.where(best_w < 1e-3, 0.0, best_w)
+    s = best_w.sum()
+    best_w = (best_w / s) if s > 0 else np.full(k, 1.0 / k)
+    return best_w, float(_score_pre(mats_full, y_m, fold_groups, best_w))
+
+
+def blend(results, y, mask, spec, max_steps: int = 30, plan=None, allow_log_odds: bool = True):
+    """Жадный отбор с возвращением (Caruana) + доуточнение на неотрицательном симплексе (и log-odds для классификации)."""
     usable = [r for r in results if r is not None and r.test is not None
               and not np.isnan(r.oof[mask]).any() and np.isfinite(r.score)]
     if not usable:
@@ -101,14 +249,28 @@ def blend(results, y, mask, spec, max_steps: int = 30, plan=None):
         counts[best_j] += 1
         cur_full, cur_s = best_p, best_s
     w = counts / counts.sum()
+    use_log_odds = False
     if spec.task_type == "regression" and len(usable) >= 2:
         M = np.column_stack([np.asarray(r.oof[mask], dtype=float).reshape(-1) for r in usable])
         w_sx = _simplex_reg_weights(M, np.asarray(y)[mask], metric, init_w=w)
         s_sx = sign * score(metric, "regression", np.asarray(y)[mask], M @ w_sx)
         if s_sx > cur_s + 1e-12:
             w = w_sx
-    oof = sum(wi * r.oof for wi, r in zip(w, usable) if wi > 0)
-    test = sum(wi * r.test for wi, r in zip(w, usable) if wi > 0)
+    elif spec.task_type != "regression" and len(usable) >= 2 and len(usable) <= 12:
+        oofs = [np.asarray(r.oof, dtype=float) for r in usable]
+        w_lin, s_lin = _simplex_cls_weights(oofs, y, metric, spec, plan=use_plan, mask=mask, init_w=w, log_odds=False)
+        if np.isfinite(s_lin) and s_lin > cur_s + 1e-12:
+            w, cur_s, use_log_odds = w_lin, s_lin, False
+        if allow_log_odds:
+            w_lo, s_lo = _simplex_cls_weights(oofs, y, metric, spec, plan=use_plan, mask=mask, init_w=w, log_odds=True)
+            if np.isfinite(s_lo) and s_lo > cur_s + 1e-12:
+                w, cur_s, use_log_odds = w_lo, s_lo, True
+    if spec.task_type == "regression":
+        oof = sum(wi * r.oof for wi, r in zip(w, usable) if wi > 0)
+        test = sum(wi * r.test for wi, r in zip(w, usable) if wi > 0)
+    else:
+        oof = _mix_cls_proba([np.asarray(r.oof, dtype=float) for r in usable], w, log_odds=use_log_odds)
+        test = _mix_cls_proba([np.asarray(r.test, dtype=float) for r in usable], w, log_odds=use_log_odds)
     weights = {r.name: round(float(wi), 3) for wi, r in zip(w, usable) if wi >= 0.005}
     return {"weights": weights, "oof": oof, "test": test,
             "score": score(spec.metric, spec.task_type, y[mask], oof[mask]) if spec.task_type == "regression"
@@ -148,7 +310,7 @@ def rank_blend(results, y, mask, spec, max_steps: int = 30, plan=None):
         ro, rt = to_rank_proba(r.oof, r.test)
         ranked.append(type(r)(name=r.name, oof=ro, test=rt, score=r.score, fold_scores=r.fold_scores,
                               iters=r.iters, importance=r.importance, seconds=r.seconds, config=r.config))
-    return blend(ranked, y, mask, spec, max_steps=max_steps, plan=plan)
+    return blend(ranked, y, mask, spec, max_steps=max_steps, plan=plan, allow_log_odds=False)
 
 
 def stack_blend(results, y, mask, spec, plan=None):
@@ -298,10 +460,11 @@ class LabelShift:
         self.merge_confusion = merge_confusion
         self.active = False
         self.info = {}
+        self._col_maps = {}
         idx = np.where(self.mask)[0]
         if len(idx) > 200_000:
             idx = np.sort(np.random.default_rng(seed).choice(idx, 200_000, replace=False))
-        A = self._numeric(X.iloc[idx])
+        A = self._numeric(X.iloc[idx], fit=True)
         trees, seen = [], set()
         for leaves in self.LEAVES:
             for frac in self.LEAF_FRACS:
@@ -317,18 +480,16 @@ class LabelShift:
         lt, le = self._leaves(trees, X), self._leaves(trees, Xt)
         self.splits = [(lt[:, i], le[:, i]) for i in range(len(trees))]
 
-    @classmethod
-    def _leaves(cls, trees, df, chunk: int = 250_000):
+    def _leaves(self, trees, df, chunk: int = 250_000):
         """Номера листьев всех деревьев для строк df; порциями, чтобы не держать всю таблицу числами."""
         out = np.zeros((len(df), len(trees)), np.int32)
         for i in range(0, len(df), chunk):
-            a = cls._numeric(df.iloc[i:i + chunk])
+            a = self._numeric(df.iloc[i:i + chunk], fit=False)
             for j, t in enumerate(trees):
                 out[i:i + chunk, j] = t.apply(a)
         return out
 
-    @staticmethod
-    def _numeric(df):
+    def _numeric(self, df, fit: bool = False):
         cols = []
         for c in df.columns:
             s = df[c]
@@ -337,7 +498,13 @@ class LabelShift:
             elif pd.api.types.is_numeric_dtype(s):
                 cols.append(s.to_numpy(np.float32, na_value=np.nan))
             else:
-                cols.append(pd.factorize(s)[0].astype(np.float32))
+                ss = s.astype("string")
+                if fit or c not in self._col_maps:
+                    codes, uniques = pd.factorize(ss, sort=False)
+                    self._col_maps[c] = {v: i for i, v in enumerate(uniques)}
+                    cols.append(codes.astype(np.float32))
+                else:
+                    cols.append(ss.map(self._col_maps[c]).fillna(-1.0).to_numpy(np.float32))
         a = np.column_stack(cols) if cols else np.zeros((len(df), 1), np.float32)
         a = np.where(np.isfinite(a), a, -1e9)
         return a.astype(np.float32)
@@ -621,6 +788,66 @@ def decide_on_test(spec, y, mask, oof, test_adj, decision, shift: LabelShift | N
         f"стало {np.bincount(new, minlength=k).tolist()}")
     return {**decision, "weights": w.tolist(), "rule": "test", "expected_test": round(exp_new, 5),
             "expected_test_oof_rule": round(exp_old, 5)}, tc
+
+
+def apply_zero_mape_hurdle(X: pd.DataFrame, Xt: pd.DataFrame, y: np.ndarray, oof: np.ndarray, test: np.ndarray,
+                           plan, mask: np.ndarray, n_jobs: int = 4):
+    """Zero-aware MAPE hurdle: predicts P(y == 0 | x) strictly OOF and zeroes predictions above the optimal OOF threshold.
+    Prevents 1e8-1e9 MAPE blowups on targets containing exact zeros (e.g. sales/claims)."""
+    import lightgbm as lgb
+    from ag_models import _sanitize_tree_frames, refit_rounds
+
+    y = np.asarray(y, dtype=float)
+    z = (np.abs(y) < 1e-12).astype(int)
+    if z.mean() < 0.01 or z.mean() > 0.99:
+        return None
+    base_s = score("mape", "regression", y[mask], oof[mask])
+    if not np.isfinite(base_s):
+        return None
+    X_s, Xt_s = _sanitize_tree_frames(X, Xt)
+    params = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_child_samples=30,
+                  feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1, verbose=-1,
+                  num_threads=max(1, min(8, n_jobs)), seed=42)
+    pz_oof = np.full(len(y), np.nan, dtype=float)
+    pz_test_parts = []
+    iters = []
+    for tr, va in plan.folds:
+        if len(np.unique(z[tr])) < 2:
+            return None
+        dtr = lgb.Dataset(X_s.iloc[tr], z[tr], free_raw_data=True)
+        dva = lgb.Dataset(X_s.iloc[va], z[va], reference=dtr)
+        m = lgb.train(params, dtr, 600, valid_sets=[dva], callbacks=[lgb.early_stopping(40, verbose=False)])
+        bi = m.best_iteration or m.current_iteration()
+        iters.append(bi)
+        pz_oof[va] = m.predict(X_s.iloc[va], num_iteration=bi)
+        if plan.mode == "cv":
+            pz_test_parts.append(m.predict(Xt_s, num_iteration=bi))
+    if plan.mode == "refit":
+        n_round = refit_rounds(iters, plan, len(X_s))
+        m = lgb.train(params, lgb.Dataset(X_s, z, free_raw_data=True), n_round)
+        pz_test = m.predict(Xt_s)
+    else:
+        pz_test = sum(pz_test_parts) / len(pz_test_parts)
+    m_ok = mask & np.isfinite(pz_oof) & np.isfinite(oof)
+    if not m_ok.any():
+        return None
+    grid = np.unique(np.concatenate([
+        np.array([1e-4, 1e-3, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7]),
+        np.quantile(pz_oof[m_ok], np.linspace(0.01, 0.99, 60)),
+    ]))
+    best_thr, best_s = None, base_s
+    y_m, o_m, p_m = y[m_ok], oof[m_ok], pz_oof[m_ok]
+    for thr in grid:
+        cand = np.where(p_m >= thr, 0.0, o_m)
+        s = score("mape", "regression", y_m, cand)
+        if np.isfinite(s) and s < best_s - 1e-9:
+            best_s, best_thr = s, float(thr)
+    if best_thr is None:
+        return None
+    new_oof = np.where(pz_oof >= best_thr, 0.0, oof)
+    new_test = np.where(pz_test >= best_thr, 0.0, test)
+    log(f"zero-MAPE hurdle: порог P(y=0)>={best_thr:.4f} улучшил OOF MAPE {base_s:.4g} -> {best_s:.4g}")
+    return {"oof": new_oof, "test": new_test, "score": best_s, "threshold": best_thr}
 
 
 def finalize_classification(spec, y, mask, oof, test, class_weight_power: float, prior_shift: float = 0.0,

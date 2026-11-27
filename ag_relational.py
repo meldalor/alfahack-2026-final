@@ -7,14 +7,50 @@ from ag_utils import log, log_exc
 
 TIME_NAMES = {'timestamp', 'date', 'datetime', 'time', 'event_time', 'created_at', 'updated_at', 'recorded_at', 'ts', 'dt'}
 POST_FACTUM_RE = re.compile(r'(?:^|_)(?:actual|final|realized|outcome|result|resolved)(?:_|$)', re.I)
+_DMY_DOT_RE = re.compile(r'^\s*\d{1,2}\.\d{1,2}\.\d{2,4}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\s*$')
+
+
+def _unix_epoch_unit(series: pd.Series) -> str | None:
+    if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+        return None
+    s = pd.to_numeric(series, errors='coerce').dropna()
+    if len(s) < 3 or s.nunique() < 3:
+        return None
+    vals = s.to_numpy(dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 3:
+        return None
+    lo, hi = float(np.quantile(vals, 0.05)), float(np.quantile(vals, 0.95))
+    if 9e8 <= lo and hi <= 2.6e9:
+        return 's'
+    if 9e11 <= lo and hi <= 2.6e12:
+        return 'ms'
+    return None
+
+
+def _parse_time_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors='coerce', utc=True)
+    unit = _unix_epoch_unit(series)
+    if unit is not None:
+        return pd.to_datetime(pd.to_numeric(series, errors='coerce'), unit=unit, errors='coerce', utc=True)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        sample = series.dropna().astype(str).head(100)
+        dayfirst = bool(len(sample) and sample.map(lambda v: bool(_DMY_DOT_RE.match(v))).mean() > 0.7)
+        parsed = pd.to_datetime(series, errors='coerce', utc=True, dayfirst=dayfirst)
+        if parsed.notna().mean() < 0.5 and series.notna().any():
+            parsed = pd.to_datetime(series, errors='coerce', utc=True, format='mixed', dayfirst=dayfirst)
+    return parsed
 
 
 def _is_time_col(name: str, series: pd.Series | None = None) -> bool:
     low = str(name).lower()
     if low.startswith(('start_', 'end_')):
         return False
-    name_ok = (low in TIME_NAMES or low.endswith(('_time', '_timestamp', '_date', '_datetime', '_at', '_ts', '_dt'))
-               or low.startswith(('timestamp_', 'datetime_', 'event_time')))
+    name_ok = (low in TIME_NAMES or low.endswith(('_time', '_timestamp', '_date', '_datetime', '_at', '_ts', '_dt', '_epoch'))
+               or low.startswith(('timestamp_', 'datetime_', 'event_time', 'unix_')))
     if not name_ok:
         return False
     if series is None:
@@ -22,14 +58,11 @@ def _is_time_col(name: str, series: pd.Series | None = None) -> bool:
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
     if pd.api.types.is_numeric_dtype(series):
-        return False
+        return _unix_epoch_unit(series) is not None
     sample = series.dropna().head(200)
     if len(sample) < 3:
         return False
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        parsed = pd.to_datetime(sample, errors='coerce', utc=True)
+    parsed = _parse_time_series(sample)
     return float(parsed.notna().mean()) >= 0.9
 
 
@@ -92,8 +125,8 @@ def _temporal_join(left, right, keys, marker, panels_out=None, table_name=None):
     tc = times[0]
     groups = [c for c in keys if c != tc]
     left, right = _align_key_dtypes(left, right, groups)
-    rt = pd.to_datetime(right[tc], errors='coerce', utc=True)
-    lt = pd.to_datetime(left[tc], errors='coerce', utc=True)
+    rt = _parse_time_series(right[tc])
+    lt = _parse_time_series(left[tc])
     if rt.notna().mean() < .99 or lt.notna().mean() < .9:
         return None
     # Require a stable measurement cadence. Never carry stale observations over outages.
@@ -241,9 +274,9 @@ def _interval_join(left, dim, name, targets):
             groups.append(c)
     if not groups or len(dim) > 50_000:
         return None
-    lt = pd.to_datetime(left[ltc], errors='coerce', utc=True)
-    st = pd.to_datetime(dim[sc], errors='coerce', utc=True)
-    et = pd.to_datetime(dim[ec], errors='coerce', utc=True)
+    lt = _parse_time_series(left[ltc])
+    st = _parse_time_series(dim[sc])
+    et = _parse_time_series(dim[ec])
     if lt.notna().mean() < 0.9 or st.notna().mean() < 0.9 or et.notna().mean() < 0.9:
         return None
     a = left[groups].copy(); a['__t__'] = lt; a['__row__'] = np.arange(len(left))
@@ -314,8 +347,8 @@ def _aggregate_child(left, dim, name, targets):
         if len(d_times) != 1 or len(l_times) != 1:
             return None  # Timed child table without matching event clock: skip to prevent future leakage.
         dtc, ltc = d_times[0], l_times[0]
-        dt = pd.to_datetime(dim_al[dtc], errors='coerce', utc=True)
-        lt = pd.to_datetime(left[ltc], errors='coerce', utc=True)
+        dt = _parse_time_series(dim_al[dtc])
+        lt = _parse_time_series(left[ltc])
         if dt.notna().mean() < 0.9 or lt.notna().mean() < 0.9:
             return None
         b = dim_al[[best_key] + num_cols].copy()
@@ -354,9 +387,71 @@ def _aggregate_child(left, dim, name, targets):
         out[f'{name}__hist_recency_days'] = rec_days.astype('float32')
         out[f'{name}__hist_span_days'] = span_days.astype('float32')
         out[f'{name}__hist_rate_per_day'] = (out[f'{name}__hist_count'] / np.maximum(span_days.fillna(0.0), 1.0)).astype('float32')
+        win_cols = []
+        # Fast O(N log N) strictly-causal sliding window counts/sums (1d, 7d, 30d, strictly < t) via searchsorted
+        try:
+            bk_str = b[best_key].astype('string')
+            lk_str = left_al[best_key].astype('string')
+            b_codes, uniques = pd.factorize(bk_str, sort=False)
+            umap = {v: i for i, v in enumerate(uniques)}
+            l_codes = lk_str.map(umap).fillna(-1).astype(np.int64).to_numpy()
+            b_ns = b['__t__'].astype('int64').to_numpy()
+            l_ns = lt.astype('int64').to_numpy()
+            v_np = valid.to_numpy()
+            t_min_ns = int(min(b_ns.min(), l_ns[v_np].min())) if v_np.any() else int(b_ns.min())
+            b_sec = np.floor((b_ns - t_min_ns) / 1e9).astype(np.int64)
+            l_sec = np.floor((l_ns - t_min_ns) / 1e9).astype(np.int64)
+            max_sec = int(max(b_sec.max(), l_sec[v_np].max() if v_np.any() else 0))
+            span_pad = max_sec + 2 * 30 * 86400 + 100_000
+            b_key = (b_codes.astype(np.int64) + 1) * span_pad + b_sec
+            b_ord = np.argsort(b_key, kind='mergesort')
+            bk_s = b_key[b_ord]
+            ok_q = v_np & (l_codes >= 0)
+            q_idx = np.flatnonzero(ok_q)
+            q_base = (l_codes[q_idx] + 1) * span_pad
+            q_key = q_base + l_sec[q_idx]
+            hi = np.searchsorted(bk_s, q_key, side='left')
+            g_lo = np.searchsorted(bk_s, q_base, side='left')
+            top_wcols = num_cols[:2]
+            csums = {}
+            for wc in top_wcols:
+                vals_w = b[wc].to_numpy(dtype=np.float64)[b_ord]
+                vals_w = np.where(np.isfinite(vals_w), vals_w, 0.0)
+                csums[wc] = np.concatenate([[0.0], np.cumsum(vals_w)])
+            w_cnts = {}
+            for tag, w_sec in (('1d', 86400), ('7d', 7 * 86400), ('30d', 30 * 86400)):
+                lo_w = np.maximum(np.searchsorted(bk_s, q_key - w_sec, side='left'), g_lo)
+                cnt_w = (hi - lo_w).astype(np.float32)
+                arr_c = np.zeros(len(left), dtype=np.float32)
+                arr_c[q_idx] = cnt_w
+                cname = f'{name}__hist_cnt_{tag}'
+                out[cname] = arr_c
+                win_cols.append(cname)
+                w_cnts[tag] = arr_c
+                if tag in ('7d', '30d'):
+                    for wc in top_wcols:
+                        sw = (csums[wc][hi] - csums[wc][lo_w]).astype(np.float32)
+                        arr_s = np.zeros(len(left), dtype=np.float32)
+                        arr_s[q_idx] = sw
+                        sname = f'{name}__{wc}__hist_sum_{tag}'
+                        out[sname] = arr_s
+                        win_cols.append(sname)
+                        if tag == '7d':
+                            arr_m = np.full(len(left), np.nan, dtype=np.float32)
+                            pos = cnt_w > 0
+                            if pos.any():
+                                arr_m[q_idx[pos]] = sw[pos] / cnt_w[pos]
+                            mname = f'{name}__{wc}__hist_mean_7d'
+                            out[mname] = arr_m
+                            win_cols.append(mname)
+            rname = f'{name}__hist_ratio_7d_30d'
+            out[rname] = (w_cnts['7d'] / (w_cnts['30d'] + 1.0)).astype('float32')
+            win_cols.append(rname)
+        except Exception:
+            log_exc(f'windowed causal RFM {name}')
         feat_cols = [c for c in pref.columns if c not in (best_key, '__t__', '__first_t__', '__last_t__')] + [
             f'{name}__hist_recency_days', f'{name}__hist_span_days', f'{name}__hist_rate_per_day'
-        ]
+        ] + win_cols
         out[f'{name}__hist_count'] = out[f'{name}__hist_count'].fillna(0).astype('float32')
         if (out[f'{name}__hist_count'] > 0).mean() == 0:
             return None
@@ -442,6 +537,78 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
     def _rec(msg):
         if isinstance(report, list):
             report.append(msg)
+    # 0) Explicit PostgreSQL FOREIGN KEY joins (handles arbitrary column names and multi-role FKs like sender/receiver)
+    fks = meta.get('foreign_keys', []) if isinstance(meta, dict) else []
+    if fks:
+        dst_counts = {}
+        for fk in fks:
+            dst_t = fk.get('dst_table')
+            if dst_t in tables and dst_t not in skip:
+                dst_counts[dst_t] = dst_counts.get(dst_t, 0) + 1
+        applied_fks = set()
+        fk_joined_dsts = set()
+        for _ in range(3):
+            fk_prog = False
+            for fk in fks:
+                src_c = fk.get('src_col')
+                dst_t = fk.get('dst_table')
+                dst_c = fk.get('dst_col')
+                sig = (src_c, dst_t, dst_c)
+                if sig in applied_fks or dst_t not in tables or dst_t in skip:
+                    continue
+                if src_c not in combined.columns or src_c in targets or dst_c not in tables[dst_t].columns:
+                    continue
+                try:
+                    dim = tables[dst_t]
+                    # Skip interval tables unless referencing their own PK (handled cleanly below)
+                    _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                    _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                    if len(_st_c) == 1 and len(_en_c) == 1 and dim[dst_c].duplicated().any():
+                        continue
+                    dim_r = dim.rename(columns={dst_c: src_c}) if dst_c != src_c else dim
+                    keys, dim_clean, excluded = _keys(dim_r, [src_c])
+                    if not keys:
+                        continue
+                    multi_role = dst_counts.get(dst_t, 1) > 1
+                    role_tag = re.sub(r'_id$', '', str(src_c), flags=re.I) if multi_role else ''
+                    pfx = f'{role_tag}__{dst_t}' if (multi_role and role_tag and role_tag.lower() != dst_t.lower()) else dst_t
+                    rename = {}
+                    for c in dim_clean:
+                        if c in keys or c in targets or POST_FACTUM_RE.search(str(c)):
+                            continue
+                        new_c = c if (not multi_role and c not in combined and c.endswith('_id')) else f'{pfx}__{c}'
+                        if new_c not in combined.columns:
+                            rename[c] = new_c
+                    if not rename:
+                        applied_fks.add(sig)
+                        continue
+                    right = dim_clean[keys + list(rename)].rename(columns=rename)
+                    marker = f'{pfx}__matched'
+                    if marker in combined.columns:
+                        marker = f'{pfx}__{src_c}__matched'
+                    right[marker] = 1.0
+                    before = len(combined)
+                    left_m, right_m = _align_key_dtypes(combined, right, keys)
+                    candidate = left_m.merge(right_m, on=keys, how='left', sort=False, validate='many_to_one')
+                    for k in keys:
+                        candidate[k] = combined[k].values
+                    cov = float(candidate[marker].notna().mean())
+                    if cov > 0.0:
+                        combined = candidate
+                        assert len(combined) == before
+                        combined[marker] = combined[marker].fillna(0)
+                        log(f'join {dst_t} (SQL FK {src_c}->{dst_c}, pfx={pfx}): coverage={cov:.3f}, features={len(rename)}')
+                        _rec(f'table {dst_t} ({len(dim)} rows): SQL FK {src_c}->{dst_c}, cov={cov:.3f}, +{len(rename)} feats')
+                        applied_fks.add(sig)
+                        fk_joined_dsts.add(dst_t)
+                        fk_prog = True
+                except Exception:
+                    log_exc(f'SQL FK join {dst_t}')
+                    applied_fks.add(sig)
+            if not fk_prog:
+                break
+        for dst_t in fk_joined_dsts:
+            remaining.pop(dst_t, None)
     for _ in range(4):
         changed = False
         for name, dim in list(remaining.items()):
@@ -491,7 +658,8 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
                         log(f'join {name}: completed-interval temporal lookup (strictly <= t - {cadence})')
                     elif len(panels) > p_before:
                         del panels[p_before:]
-                if candidate[marker].notna().mean() == 0:
+                has_time_key = any(_is_time_col(k, dim_clean[k]) for k in keys if k in dim_clean.columns)
+                if candidate[marker].notna().mean() == 0 or (has_time_key and mode_tag == 'many-to-one' and coverage < 0.5):
                     iv = _interval_join(combined, dim_clean, name, targets)
                     if iv is not None:
                         combined = pd.concat([combined, iv], axis=1)
@@ -552,8 +720,8 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
         event_time = next((p.get('time_col') for p in panels if p.get('time_col') in combined.columns), None)
         meta['event_time'] = event_time
         if event_time is not None:
-            meta['train_times'] = pd.to_datetime(combined[event_time].iloc[:n], errors='coerce', utc=True).reset_index(drop=True)
-            meta['test_times'] = pd.to_datetime(combined[event_time].iloc[n:], errors='coerce', utc=True).reset_index(drop=True)
+            meta['train_times'] = _parse_time_series(combined[event_time].iloc[:n]).reset_index(drop=True)
+            meta['test_times'] = _parse_time_series(combined[event_time].iloc[n:]).reset_index(drop=True)
             gcols_all = sorted({g for p in panels for g in p['groups'] if g in combined.columns})
             if gcols_all:
                 meta['train_groups'] = combined[gcols_all].iloc[:n].reset_index(drop=True)

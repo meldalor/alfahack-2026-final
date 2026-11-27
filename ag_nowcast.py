@@ -342,6 +342,15 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
         test_cutoff = te_min_h if pd.notna(te_min_h) else (tr_slots.max() + cadence)
 
         n_c = len(cols)
+        # Detect binary 0/1 flags strictly on early train history (for calibrated logloss LGBM nowcaster)
+        early_p_m = (h_series < earliest_val).to_numpy()
+        if int(early_p_m.sum()) < 50:
+            early_p_m = (h_series <= h_series.median()).to_numpy()
+        is_bin_col = np.zeros(n_c, dtype=bool)
+        for j, c in enumerate(cols):
+            hd = panel.loc[early_p_m, c].dropna()
+            if len(hd) >= 10 and hd.nunique() == 2 and hd.isin([0, 1, 0.0, 1.0]).mean() >= 0.99:
+                is_bin_col[j] = True
         tr_pred_r = np.full((n_tr, n_c), np.nan, dtype=np.float32)
         te_pred_r = np.full((n_te, n_c), np.nan, dtype=np.float32)
         tr_prof_out = np.full((n_tr, n_c), np.nan, dtype=np.float32)
@@ -373,7 +382,16 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
             tr_pos_all = np.flatnonzero(p_tr_mask)
             tr_pos_r = _recent_chrono_pos(tr_pos_all, h_ns, 150_000)
             Z_tr = Z_vals[tr_pos_r]
-            Y_tr = Y_vals[tr_pos_r] - prof_all[tr_pos_r]
+            Y_raw_tr = Y_vals[tr_pos_r]
+            # Strictly causal domain bounds from past train rows (eliminates impossible negative rainfall/probs)
+            with np.errstate(all="ignore"):
+                y_lo_tr = np.nanmin(Y_raw_tr, axis=0)
+                y_hi_tr = np.nanmax(Y_raw_tr, axis=0)
+            span_tr = np.where(np.isfinite(y_hi_tr - y_lo_tr), np.maximum(y_hi_tr - y_lo_tr, 1e-3), 1.0)
+            clip_lo = np.where(is_bin_col, 0.0, np.where(y_lo_tr >= 0.0, 0.0, y_lo_tr - 0.15 * span_tr)).astype(np.float32)
+            clip_hi = np.where(is_bin_col, 1.0, y_hi_tr + 0.15 * span_tr).astype(np.float32)
+
+            Y_tr = Y_raw_tr - prof_all[tr_pos_r]
             col_fill = np.nanmean(Z_tr, axis=0)
             col_fill = np.where(np.isfinite(col_fill), col_fill, 0.0).astype(np.float32)
             Z_tr_f = np.where(np.isfinite(Z_tr), Z_tr, col_fill[None, :])
@@ -405,9 +423,10 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                 Z_ev_f = np.where(np.isfinite(Z_ev), Z_ev, col_fill[None, :])
                 Z_ev_s = ((Z_ev_f - mu) / sd).astype(np.float64)
                 pred_res = (Z_ev_s @ W + y_bias.astype(np.float64)).astype(np.float32)
-            out_r[ok_rows] = prof_all[ev_pidx] + pred_res
+            raw_pred_r = prof_all[ev_pidx] + pred_res
+            out_r[ok_rows] = np.clip(raw_pred_r, clip_lo[None, :], clip_hi[None, :]).astype(np.float32)
 
-            # 3) Нелинейный LightGBM nowcaster для топ-K ключевых сенсорных колонок по недавним слотам ВСЕХ групп
+            # 3) Нелинейный LightGBM nowcaster: binary logloss для 0/1 флагов и L2-остатки для непрерывных сенсоров
             if lgb_state["enabled"] and out_g is not None:
                 if not is_test and (time.time() - t0 > max_seconds * 0.95):
                     lgb_state["enabled"] = False
@@ -433,13 +452,27 @@ def build_nowcast_features(rel_meta: dict, y_train: np.ndarray, plan, task_type:
                     "seed": 42,
                 }
                 for j, ci in enumerate(top_idx):
-                    yj = Y_vals[tr_pos, ci] - prof_all[tr_pos, ci]
-                    ok_y = np.isfinite(yj)
-                    if ok_y.sum() < 500:
-                        continue
-                    ds = lgb.Dataset(Z_g_tr[ok_y], yj[ok_y], free_raw_data=True)
-                    m_g = lgb.train(params_g, ds, num_boost_round=55)
-                    out_g[ok_rows, j] = prof_all[ev_pidx, ci] + m_g.predict(Z_g_ev).astype(np.float32)
+                    if is_bin_col[ci]:
+                        yb = Y_vals[tr_pos, ci]
+                        ok_y = np.isfinite(yb)
+                        if ok_y.sum() < 500:
+                            continue
+                        yb_ok = (yb[ok_y] >= 0.5).astype(np.float32)
+                        if yb_ok.min() == yb_ok.max():
+                            out_g[ok_rows, j] = float(yb_ok[0])
+                            continue
+                        ds = lgb.Dataset(Z_g_tr[ok_y], yb_ok, free_raw_data=True)
+                        m_g = lgb.train({**params_g, "objective": "binary"}, ds, num_boost_round=55)
+                        out_g[ok_rows, j] = np.clip(m_g.predict(Z_g_ev), 0.0, 1.0).astype(np.float32)
+                    else:
+                        yj = Y_vals[tr_pos, ci] - prof_all[tr_pos, ci]
+                        ok_y = np.isfinite(yj)
+                        if ok_y.sum() < 500:
+                            continue
+                        ds = lgb.Dataset(Z_g_tr[ok_y], yj[ok_y], free_raw_data=True)
+                        m_g = lgb.train(params_g, ds, num_boost_round=55)
+                        pg = prof_all[ev_pidx, ci] + m_g.predict(Z_g_ev).astype(np.float32)
+                        out_g[ok_rows, j] = np.clip(pg, clip_lo[ci], clip_hi[ci]).astype(np.float32)
 
         for bi, start_ts in enumerate(cuts):
             end_ts = cuts[bi + 1] if bi + 1 < len(cuts) else None

@@ -10,6 +10,29 @@ from pathlib import Path
 import pandas as pd
 
 
+def _convert_pg_booleans(df: pd.DataFrame, bool_cols: list[str]) -> pd.DataFrame:
+    """PostgreSQL COPY CSV exports boolean as literal 't'/'f' strings; map them to clean numeric 1.0/0.0."""
+    for c in bool_cols:
+        if c not in df.columns or pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_bool_dtype(df[c]):
+            continue
+        s = df[c].astype("string").str.strip().str.lower()
+        df[c] = s.map({"t": 1.0, "true": 1.0, "1": 1.0, "f": 0.0, "false": 0.0, "0": 0.0}).astype("float32")
+    return df
+
+
+_FK_SQL = (
+    "SELECT tc.table_schema AS src_schema, tc.table_name AS src_table, kcu.column_name AS src_col, "
+    "ccu.table_schema AS dst_schema, ccu.table_name AS dst_table, ccu.column_name AS dst_col "
+    "FROM information_schema.table_constraints tc "
+    "JOIN information_schema.key_column_usage kcu "
+    "  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+    "JOIN information_schema.constraint_column_usage ccu "
+    "  ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema "
+    "WHERE tc.constraint_type = 'FOREIGN KEY' "
+    "  AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')"
+)
+
+
 class _PsycopgDatabase:
     def __init__(self):
         import psycopg
@@ -35,6 +58,13 @@ class _PsycopgDatabase:
             rows = cur.fetchall()
             return pd.DataFrame(rows, columns=cols)
 
+    def foreign_keys(self):
+        try:
+            df = self.query(_FK_SQL)
+            return df.to_dict("records") if not df.empty else []
+        except Exception:
+            return []
+
     def table(self, schema, name):
         quote = lambda s: '"' + s.replace('"', '""') + '"'
         literal = lambda s: "'" + s.replace("'", "''") + "'"
@@ -44,13 +74,15 @@ class _PsycopgDatabase:
         )
         text_types = {'text', 'character varying', 'character', 'uuid'}
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
+        bool_cols = [r.column_name for r in types.itertuples(index=False) if r.data_type == 'boolean']
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as buf:
             with self.conn.cursor() as cur:
                 with cur.copy(f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER') as copy:
                     for chunk in copy:
                         buf.write(chunk)
             buf.seek(0)
-            return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+            df = pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+        return _convert_pg_booleans(df, bool_cols)
 
 
 class _LibpqDatabase:
@@ -106,6 +138,13 @@ class _LibpqDatabase:
         finally:
             if res: self.lib.PQclear(res)
 
+    def foreign_keys(self):
+        try:
+            df = self.query(_FK_SQL)
+            return df.to_dict("records") if not df.empty else []
+        except Exception:
+            return []
+
     def table(self, schema, name):
         quote = lambda s: '"' + s.replace('"', '""') + '"'
         literal = lambda s: "'" + s.replace("'", "''") + "'"
@@ -113,6 +152,7 @@ class _LibpqDatabase:
                            + literal(schema) + " AND table_name=" + literal(name))
         text_types = {'text', 'character varying', 'character', 'uuid'}
         dtypes = {r.column_name: str for r in types.itertuples(index=False) if r.data_type in text_types}
+        bool_cols = [r.column_name for r in types.itertuples(index=False) if r.data_type == 'boolean']
         res = self.lib.PQexec(self.conn, f'COPY (SELECT * FROM {quote(schema)}.{quote(name)}) TO STDOUT WITH CSV HEADER'.encode())
         ok = res and self.lib.PQresultStatus(res) == 3
         if res: self.lib.PQclear(res)
@@ -133,7 +173,8 @@ class _LibpqDatabase:
                 status = self.lib.PQresultStatus(res); self.lib.PQclear(res)
                 if status != 1: raise RuntimeError('PostgreSQL export did not complete')
             buf.seek(0)
-            return pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+            df = pd.read_csv(buf, low_memory=False, dtype=dtypes, keep_default_na=False, na_values=[""])
+        return _convert_pg_booleans(df, bool_cols)
 
 
 def Database():
@@ -144,7 +185,7 @@ def Database():
         return _LibpqDatabase()
 
 
-def extract(work: Path):
+def extract(work: Path, meta: dict | None = None):
     if not os.environ.get('PGDATABASE'):
         raise RuntimeError('No train/test files; set PGDATABASE and PostgreSQL connection variables')
     db = Database()
@@ -157,11 +198,24 @@ def extract(work: Path):
             "ORDER BY table_schema,table_name"
         )
         tables = {}
+        key_of = {}
         for row in schema.itertuples(index=False):
             key = row.table_name
             if key in tables:
                 key = f"{row.table_schema}__{row.table_name}"
             tables[key] = db.table(row.table_schema, row.table_name)
+            key_of[(row.table_schema, row.table_name)] = key
+        if isinstance(meta, dict):
+            fks = []
+            for r in db.foreign_keys():
+                src_k = key_of.get((r.get("src_schema"), r.get("src_table")), r.get("src_table"))
+                dst_k = key_of.get((r.get("dst_schema"), r.get("dst_table")), r.get("dst_table"))
+                if src_k and dst_k and r.get("src_col") and r.get("dst_col"):
+                    fks.append({
+                        "src_table": src_k, "src_col": r["src_col"],
+                        "dst_table": dst_k, "dst_col": r["dst_col"],
+                    })
+            meta["foreign_keys"] = fks
         return tables
     finally:
         db.close()

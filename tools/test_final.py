@@ -1399,4 +1399,63 @@ class Pool5HarnessTests(unittest.TestCase):
         self.assertEqual(model_family('cat_top_s2'), 'cat_top')
         self.assertEqual(model_family('mlp_dual_s11'), 'mlp_dual')
 
+    def test_causal_cat_nunique_exact_int64_microsecond_no_tie_leak(self):
+        from ag_relational import _causal_window_cat_nunique
+        # Test 200 consecutive microsecond timestamps where float64(ns) rounds UP on ~48% of values
+        base = pd.Timestamp('2025-02-02 12:00:00.100000').value
+        ts = np.array([base + i * 1000 for i in range(200)], dtype=np.int64)
+        codes = np.arange(200, dtype=np.int64)  # 200 distinct entities, each has ONE event at exact tie ts[i]
+        cats = np.zeros(200, dtype=np.int32)
+        wins = [86400 * 1_000_000_000]
+        # Exact tie MUST yield 0.0 for every single microsecond timestamp (strictly < t)
+        out_tie = _causal_window_cat_nunique(codes, ts, cats, codes, ts, wins, q_valid=np.ones(200, bool))
+        self.assertEqual(float(out_tie.max()), 0.0)
+        # 1 nanosecond AFTER child event MUST yield 1.0
+        out_after = _causal_window_cat_nunique(codes, ts, cats, codes, ts + 1, wins, q_valid=np.ones(200, bool))
+        self.assertEqual(float(out_after.min()), 1.0)
+
+    def test_fit_mlp_refit_never_returns_untrained_test_after_time_cut(self):
+        from ag_models import FoldPlan, ModelConfig, fit_mlp
+        rng = np.random.default_rng(19)
+        n = 240
+        t = np.arange(n, dtype=float)
+        x = rng.normal(size=n)
+        y = 10.0 + 4.0 * x + rng.normal(0, 0.2, n)
+        X = pd.DataFrame({'t': t, 'x1': x, 'x2': x * 0.5 + rng.normal(0, 0.1, n)})
+        Xt = pd.DataFrame({'t': np.arange(n, n + 40, dtype=float), 'x1': np.linspace(-2, 2, 40), 'x2': np.linspace(-1, 1, 40)})
+        folds = [(np.arange(0, 140), np.arange(140, 190)), (np.arange(0, 190), np.arange(190, 240))]
+        mask = np.zeros(n, bool); mask[140:] = True
+        plan = FoldPlan(folds=folds, mode='refit', oof_mask=mask, time_col='t', desc='time')
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        # Tiny time_limit forces guard.expired() right after folds; refit MUST extend deadline and learn y ~ 10 + 4*x1
+        r = fit_mlp(X, y, Xt, plan, spec, ModelConfig(), n_jobs=1, time_limit=5.0, seed=0)
+        self.assertIsNotNone(r)
+        self.assertIsNotNone(r.test)
+        corr = float(np.corrcoef(r.test, 10.0 + 4.0 * Xt['x1'].values)[0, 1])
+        self.assertGreater(corr, 0.85)
+
+    def test_worker_poison_filter_int8_and_fallback_trunc(self):
+        import os, subprocess
+        worker = Path(__file__).resolve().parent.parent / 'ag_worker.py'
+        with tempfile.TemporaryDirectory() as d:
+            dp = Path(d)
+            rng = np.random.default_rng(23)
+            tr = pd.DataFrame({'t': np.arange(60, dtype=float), 'flag8': rng.integers(0, 5, 60, dtype=np.int8), 'a': rng.normal(size=60)})
+            te = pd.DataFrame({'t': np.arange(60, 100, dtype=float), 'flag8': rng.integers(0, 5, 40, dtype=np.int8), 'a': rng.normal(size=40)})
+            tr.to_pickle(dp / 'train.pkl'); te.to_pickle(dp / 'test.pkl')
+            # Non-constant leaky feature on narrow int8 + clean row-wise feature
+            (dp / 'code.py').write_text(
+                'def make_features(train, test):\n'
+                '    m = float(test["flag8"].mean())\n'
+                '    ok_tr = pd.DataFrame({"good": train["flag8"].astype(float) * 2.0, "leak": train["a"] + m})\n'
+                '    ok_te = pd.DataFrame({"good": test["flag8"].astype(float) * 2.0, "leak": test["a"] + m})\n'
+                '    return ok_tr, ok_te\n',
+                encoding='utf-8',
+            )
+            res = subprocess.run([sys.executable, str(worker), str(dp), 't'], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn('POISON_DROP: leak', res.stdout)
+            out_tr = pd.read_pickle(dp / 'out_train.pkl')
+            self.assertEqual(list(out_tr.columns), ['good'])
+
 if __name__=='__main__': unittest.main()

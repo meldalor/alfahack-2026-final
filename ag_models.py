@@ -1246,6 +1246,8 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     def fit_one(df_tr, y_tr, w_tr, ep_seed: int):
         pre = build_pre(len(df_tr))
         Z = np.asarray(pre.fit_transform(df_tr), dtype=np.float32)
+        if Z.ndim != 2 or Z.shape[1] == 0:
+            return None
         Z = np.where(np.isfinite(Z), Z, 0.0)
         if prep_mode == "dual":
             Z = np.clip(Z, -6.0, 6.0)
@@ -1288,6 +1290,8 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             return None
         tr_use = _cap_rows(tr, seed + 17 * k)
         bundle = fit_one(X_in.iloc[tr_use], yt[tr_use], w[tr_use], seed + 17 * k)
+        if bundle is None:
+            return None
         oof[va] = pred_one(bundle, X_in.iloc[va])
         iters.append(int(bundle[1].n_iter_))
         if plan.mode == "cv" and Xt_in is not None:
@@ -1299,17 +1303,26 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             return _finish(name, oof, None, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
     if plan.mode == "refit" and Xt_in is not None:
         all_idx = _cap_rows(np.arange(n), seed + 99)
+        # Свежий запас времени на refit: если последний фолд упёрся в guard.deadline, без этого b1 выйдет на 0-й эпохе!
+        guard.deadline = max(guard.deadline, time.time() + max(25.0, 0.40 * time_limit))
         t_ref0 = time.time()
         b1 = fit_one(X_in.iloc[all_idx], yt[all_idx], w[all_idx], seed + 99)
-        p1 = pred_one(b1, Xt_in)
-        # On temporal refit, average a second complementary 90/10 bag if plenty of time remains (covers 100% of train)
-        dt_ref = time.time() - t_ref0
-        if not guard.expired() and (guard.deadline - time.time()) > max(12.0, 1.5 * dt_ref):
-            b2 = fit_one(X_in.iloc[all_idx], yt[all_idx], w[all_idx], seed + 199)
-            p2 = pred_one(b2, Xt_in)
-            test = 0.5 * (p1 + p2)
+        min_ref_ep = max(2, int(0.3 * float(np.median(iters)))) if iters else 2
+        if b1 is None or b1[1].n_iter_ < min_ref_ep:
+            test = None
         else:
-            test = p1
+            p1 = pred_one(b1, Xt_in)
+            # On temporal refit, average a second complementary 90/10 bag if plenty of time remains (covers 100% of train)
+            dt_ref = time.time() - t_ref0
+            if not guard.expired() and (guard.deadline - time.time()) > max(12.0, 1.5 * dt_ref):
+                b2 = fit_one(X_in.iloc[all_idx], yt[all_idx], w[all_idx], seed + 199)
+                if b2 is not None and b2[1].n_iter_ >= min_ref_ep:
+                    p2 = pred_one(b2, Xt_in)
+                    test = 0.5 * (p1 + p2)
+                else:
+                    test = p1
+            else:
+                test = p1
     return _finish(name, oof, test, plan, spec, y, iters, [], t0, cfg, cut=guard.cut)
 
 

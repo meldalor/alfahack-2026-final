@@ -337,27 +337,39 @@ def _interval_join(left, dim, name, targets):
 
 
 def _causal_window_cat_nunique(b_codes: np.ndarray, b_ts_ns: np.ndarray, b_cats: np.ndarray,
-                               q_codes: np.ndarray, q_ts_ns: np.ndarray, windows_ns: list[int]) -> np.ndarray:
-    """Strictly causal (< event_time) distinct category count per entity across rolling windows in O((N+M) log N)."""
+                               q_codes: np.ndarray, q_ts_ns: np.ndarray, windows_ns: list[int],
+                               q_valid: np.ndarray | None = None) -> np.ndarray:
+    """Strictly causal (< event_time) distinct category count per entity across rolling windows in O((N+M) log N).
+    Uses exact int64 nanoseconds to prevent float64 ULP rounding leaks on sub-second (ms/us) timestamps."""
     n_q = len(q_codes)
     n_w = len(windows_ns)
     out = np.zeros((n_q, n_w), dtype=np.float32)
-    valid_q = (q_codes >= 0) & np.isfinite(q_ts_ns)
+    q_ts_arr = np.asarray(q_ts_ns)
+    if q_valid is not None:
+        valid_q = (q_codes >= 0) & np.asarray(q_valid, dtype=bool)
+        q_ts_i64 = q_ts_arr.astype(np.int64, copy=False)
+    elif np.issubdtype(q_ts_arr.dtype, np.integer):
+        valid_q = (q_codes >= 0) & (q_ts_arr != np.iinfo(np.int64).min)
+        q_ts_i64 = q_ts_arr.astype(np.int64, copy=False)
+    else:
+        valid_q = (q_codes >= 0) & np.isfinite(q_ts_arr)
+        q_ts_i64 = np.where(valid_q, q_ts_arr, 0).astype(np.int64)
     if not valid_q.any() or len(b_codes) == 0:
         return out
     q_idx = np.flatnonzero(valid_q)
-    q_ord = np.lexsort((q_ts_ns[q_idx], q_codes[q_idx]))
+    q_ord = np.lexsort((q_ts_i64[q_idx], q_codes[q_idx]))
     q_pos = q_idx[q_ord]
     qs_g = q_codes[q_pos]
-    qs_t = q_ts_ns[q_pos]
+    qs_t = q_ts_i64[q_pos]
     valid_b = (b_codes >= 0) & (b_cats >= 0)
     if not valid_b.any():
         return out
     b_idx = np.flatnonzero(valid_b)
-    b_ord = np.lexsort((b_ts_ns[b_idx], b_codes[b_idx]))
+    b_ts_i64 = np.asarray(b_ts_ns, dtype=np.int64)
+    b_ord = np.lexsort((b_ts_i64[b_idx], b_codes[b_idx]))
     b_pos = b_idx[b_ord]
     bs_g = b_codes[b_pos]
-    bs_t = b_ts_ns[b_pos].tolist()
+    bs_t = b_ts_i64[b_pos].tolist()
     bs_v = b_cats[b_pos].tolist()
 
     uq_g, q_starts = np.unique(qs_g, return_index=True)
@@ -551,14 +563,13 @@ def _aggregate_child(left, dim, name, targets):
                 bname = f'{name}__hist_burst_1h_1d'
                 out[bname] = (w_cnts['1h'] / (w_cnts['1d'] / 24.0 + 0.5)).astype('float32')
                 win_cols.append(bname)
-            # Strictly causal (< t) rolling categorical nunique over 1d / 7d / 30d
+            # Strictly causal (< t) rolling categorical nunique over 1d / 7d / 30d (exact int64 ns, no float64 rounding)
             if use_cats:
-                q_ts_f = np.where(v_np, l_ns.astype(np.float64), np.nan)
                 win_ns = [86400 * 1_000_000_000, 7 * 86400 * 1_000_000_000, 30 * 86400 * 1_000_000_000]
                 for cc in use_cats:
                     b_cat_codes, _ = pd.factorize(b[cc].astype('string'), sort=False)
                     nu_mat = _causal_window_cat_nunique(b_codes.astype(np.int64), b_ns, b_cat_codes.astype(np.int32),
-                                                        l_codes.astype(np.int64), q_ts_f, win_ns)
+                                                        l_codes.astype(np.int64), l_ns, win_ns, q_valid=v_np)
                     for wi, tag in enumerate(('1d', '7d', '30d')):
                         cname = f'{name}__{cc}__hist_nunique_{tag}'
                         out[cname] = nu_mat[:, wi]

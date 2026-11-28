@@ -1033,8 +1033,8 @@ def apply_zero_mape_hurdle(X: pd.DataFrame, Xt: pd.DataFrame, y: np.ndarray, oof
     ]))
     best_thr, best_s = None, base_s
     y_m, o_m, p_m = y[m_ok], oof[m_ok], pz_oof[m_ok]
-    min_pos_oof = max(2, int(0.02 * len(y_m)))
-    min_pos_test = max(2, int(0.01 * len(test)))
+    min_pos_oof = min(len(y_m), max(2, int(0.02 * len(y_m))))
+    min_pos_test = min(len(test), max(2, int(0.01 * len(test))))
     for thr in grid:
         if int((p_m < thr).sum()) < min_pos_oof or int((pz_test < thr).sum()) < min_pos_test:
             continue

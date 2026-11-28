@@ -71,7 +71,16 @@ def _poison_future_test(test: pd.DataFrame, future_mask: np.ndarray, time_col: s
             else:
                 new_v = np.where(np.isfinite(vals), -3.7 * vals + 98765.43, 987654.0)
             if pd.api.types.is_integer_dtype(s.dtype):
-                tp.loc[future_mask, col] = np.round(new_v).astype(s.dtype)
+                ii = np.iinfo(s.dtype)
+                if ii.max <= 65535:
+                    # Narrow int8/uint8/int16: invert safely inside dtype range without overflow
+                    span = max(int(ii.max - ii.min), 1)
+                    raw_i = np.nan_to_num(vals, nan=0.0).astype(np.int64)
+                    sh = max(1, min(17, span // 3))
+                    new_i = ii.min + ((raw_i - ii.min + sh) % (span + 1))
+                    tp.loc[future_mask, col] = new_i.astype(s.dtype)
+                else:
+                    tp.loc[future_mask, col] = np.clip(np.round(new_v), ii.min, ii.max).astype(s.dtype)
             else:
                 tp.loc[future_mask, col] = new_v.astype(s.dtype if pd.api.types.is_float_dtype(s.dtype) else np.float32)
         else:
@@ -121,8 +130,8 @@ def _poison_filter(fn, train: pd.DataFrame, test: pd.DataFrame, a_df: pd.DataFra
     except Exception:
         pass
 
-    # Проверка B: полное удаление будущих строк test (ловит зависимости от len(test), value_counts, квантилей)
-    if first_sec < 15.0:
+    # Проверка B: полное удаление будущих строк test (всегда выполняется при сбое A, чтобы не пропустить утечку)
+    if first_sec < 15.0 or not checks:
         try:
             np.random.seed(0)
             t_early = test.loc[early_mask].copy().reset_index(drop=True)
@@ -133,7 +142,7 @@ def _poison_filter(fn, train: pd.DataFrame, test: pd.DataFrame, a_df: pd.DataFra
             pass
 
     if not checks:
-        return keep, []
+        raise RuntimeError("temporal leakage verification failed in LLM make_features (both poison and trunc checks errored)")
 
     clean, leaky = [], []
     b_early_ref = b_df.loc[early_mask].reset_index(drop=True)

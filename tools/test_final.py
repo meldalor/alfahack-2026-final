@@ -1146,7 +1146,7 @@ class FinalTests(unittest.TestCase):
         xb = rng.normal(size=(8, 6)).astype(np.float32)
         yb = rng.normal(size=(8,)).astype(np.float32)
         wb = np.ones(8, dtype=np.float32)
-        out, cache = net._forward(xb, train=False)
+        out, cache = net._forward(xb, train=True)
         loss0, dout = net._loss_grad(out, yb, wb)
         x_raw, x, c_n1, c_a1, m1, a1d, c_nr, c_ar, ar_g, vr, mr, h1, c_n2, c_a2, m2, a2d = cache
         da2d = dout @ net.p['W3'].T
@@ -1356,5 +1356,44 @@ class Pool5HarnessTests(unittest.TestCase):
             with self.assertRaises(ValueError): audit_zip(archive, root)
             (root / 'solution.py').write_text('token="sk-' + 'x' * 20 + '"\n'); pack()
             with self.assertRaises(ValueError): audit_zip(archive, root)
+
+    def test_entity_key_candidates_excludes_eq_and_caps_key_length(self):
+        from ag_features import entity_key_candidates
+        rng = np.random.default_rng(7)
+        n = 600
+        df = pd.DataFrame({
+            't': np.repeat(np.arange(6), 100).astype(float),
+            'district_id': np.tile([f'D{i:02d}' for i in range(20)], 30),
+            'kind': rng.choice(['A', 'B', 'C', 'D'], n),
+            'sev': rng.choice(['L', 'M', 'H'], n),
+            'aux__sensor_status': rng.choice(['ok', 'warn', 'fail'], n),
+            'aux__a__eq__aux__b': rng.choice([0.0, 1.0], n),
+            'aux__cond': rng.choice(['sun', 'rain', 'snow', 'fog'], n),
+        })
+        for j in range(10):
+            df[f'aux__cat{j}'] = rng.choice(['x', 'y', 'z'], n)
+        cats = [c for c in df.columns if c not in ('t', 'aux__a__eq__aux__b')]
+        keys = entity_key_candidates(df, 't', cats, extra=['district_id'])
+        self.assertTrue(keys)
+        for k in keys:
+            self.assertLessEqual(len(k), 4)
+            self.assertFalse(any('__eq__' in c for c in k))
+            self.assertFalse(any(c.startswith('aux__') for c in k))
+
+    def test_resnet_chunked_predict_exact_and_stratified_es(self):
+        from ag_models import _NumpyTabularResNet
+        rng = np.random.default_rng(11)
+        X = rng.normal(size=(400, 12)).astype(np.float32)
+        y = np.zeros(400, dtype=np.float32)
+        y[:12] = 1.0  # 3% minority positives
+        sw = np.ones(400, dtype=np.float32)
+        net = _NumpyTabularResNet(12, 1, loss_kind='bce', hidden=32, h2=16, seed=3)
+        net.fit(X, y, sw, max_epochs=8, batch_size=64, patience=5, n_jobs=2)
+        p_full = net.predict(X, batch_size=1000)
+        p_chunk = net.predict(X, batch_size=37)
+        np.testing.assert_allclose(p_full, p_chunk, atol=1e-6)
+        out_nt, cache_nt = net._forward(X[:10], train=False)
+        self.assertIsNone(cache_nt)
+        self.assertEqual(out_nt.shape, (10, 1))
 
 if __name__=='__main__': unittest.main()

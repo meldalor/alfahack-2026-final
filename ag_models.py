@@ -956,6 +956,8 @@ class _NumpyTabularResNet:
         else:
             m2, a2d = None, a2
         out = a2d @ p["W3"] + p["b3"] + x @ p["Ws"]
+        if not train:
+            return out, None
         return out, (x_raw, x, c_n1, c_a1, m1, a1d, c_nr, c_ar, ar_g, vr, mr, h1, c_n2, c_a2, m2, a2d)
 
     def _loss_grad(self, out: np.ndarray, y: np.ndarray, sw: np.ndarray):
@@ -999,11 +1001,27 @@ class _NumpyTabularResNet:
             ctx = nullcontext()
 
         n = len(X)
-        idx = self.rng.permutation(n)
         n_va = max(32, min(int(0.1 * n), 5000))
         if n < 160:
             n_va = max(16, int(0.15 * n))
-        va_i, tr_i = idx[:n_va], idx[n_va:]
+        if self.loss_kind in ("bce", "ce"):
+            yi = y.astype(np.int64)
+            va_parts, tr_parts = [], []
+            frac_va = n_va / max(float(n), 1.0)
+            for cls in np.unique(yi):
+                ci = np.flatnonzero(yi == cls)
+                self.rng.shuffle(ci)
+                kv = max(1, min(len(ci) - 1, int(round(len(ci) * frac_va)))) if len(ci) >= 2 else 0
+                va_parts.append(ci[:kv])
+                tr_parts.append(ci[kv:])
+            va_i = np.concatenate(va_parts) if va_parts else np.array([], dtype=np.int64)
+            tr_i = np.concatenate(tr_parts) if tr_parts else np.arange(n, dtype=np.int64)
+            if len(va_i) < 8 or len(tr_i) < 16:
+                idx = self.rng.permutation(n)
+                va_i, tr_i = idx[:n_va], idx[n_va:]
+        else:
+            idx = self.rng.permutation(n)
+            va_i, tr_i = idx[:n_va], idx[n_va:]
         Xtr, ytr, wtr = X[tr_i], y[tr_i], sw[tr_i]
         Xva, yva, wva = X[va_i], y[va_i], sw[va_i]
         best_val = float("inf")
@@ -1108,8 +1126,15 @@ class _NumpyTabularResNet:
                         self.p = top_ckpts[0][1]
         return self
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        out, _ = self._forward(X, train=False)
+    def predict(self, X: np.ndarray, batch_size: int = 8192) -> np.ndarray:
+        n = len(X)
+        if n <= batch_size:
+            out, _ = self._forward(X, train=False)
+        else:
+            out = np.empty((n, self.d_out), dtype=np.float32)
+            for s in range(0, n, batch_size):
+                o, _ = self._forward(X[s:s + batch_size], train=False)
+                out[s:s + batch_size] = o
         if self.loss_kind in ("huber", "l1", "mse"):
             return out[:, 0].astype(np.float64)
         if self.loss_kind == "bce":
@@ -1125,7 +1150,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
             max_cols: int = 80, prep_mode: str = "qt", loss_override: str | None = None) -> FitResult | None:
     """Табличная нейросеть ResNet/MLP (обучается строго с нуля на CPU): гауссизация числовых признаков
     (QuantileTransformer или Dual [Quantile+Standard]) + OHE категорий, bias-corrected EMA + Top-3 SWA,
-    нативная поддержка L1 (под MAE), Huber, MSE, BCE и CrossEntropy, масштабирование до 600k строк."""
+    нативная поддержка L1 (под MAE/MAPE), Huber, MSE, BCE и CrossEntropy, батч-инференс до 1.2M строк."""
     from sklearn.compose import ColumnTransformer
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import make_pipeline
@@ -1143,7 +1168,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         if len(chosen) >= 10:
             cols = chosen
     n = len(X)
-    if not cols or n < 100 or n > 600_000:
+    if not cols or n < 100 or n > 1_200_000:
         return None
     cat_cols = [c for c in cols if isinstance(X[c].dtype, pd.CategoricalDtype) or X[c].dtype == object or str(X[c].dtype) == "string"]
     num_cols = [c for c in cols if c not in cat_cols]
@@ -1165,7 +1190,7 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
     y_lo = float(np.nanmin(y)) if spec.task_type == "regression" else None
     y_hi = float(np.nanmax(y)) if spec.task_type == "regression" else None
     if spec.task_type == "regression":
-        loss_kind = loss_override or ("l1" if spec.metric in ("mae", "medae", "smape") else "mse")
+        loss_kind = loss_override or ("l1" if spec.metric in ("mae", "medae", "smape", "mape") else "mse")
         d_out = 1
     elif spec.task_type == "binary":
         loss_kind, d_out = "bce", 1
@@ -1240,13 +1265,17 @@ def fit_mlp(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
         net.fit(Z, y_norm, w_tr, max_epochs=max_ep, batch_size=bs, patience=pat, guard=guard, n_jobs=n_jobs)
         return pre, net, y_med, y_sc
 
-    def pred_one(bundle, df):
+    def pred_one(bundle, df, chunk: int = 65_536):
         pre, net, y_med, y_sc = bundle
-        Z = np.asarray(pre.transform(df), dtype=np.float32)
-        Z = np.where(np.isfinite(Z), Z, 0.0)
-        if prep_mode == "dual":
-            Z = np.clip(Z, -6.0, 6.0)
-        p = net.predict(Z)
+        n_df = len(df)
+        parts = []
+        for s in range(0, n_df, chunk):
+            Z = np.asarray(pre.transform(df.iloc[s:s + chunk]), dtype=np.float32)
+            Z = np.where(np.isfinite(Z), Z, 0.0)
+            if prep_mode == "dual":
+                Z = np.clip(Z, -6.0, 6.0)
+            parts.append(net.predict(Z))
+        p = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
         if spec.task_type == "regression":
             return np.clip(inverse_target(p * y_sc + y_med, cfg.target_transform), y_lo, y_hi)
         return p

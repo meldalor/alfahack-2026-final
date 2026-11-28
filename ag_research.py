@@ -706,6 +706,9 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
         X = Xe[mask]
         out = []
         try:
+            imp_s = r.importance if r.importance is not None else None
+            top_cats = (sorted(self.prep.cat_cols, key=lambda c: -float(imp_s.get(c, 0.0)))
+                        if imp_s is not None else list(self.prep.cat_cols))[:3]
             if self.spec.task_type == "regression":
                 err = r.oof[mask] - y
                 abs_e = np.abs(err)
@@ -715,7 +718,7 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
                 big = abs_e > np.quantile(abs_e, 0.95)
                 out.append(f"top-5% errors: target mean {y[big].mean():.4g} vs overall {y.mean():.4g}, "
                            f"mean bias={err[big].mean():+.4g}")
-                for c in self.prep.cat_cols[:3]:
+                for c in top_cats:
                     if use_mae:
                         g = pd.DataFrame({"c": X[c].astype(str).values, "ae": abs_e, "e": err}).groupby("c").agg(
                             err_m=("ae", "mean"), bias=("e", "mean"), size=("ae", "size"))
@@ -739,7 +742,7 @@ numpy as np are available. Fix this error and any similar problems; keep all oth
                 prec5 = float(yb[top5].mean()) if top5.any() else base_r
                 out.append(f"binary ranking: pos_rate={base_r:.4f}, pred p50={q50:.4f} p90={q90:.4f} p99={q99:.4f}, "
                            f"top-10% lift={lift10:.2f}x, top-5% precision={prec5:.4f} (NOTE: do NOT use 0.5 threshold; metric is {self.spec.metric})")
-                for c in self.prep.cat_cols[:3]:
+                for c in top_cats:
                     seg = []
                     for val, grp in pd.DataFrame({"c": X[c].astype(str).values, "y": yb, "p": p1}).groupby("c"):
                         if len(grp) >= 100 and grp["y"].nunique() == 2:

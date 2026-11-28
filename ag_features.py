@@ -645,7 +645,7 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
     for c in X.columns:
         cs = str(c)
         if (c == time_col or cs.endswith(_DERIVED_SFX) or cs.startswith(_DERIVED_PFX)
-                or "__minus__" in cs or "__ov__" in cs or "__jac__" in cs):
+                or "__minus__" in cs or "__ov__" in cs or "__jac__" in cs or "__eq__" in cs):
             continue
         # Joined continuous numeric telemetry columns are never entity keys
         if "__" in cs and pd.api.types.is_numeric_dtype(X[c]) and X[c].nunique() > 30:
@@ -674,30 +674,33 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
                 match.append(b.isin(a).mean())
         return float(uniq), float(np.mean(match)) if match else 0.0
 
-    static = [c for c, (p, nu) in stats.items() if p >= 0.6]
+    # Предпочитаем исходные колонки главной таблицы (без '__' из джойненных сенсоров/справочников)
+    static_all = [c for c, (p, nu) in stats.items() if p >= 0.6]
+    static_main = [c for c in static_all if "__" not in str(c)]
+    static = static_main if static_main else static_all
     cands = []
     if extra:
-        ex = [c for c in extra if c in X.columns and c != time_col]
+        ex = [c for c in extra if c in X.columns and c != time_col][:3]
         if ex:
             cands.append(ex)
-    # жадно: добавляем колонки, пока растёт uniq*match
+    # жадно (до 3 колонок): добавляем колонки, пока заметно растёт uniq*match
     order = sorted(static, key=lambda c: -stats[c][1])
     cur, cur_q = [], 0.0
     for c in order:
+        if len(cur) >= 3:
+            break
         u, m = quality(cur + [c])
         q = u * m
-        if q > cur_q + 1e-4:
+        if q > cur_q + (1e-4 if not cur else 0.01):
             cur, cur_q = cur + [c], q
     if cur:
         cands.append(cur)
-        # тот же ключ, уточнённый стабильными категориями: реже склеивает разные объекты
+        # тот же ключ, уточнённый одной стабильной категорией (итого <= 4 колонок)
         cats_static = sorted([c for c in static if c in set(cat_cols) and c not in cur and stats[c][0] >= 0.9],
                              key=lambda c: -stats[c][1])
-        if cats_static:
+        if cats_static and len(cur) <= 3:
             cands.append(cur + cats_static[:1])
-        if len(cats_static) > 1:
-            cands.append(cur + cats_static)
-    if len(static) > 1:
+    if 2 <= len(static) <= 4:
         cands.append(static)
     out = []
     for c in cands:
@@ -709,7 +712,7 @@ def entity_key_candidates(X: pd.DataFrame, time_col: str, cat_cols, extra=None, 
     # объект встречается много раз за период (например, магазин по дням): история по одной колонке-группе
     # = кодирование таргета только по прошлым периодам
     per_rows = len(X) / max(1, len(periods))
-    groups = [c for c, (p, nu) in stats.items() if p >= 0.8 and 10 <= nu <= 0.5 * per_rows]
+    groups = [c for c in static if stats[c][0] >= 0.8 and 10 <= stats[c][1] <= 0.5 * per_rows]
     for c in sorted(groups, key=lambda c: -stats[c][1])[:2]:
         if [c] not in out:
             out.append([c])

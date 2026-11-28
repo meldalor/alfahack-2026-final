@@ -441,7 +441,7 @@ def blend(results, y, mask, spec, max_steps: int = 30, plan=None, allow_log_odds
         s_sx = sign * score(metric, "regression", np.asarray(y)[mask], M @ w_sx)
         if s_sx > cur_s + 1e-12:
             w = w_sx
-    elif spec.task_type != "regression" and len(usable) >= 2 and len(usable) <= 12:
+    elif spec.task_type != "regression" and len(usable) >= 2 and len(usable) <= 24:
         oofs = [np.asarray(r.oof, dtype=float) for r in usable]
         w_lin, s_lin = _simplex_cls_weights(oofs, y, metric, spec, plan=use_plan, mask=mask, init_w=w, log_odds=False)
         if np.isfinite(s_lin) and s_lin > cur_s + 1e-12:

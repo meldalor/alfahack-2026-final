@@ -1137,9 +1137,37 @@ class FinalTests(unittest.TestCase):
         r_dual = fit_mlp(X, y, Xt, plan, spec, ModelConfig(), n_jobs=2, time_limit=60, seed=0,
                          name='mlp_dual', prep_mode='dual')
         self.assertIsNotNone(r_dual)
-        self.assertLess(r_dual.score, 1.2)
+        self.assertLess(r_dual.score, 1.0)
         self.assertEqual(len(r_dual.test), len(Xt))
         self.assertTrue(np.isfinite(r_dual.test).all())
+        # Finite-difference gradient check on _NumpyTabularResNet (SwiGLU + Ws skip + s_in feature gate)
+        from ag_models import _NumpyTabularResNet
+        net = _NumpyTabularResNet(6, 1, loss_kind='huber', hidden=16, h2=8, dropout=0.0, seed=7)
+        xb = rng.normal(size=(8, 6)).astype(np.float32)
+        yb = rng.normal(size=(8,)).astype(np.float32)
+        wb = np.ones(8, dtype=np.float32)
+        out, cache = net._forward(xb, train=False)
+        loss0, dout = net._loss_grad(out, yb, wb)
+        x_raw, x, c_n1, c_a1, m1, a1d, c_nr, c_ar, ar_g, vr, mr, h1, c_n2, c_a2, m2, a2d = cache
+        da2d = dout @ net.p['W3'].T
+        dz2, _, _ = net._ln_bwd(net._silu_bwd(da2d, c_a2), c_n2)
+        dh1 = dz2 @ net.p['W2'].T
+        dar_g, dvr = dh1 * vr, dh1 * ar_g
+        dzr, _, _ = net._ln_bwd(net._silu_bwd(dar_g, c_ar), c_nr)
+        da1d = dh1 + dzr @ net.p['Wr'].T + dvr @ net.p['Wv'].T
+        dz1, _, _ = net._ln_bwd(net._silu_bwd(da1d, c_a1), c_n1)
+        g_s_in = np.sum((dz1 @ net.p['W1'].T + dout @ net.p['Ws'].T) * x_raw, axis=0)
+        g_Ws = x.T @ dout
+        eps = 1e-3
+        for pname, idx_p, ana in [('s_in', 0, float(g_s_in[0])), ('Ws', (0, 0), float(g_Ws[0, 0]))]:
+            orig = float(net.p[pname][idx_p])
+            net.p[pname][idx_p] = orig + eps
+            lp, _ = net._loss_grad(net._forward(xb, train=False)[0], yb, wb)
+            net.p[pname][idx_p] = orig - eps
+            lm, _ = net._loss_grad(net._forward(xb, train=False)[0], yb, wb)
+            net.p[pname][idx_p] = orig
+            num_g = (lp - lm) / (2.0 * eps)
+            self.assertAlmostEqual(ana, num_g, delta=1e-2, msg=f'Grad mismatch on {pname}: {ana} vs {num_g}')
 
     def test_subdaily_1h_6h_causal_velocity_and_smoothed_entity_history(self):
         from ag_features import op_entity_history

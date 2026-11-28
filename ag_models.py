@@ -860,40 +860,39 @@ def fit_hgb(X, y, Xt, plan: FoldPlan, spec, cfg: ModelConfig, n_jobs: int, time_
 
 
 class _NumpyTabularResNet:
-    """Компактная табличная нейросеть ResNet/MLP на чистом NumPy/OpenBLAS с поддержкой
-    L1, SmoothL1 (Huber), MSE, BCEWithLogits и CrossEntropy, LayerNorm, SiLU, Dropout, AdamW,
-    bias-corrected EMA и Top-K SWA усреднения весов."""
+    """Компактная табличная нейросеть SwiGLU-ResNet + Wide&Deep Skip + RealMLP Feature-Scale на чистом
+    NumPy/OpenBLAS с поддержкой L1, SmoothL1 (Huber), MSE, BCEWithLogits и CrossEntropy, LayerNorm, SiLU,
+    Dropout, AdamW, bias-corrected EMA и Top-K SWA усреднения весов."""
 
     def __init__(self, d_in: int, d_out: int, loss_kind: str = "l1", hidden: int = 128,
-                 h2: int = 64, dropout: float = 0.12, lr: float = 2.5e-3, wd: float = 1e-2,
+                 h2: int = 64, dropout: float | None = None, lr: float = 2.5e-3, wd: float | None = None,
                  huber_delta: float = 0.35, ema_decay: float = 0.985, topk_avg: int = 3,
                  seed: int = 0):
         self.loss_kind = loss_kind
         self.d_out = d_out
-        self.dropout = float(dropout)
+        self.dropout = float(dropout if dropout is not None else (0.14 if d_in >= 30 else 0.10))
         self.lr = float(lr)
-        self.wd = float(wd)
+        self.wd = float(wd if wd is not None else (1.5e-2 if d_in >= 30 else 1.0e-2))
         self.delta = float(huber_delta)
         self.ema_decay = float(ema_decay)
         self.topk_avg = int(topk_avg)
         self.rng = np.random.default_rng(seed)
 
-        def _lin(a, b):
-            lim = 1.0 / np.sqrt(max(a, 1))
+        def _lin(a, b, sc: float = 1.0):
+            lim = sc / np.sqrt(max(a, 1))
             return self.rng.uniform(-lim, lim, size=(a, b)).astype(np.float32)
 
-        def _bias(a, b):
-            lim = 1.0 / np.sqrt(max(a, 1))
-            return self.rng.uniform(-lim, lim, size=(b,)).astype(np.float32)
-
         self.p = {
-            "W1": _lin(d_in, hidden), "b1": _bias(d_in, hidden),
+            "s_in": np.ones(d_in, np.float32),
+            "W1": _lin(d_in, hidden), "b1": np.zeros(hidden, np.float32),
             "g1": np.ones(hidden, np.float32), "be1": np.zeros(hidden, np.float32),
-            "Wr": _lin(hidden, hidden), "br": _bias(hidden, hidden),
+            "Wr": _lin(hidden, hidden), "br": np.zeros(hidden, np.float32),
             "gr": np.ones(hidden, np.float32), "ber": np.zeros(hidden, np.float32),
-            "W2": _lin(hidden, h2), "b2": _bias(hidden, h2),
+            "Wv": _lin(hidden, hidden), "bv": np.zeros(hidden, np.float32),
+            "W2": _lin(hidden, h2), "b2": np.zeros(h2, np.float32),
             "g2": np.ones(h2, np.float32), "be2": np.zeros(h2, np.float32),
-            "W3": _lin(h2, d_out), "b3": _bias(h2, d_out),
+            "W3": _lin(h2, d_out), "b3": np.zeros(d_out, np.float32),
+            "Ws": _lin(d_in, d_out, sc=0.25),
         }
         self.m = {k: np.zeros_like(v) for k, v in self.p.items()}
         self.v = {k: np.zeros_like(v) for k, v in self.p.items()}
@@ -927,8 +926,9 @@ class _NumpyTabularResNet:
         x, s = cache
         return dy * (s * (1.0 + x * (1.0 - s)))
 
-    def _forward(self, x: np.ndarray, train: bool = False):
+    def _forward(self, x_raw: np.ndarray, train: bool = False):
         p = self.p
+        x = x_raw * p["s_in"]
         z1 = x @ p["W1"] + p["b1"]
         n1, c_n1 = self._ln_fwd(z1, p["g1"], p["be1"])
         a1, c_a1 = self._silu_fwd(n1)
@@ -939,7 +939,9 @@ class _NumpyTabularResNet:
             m1, a1d = None, a1
         zr = a1d @ p["Wr"] + p["br"]
         nr, c_nr = self._ln_fwd(zr, p["gr"], p["ber"])
-        ar, c_ar = self._silu_fwd(nr)
+        ar_g, c_ar = self._silu_fwd(nr)
+        vr = a1d @ p["Wv"] + p["bv"]
+        ar = ar_g * vr
         if train and self.dropout > 0:
             mr = (self.rng.random(ar.shape, dtype=np.float32) >= self.dropout).astype(np.float32) / (1.0 - self.dropout)
             h1 = a1d + ar * mr
@@ -953,8 +955,8 @@ class _NumpyTabularResNet:
             a2d = a2 * m2
         else:
             m2, a2d = None, a2
-        out = a2d @ p["W3"] + p["b3"]
-        return out, (x, c_n1, c_a1, m1, a1d, c_nr, c_ar, mr, h1, c_n2, c_a2, m2, a2d)
+        out = a2d @ p["W3"] + p["b3"] + x @ p["Ws"]
+        return out, (x_raw, x, c_n1, c_a1, m1, a1d, c_nr, c_ar, ar_g, vr, mr, h1, c_n2, c_a2, m2, a2d)
 
     def _loss_grad(self, out: np.ndarray, y: np.ndarray, sw: np.ndarray):
         w = sw / max(float(sw.sum()), 1e-12)
@@ -1021,7 +1023,7 @@ class _NumpyTabularResNet:
                     bi = perm[s:s + batch_size]
                     out, cache = self._forward(Xtr[bi], train=True)
                     _, dout = self._loss_grad(out, ytr[bi], wtr[bi])
-                    x, c_n1, c_a1, m1, a1d, c_nr, c_ar, mr, h1, c_n2, c_a2, m2, a2d = cache
+                    x_raw, x, c_n1, c_a1, m1, a1d, c_nr, c_ar, ar_g, vr, mr, h1, c_n2, c_a2, m2, a2d = cache
                     grads = {}
                     grads["W3"] = a2d.T @ dout
                     grads["b3"] = dout.sum(axis=0)
@@ -1033,16 +1035,23 @@ class _NumpyTabularResNet:
                     grads["b2"] = dz2.sum(axis=0)
                     dh1 = dz2 @ self.p["W2"].T
                     dar = dh1 * mr if mr is not None else dh1
-                    dnr = self._silu_bwd(dar, c_ar)
+                    dar_g = dar * vr
+                    dvr = dar * ar_g
+                    grads["Wv"] = a1d.T @ dvr
+                    grads["bv"] = dvr.sum(axis=0)
+                    dnr = self._silu_bwd(dar_g, c_ar)
                     dzr, grads["gr"], grads["ber"] = self._ln_bwd(dnr, c_nr)
                     grads["Wr"] = a1d.T @ dzr
                     grads["br"] = dzr.sum(axis=0)
-                    da1d = dh1 + dzr @ self.p["Wr"].T
+                    da1d = dh1 + dzr @ self.p["Wr"].T + dvr @ self.p["Wv"].T
                     da1 = da1d * m1 if m1 is not None else da1d
                     dn1 = self._silu_bwd(da1, c_a1)
                     dz1, grads["g1"], grads["be1"] = self._ln_bwd(dn1, c_n1)
                     grads["W1"] = x.T @ dz1
                     grads["b1"] = dz1.sum(axis=0)
+                    grads["Ws"] = x.T @ dout
+                    dx = dz1 @ self.p["W1"].T + dout @ self.p["Ws"].T
+                    grads["s_in"] = np.sum(dx * x_raw, axis=0)
 
                     gnorm = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads.values())))
                     gscale = (5.0 / gnorm) if gnorm > 5.0 else 1.0
@@ -1053,7 +1062,7 @@ class _NumpyTabularResNet:
                     for k, g in grads.items():
                         if gscale < 1.0:
                             g = g * gscale
-                        if k.startswith("W"):
+                        if k.startswith("W") or k == "s_in":
                             self.p[k] *= (1.0 - lr_ep * self.wd)
                         self.m[k] = 0.9 * self.m[k] + 0.1 * g
                         self.v[k] = 0.999 * self.v[k] + 0.001 * (g * g)

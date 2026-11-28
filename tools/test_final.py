@@ -1395,5 +1395,8 @@ class Pool5HarnessTests(unittest.TestCase):
         out_nt, cache_nt = net._forward(X[:10], train=False)
         self.assertIsNone(cache_nt)
         self.assertEqual(out_nt.shape, (10, 1))
+        from solution import model_family
+        self.assertEqual(model_family('cat_top_s2'), 'cat_top')
+        self.assertEqual(model_family('mlp_dual_s11'), 'mlp_dual')
 
 if __name__=='__main__': unittest.main()

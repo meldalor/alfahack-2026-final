@@ -762,15 +762,20 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
     if spec.task_type == "regression" and cfg.target_transform == "log1p" and spec.metric in ("rmse", "mse", "r2"):
         cfg_x = ModelConfig(**{**cfg.to_dict(), "target_transform": "none"})
 
-    def fit_extra(name, fn, kw, min_need=None, use_clean=False):
+    def fit_extra(name, fn, kw, min_need=None, use_clean=False, data_override=None):
         dyn_need = min(80.0, eval_t * 2 + 25) if min_need is None else min(min_need, max(6.0, eval_t * 3 + 6))
         if left() < dyn_need:
             log(f"{name}: пропуск, мало времени ({left():.0f}s)")
             return
         lim = min(left(), max(12.0 if min_need is not None else 25.0, left() * 0.45))
         kwargs = dict(kw)
-        Xf, Xtf = (prep.X, prep.Xt) if use_clean else (X, Xt)
-        cf = ModelConfig(**{**cfg_x.to_dict(), "drop": []}) if use_clean else cfg_x
+        if data_override is not None:
+            Xf, Xtf, cf = data_override
+        elif use_clean:
+            Xf, Xtf = prep.X, prep.Xt
+            cf = ModelConfig(**{**cfg_x.to_dict(), "drop": []})
+        else:
+            Xf, Xtf, cf = X, Xt, cfg_x
         if fn is fit_cat:
             r = safe_fit(fn, Xf, y, Xtf, plan, spec, cf, kwargs.pop("cat_cols"), N_JOBS, lim, name=name, **kwargs)
         else:
@@ -780,7 +785,25 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             results.append(r)
             publish(name)
 
-    # Tier 1: базовые разнообразные семейства (все видят принятые AutoResearch-признаки: text_oof, entity_history, LLM)
+    # Разделение признаковых видов для двух нейросетевых семейств:
+    # mlp (qt, L1 на MAE) — чистые базовые + nowcast + text_oof (защита от вытеснения top-80 шумными блоками),
+    # mlp_dual (dual, Huber на MAE) — полный X со всеми принятыми AutoResearch-признаками.
+    text_block_ids = {f"h{e['id']}" for e in researcher.journal if e.get("kind") == "text_oof" and e.get("accepted")}
+    nn_cln_blocks = {k: v for k, v in researcher.blocks.items() if k in text_block_ids}
+    X_nn_cln, Xt_nn_cln = researcher.frames(blocks=nn_cln_blocks) if nn_cln_blocks else (prep.X, prep.Xt)
+    cfg_nn_cln = ModelConfig(**{**cfg_x.to_dict(), "drop": [c for c in cfg_x.drop if c in X_nn_cln.columns]})
+    nn_cln_data = (X_nn_cln, Xt_nn_cln, cfg_nn_cln)
+    mlp_dual_loss = "huber" if is_mae_task else None
+
+    cfg_top_cat = None
+    top_cat_depth = min(cat_kw["depth"] + 1, 6) if mc_many else 7
+    if not late_cat and top_cols and X.shape[1] > 200:
+        keep150 = [c for c in top_cols if c in X.columns][:150]
+        if len(keep150) >= 60:
+            drop_rest = [c for c in X.columns if c not in set(keep150)]
+            cfg_top_cat = ModelConfig(**{**cfg_x.to_dict(), "drop": sorted(set(cfg_x.drop) | set(drop_rest))})
+
+    # Tier 1: базовые разнообразные семейства
     if spec.task_type == "regression":
         fit_extra("ridge", fit_linear, {"kind": "ridge", "top_cols": top_cols}, min_need=15.0)
     else:
@@ -789,29 +812,34 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         fit_extra("cat", fit_cat, cat_kw, min_need=40.0)
         if is_mae_task:
             fit_extra("cat_rmse", fit_cat, {**cat_kw, "loss_override": "RMSE", "seed": 2}, min_need=40.0)
+        if cfg_top_cat is not None and left() > 90.0:
+            kw_top = {**cat_kw, "depth": top_cat_depth, "seed": 5}
+            if is_mae_task:
+                kw_top["loss_override"] = "RMSE"
+            fit_extra("cat_top", fit_cat, kw_top, min_need=40.0, data_override=(X, Xt, cfg_top_cat))
     if is_mae_task:
         fit_extra("xgb_ph", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6, "objective_override": "pseudohuber", "seed": 11}, min_need=40.0)
     else:
         fit_extra("xgb", fit_xgb, {"lr": xgb_lr, "depth": xgb_depth}, min_need=40.0)
     fit_extra("hgb", fit_hgb, {"top_cols": top_cols}, min_need=25.0)
     fit_extra("et", fit_et, {"top_cols": top_cols, "max_cols": 80} if len(X) > 100_000 else {}, min_need=25.0)
-    fit_extra("mlp", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt"}, min_need=25.0)
-    # Второе нейросетевое семейство Dual-View [Quantile + Standard] + дополнительные сиды при быстром обучении
+    fit_extra("mlp", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt"}, min_need=25.0, data_override=nn_cln_data)
+    # Второе нейросетевое семейство Dual-View [Quantile + Standard] на полном X + дополнительные сиды при быстром обучении
     mlp_r = next((r for r in results if r is not None and r.name == "mlp" and r.test is not None), None)
     if mlp_r is not None and mlp_r.seconds <= 90.0 and left() > 140.0:
-        fit_extra("mlp_dual", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "seed": 100}, min_need=30.0)
+        fit_extra("mlp_dual", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "loss_override": mlp_dual_loss, "seed": 100}, min_need=30.0)
     if mlp_r is not None and mlp_r.seconds <= 75.0 and left() > 180.0:
         n_extra_mlp = 3 if (mlp_r.seconds <= 45.0 and left() > 360.0) else 2
         for ms in range(1, n_extra_mlp + 1):
             if left() <= 120.0:
                 break
-            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt", "seed": ms}, min_need=35.0)
+            fit_extra(f"mlp_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "qt", "seed": ms}, min_need=35.0, data_override=nn_cln_data)
         md_r = next((r for r in results if r is not None and r.name == "mlp_dual" and r.test is not None), None)
         if md_r is not None and md_r.seconds <= 60.0 and left() > 240.0:
             for ms in range(1, 3):
                 if left() <= 140.0:
                     break
-                fit_extra(f"mlp_dual_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "seed": 100 + ms}, min_need=35.0)
+                fit_extra(f"mlp_dual_s{ms}", fit_mlp, {"top_cols": top_cols, "prep_mode": "dual", "loss_override": mlp_dual_loss, "seed": 100 + ms}, min_need=35.0)
 
     # Tier 2: вторичные модели для усиления ансамбля (когда все базовые семейства уже обучены)
     if left() > min(90.0, eval_t * 2 + 30):
@@ -824,18 +852,6 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             publish("lgb_et")
     if is_mae_task:
         fit_extra("xgb", fit_xgb, {"lr": 0.04 if not big else 0.1, "depth": 6 if X.shape[1] > 100 else 7}, min_need=45.0)
-    if not late_cat and top_cols and X.shape[1] > 350 and left() > 90.0:
-        # На широких БД (>350 колонок): дополнительный CatBoost на очищенном top-250 (меньше шума, быстрее)
-        keep250 = [c for c in top_cols if c in X.columns][:250]
-        if len(keep250) >= 80:
-            drop_rest = [c for c in X.columns if c not in set(keep250)]
-            cfg_top = ModelConfig(**{**cfg_x.to_dict(), "drop": sorted(set(cfg_x.drop) | set(drop_rest))})
-            r = safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_top, prep.cat_cols, N_JOBS,
-                         max(55.0, left() * 0.4), lr=cat_kw["lr"], depth=7, seed=5, name="cat_top")
-            if r is not None and r.test is not None:
-                log(f"cat_top: {spec.metric}={r.score:.5f} итерации={r.iters} за {r.seconds:.0f}s")
-                results.append(r)
-                publish("cat_top")
     if spec.task_type == "regression":
         fit_extra("huber", fit_linear, {"kind": "huber", "top_cols": top_cols}, min_need=25.0)
         fit_extra("lasso", fit_linear, {"kind": "lasso", "top_cols": top_cols}, min_need=25.0)
@@ -925,6 +941,16 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
         return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_x, kw_k.pop("cat_cols"), N_JOBS,
                          max(60.0, left() * 0.45), seed=20 + k, name=f"cat_rmse_s{k}", **kw_k)]
 
+    def cat_top_seed(k):
+        if cfg_top_cat is None:
+            return []
+        depths = (top_cat_depth, max(5, top_cat_depth - 1), top_cat_depth)
+        kw_k = {**cat_kw, "depth": depths[k % len(depths)]}
+        if is_mae_task:
+            kw_k["loss_override"] = "RMSE"
+        return [safe_fit(fit_cat, X, y, Xt, plan, spec, cfg_top_cat, kw_k.pop("cat_cols"), N_JOBS,
+                         max(60.0, left() * 0.45), seed=25 + k, name=f"cat_top_s{k}", **kw_k)]
+
     def xgb_ph_seed(k):
         depths = (6, 7, 5)
         return [safe_fit(fit_xgb, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.45),
@@ -954,12 +980,13 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
                          top_cols=top_cols, seed=40 + k, name=f"hgb_s{k}")]
 
     def mlp_seed(k):
-        return [safe_fit(fit_mlp, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.3),
+        return [safe_fit(fit_mlp, X_nn_cln, y, Xt_nn_cln, plan, spec, cfg_nn_cln, N_JOBS, max(60.0, left() * 0.3),
                          top_cols=top_cols, prep_mode="qt", seed=10 + k, name=f"mlp_s{10 + k}")]
 
     def mlp_dual_seed(k):
         return [safe_fit(fit_mlp, X, y, Xt, plan, spec, cfg_x, N_JOBS, max(60.0, left() * 0.3),
-                         top_cols=top_cols, prep_mode="dual", seed=110 + k, name=f"mlp_dual_s{10 + k}")]
+                         top_cols=top_cols, prep_mode="dual", loss_override=mlp_dual_loss,
+                         seed=110 + k, name=f"mlp_dual_s{10 + k}")]
 
     def lgb_et_seed(k):
         cfg2 = ModelConfig(**{**cfg.to_dict(), "lgb_params": {**cfg.lgb_params, "extra_trees": True}})
@@ -983,6 +1010,7 @@ def final_stage(spec, prep, plan, X, Xt, y, cfg, researcher, writer, budget, wor
             fam_best[f] = r.score
 
     cand_map = [
+        ("cat_top", cat_top_seed, not late_cat and cfg_top_cat is not None),
         ("cat", cat_seed, not late_cat),
         ("cat_rmse", cat_rmse_seed, not late_cat),
         ("lgb_huber", lgb_huber_seed, True),

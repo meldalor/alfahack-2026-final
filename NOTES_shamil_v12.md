@@ -100,3 +100,15 @@
 - Ветка создана от актуального `origin/main` (`93fb9fa`, `v11` с 4 фиксами Private LB, `72/72` тестов, `0/526` poison-аудит, `8/8` Private stress PASS).
 - Зафиксированы результаты на платформе: `v10 = 2506.127`, `v11 = 2543.855` (`+37.73`).
 - Сформулирован roadmap `v12` (10 идей, 3 волны A/B/C). Готовы к обсуждению и запуску Волны A.
+
+### 2026-11-28 — Согласование ответа Родиона (`b8d1805`) и старт параллельной разработки
+- **Полностью согласны** с перестановкой приоритетов под Private LB (Волна 1: №8, №9, №7, №3 -> Волна 2: №1, №4, №2, №10 -> Волна 3: №5, №6 при остатке времени) и с чистым разделением файлов без merge-конфликтов:
+  - **Трек Шамиля (`exp/shamil-v12-data-nowcast`, трогаем ТОЛЬКО `ag_relational.py`, `ag_features.py`, `ag_nowcast.py`, `tools/test_final.py`):**
+    1. *Волна 1:* **№8** (Multi-Hop Snowflake SQL FK до 3 хопов с `visited`, строгим `M:1` и `POST_FACTUM_RE` на каждом хопе + плоский JSONB / `{a,b}` / `;`/`|` теги) + **Zero-GNN `PPMI + TruncatedSVD`** (строго на `train`-рёбрах внутри `prepare()`, 0 утечек из `test` и `target`, 0 новых пакетов).
+    2. *Волна 2:* **№1** (реал-тайм `< t` `15m`/`1h`/ускорение + доли бинарных флагов и топ-категорий с авто-гейтом на подчасовой поток и точными `int64` нс) + **№4** (Nowcaster v3: не-часовые каденсы `15m/30m/1d`, `phase_in_cadence` интерполяция, обязательные бинарные флаги в `binary` LGBM-nowcaster, `sin/cos * lag1_anom`, ограниченный `Spatial Neighbor Graph` при `n_groups <= 200` и `>= 50` общих слотов `< cutoff_ts`).
+  - **Трек Родиона (`ag_models.py`, `ag_ensemble.py`, `ag_research.py`, `solution.py`):**
+    - №9 (`1/|y|`-MAPE с клипом `<= 20x`, OOF Temperature Scaling, строго каузальный High-Card TE в `fit_mlp`), №7 (динамический `seeders` + Pairwise Loss), №3 (MRMR-дедупликация `|corr| > 0.97`), №2 (`PLE -> TabM -> DCN-v2`), №10 (Residual + Disagreement AutoResearch).
+- **2 коротких тех. уточнения:**
+  1. По `Zero-GNN PPMI+SVD`: строим матрицу строго по `train`-строкам внутри `ag_features.prepare()` (на `test` только lookup + `cos`, невиданные сущности -> `0`), чтобы гарантированно сохранить `0` на online-stream и dual-poison аудите.
+  2. По `Adversarial Validation`: `adversarial_scores()` уже есть в `solution.py:382` и передаётся в `researcher.shift_note` — при желании в твоём треке его можно усилить проверкой не-временных дрейфующих ID/счётчиков.
+- **Стартуем реализацию прямо сейчас в ветке `exp/shamil-v12-data-nowcast`** (все фичи проходят A/B-ворота на сервере: оставляем только доказанные улучшения с `0 / N` на poison-аудите).

@@ -209,6 +209,16 @@ def detect_task_type(text: str, y: pd.Series, metric: str | None) -> str:
     yy = y.dropna()
     nun = yy.nunique()
     numeric = pd.api.types.is_numeric_dtype(yy) and not pd.api.types.is_bool_dtype(yy)
+    if not numeric and not pd.api.types.is_bool_dtype(yy) and len(yy):
+        from ag_features import _parse_dirty_numeric
+
+        parsed, nn = _parse_dirty_numeric(yy)
+        if nn > 0 and parsed.notna().sum() >= 0.85 * nn:
+            yy_num = parsed.dropna()
+            if len(yy_num):
+                yy = yy_num
+                nun = int(yy.nunique())
+                numeric = True
     says_reg = bool(re.search(r"регресс|regression", low))
     says_cls = bool(re.search(r"классификац|classification|classif", low))
     says_bin = bool(re.search(r"бинарн|binary", low))

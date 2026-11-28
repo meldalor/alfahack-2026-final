@@ -14,22 +14,43 @@ DMY_DOT_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}\.\d{2,4}([ T]\d{1,2}:\d{2}(:\d{2}
 _NA_TOKS = {"", "na", "n/a", "nan", "null", "none", "nil", "-", "--", "?", "unknown", "missing", "inf", "-inf"}
 
 
+def _clean_float32(s: pd.Series) -> pd.Series:
+    """Cast to float32 while converting +-inf and float32-overflow (>1e30) to NaN for XGBoost/MLP safety."""
+    arr = pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64, copy=True)
+    bad = (~np.isfinite(arr)) | (np.abs(arr) > 1e30)
+    if bad.any():
+        arr[bad] = np.nan
+    return pd.Series(arr.astype(np.float32), index=s.index)
+
+
 def _parse_dirty_numeric(s: pd.Series):
     """Parse numeric strings with whitespace, NA tokens, trailing '%', or European decimal comma ('12,5')."""
     if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        num = pd.to_numeric(s, errors="coerce")
+        num = pd.to_numeric(s, errors="coerce").astype("float64")
+        arr = num.to_numpy(copy=True)
+        arr[~np.isfinite(arr)] = np.nan
+        num = pd.Series(arr, index=s.index)
         return num, int(num.notna().sum())
     st = s.astype("string").str.strip()
     clean = st.mask(st.str.lower().isin(_NA_TOKS))
-    num = pd.to_numeric(clean, errors="coerce")
     nn_c = int(clean.notna().sum())
-    if nn_c > 0 and num.notna().sum() >= 0.95 * nn_c:
-        return num, nn_c
     alt = clean.str.replace(r"%$", "", regex=True).str.strip()
-    if nn_c > 0 and alt.dropna().str.match(r"^-?\d+,\d+$").mean() > 0.5:
-        alt = alt.str.replace(",", ".", regex=False)
-    num2 = pd.to_numeric(alt, errors="coerce")
-    return num2, nn_c
+    num = pd.to_numeric(alt, errors="coerce").astype("float64")
+    arr = num.to_numpy(copy=True)
+    arr[~np.isfinite(arr)] = np.nan
+    num = pd.Series(arr, index=s.index)
+    if nn_c > 0 and num.notna().sum() < nn_c:
+        miss = alt.notna() & num.isna()
+        comma_m = miss & alt.str.match(r"^-?\d+,\d+$", na=False)
+        if comma_m.any():
+            has_dots = bool(alt.dropna().str.contains(".", regex=False).any())
+            all_thous = bool(alt[comma_m].str.match(r"^-?\d{1,3},\d{3}$").all())
+            if comma_m.sum() > 0.5 * nn_c or has_dots or not all_thous:
+                fixed = pd.to_numeric(alt.where(~comma_m, alt.str.replace(",", ".", regex=False)), errors="coerce").astype("float64")
+                farr = fixed.to_numpy(copy=True)
+                farr[~np.isfinite(farr)] = np.nan
+                num = pd.Series(farr, index=s.index)
+    return num, nn_c
 
 
 def _unix_epoch_unit(name: str, a: pd.Series) -> str | None:
@@ -193,8 +214,8 @@ def _unpack_flat_json(name: str, sa: pd.Series, sb: pd.Series, max_keys: int = 8
         num_a, nn_a = _parse_dirty_numeric(s_a)
         if nn_a > 0 and num_a.notna().sum() >= 0.90 * nn_a:
             num_b, _ = _parse_dirty_numeric(s_b)
-            a_df[col_nm] = num_a.astype("float32").to_numpy()
-            b_df[col_nm] = num_b.astype("float32").to_numpy()
+            a_df[col_nm] = _clean_float32(num_a).to_numpy()
+            b_df[col_nm] = _clean_float32(num_b).to_numpy()
         else:
             st_a = s_a.astype("string")
             nu = int(st_a.nunique(dropna=True))
@@ -466,15 +487,15 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                     X_parts.append(fmt(a).rename(name).to_frame())
                     T_parts.append(fmt(b).rename(name).to_frame())
                 else:
-                    X_parts.append(a.astype("float32").rename(name).to_frame())
-                    T_parts.append(pd.to_numeric(b, errors="coerce").astype("float32").rename(name).to_frame())
+                    X_parts.append(_clean_float32(a).rename(name).to_frame())
+                    T_parts.append(_clean_float32(b).rename(name).to_frame())
                 continue
             sa, sb = a.astype("string"), b.astype("string")
             na, nn = _parse_dirty_numeric(sa)
             if nn > 0 and na.notna().sum() >= 0.95 * nn and (name not in cat_hint or not _codes_seen(name, sa, sb)):
                 nb, _ = _parse_dirty_numeric(sb)
-                X_parts.append(na.astype("float32").rename(name).to_frame())
-                T_parts.append(nb.astype("float32").rename(name).to_frame())
+                X_parts.append(_clean_float32(na).rename(name).to_frame())
+                T_parts.append(_clean_float32(nb).rename(name).to_frame())
                 continue
             if _is_datetime_series(sa):
                 xa, xb = _expand_datetime(name, sa, sb)
@@ -669,6 +690,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
 
     # категориальные: частоты/ранги высокой кардинальности строго по train (без утечки частот из test)
     final_cats = []
+    freq_tr, freq_te = {}, {}
     for c in cat_cols:
         sa = X[c].astype("string")
         sb = Xt[c].astype("string")
@@ -678,8 +700,8 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
             tr_n = max(len(X), 1)
             X[c] = sa.map(rank).fillna(-1.0).astype("float32").values
             Xt[c] = sb.map(rank).fillna(-1.0).astype("float32").values
-            X[c + "__freq"] = (sa.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
-            Xt[c + "__freq"] = (sb.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
+            freq_tr[c + "__freq"] = (sa.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
+            freq_te[c + "__freq"] = (sb.map(vc_tr).fillna(0.0) / tr_n).astype("float32").values
         else:
             seen = set(vc_tr.index)
             extra_te = [v for v in sb.dropna().unique() if v not in seen]
@@ -687,6 +709,20 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
             X[c] = pd.Categorical(sa.astype(object), dtype=cats)
             Xt[c] = pd.Categorical(sb.astype(object), dtype=cats)
             final_cats.append(c)
+    if freq_tr:
+        X = pd.concat([X, pd.DataFrame(freq_tr, index=X.index)], axis=1)
+        Xt = pd.concat([Xt, pd.DataFrame(freq_te, index=Xt.index)], axis=1)
+
+    # финальная санитаризация +-inf / float32-overflow в числовых признаках (защита XGBoost/MLP)
+    for df_t in (X, Xt):
+        for c in df_t.columns:
+            if pd.api.types.is_float_dtype(df_t[c]):
+                arr = df_t[c].to_numpy(dtype=np.float64, copy=False)
+                bad = (~np.isfinite(arr)) | (np.abs(arr) > 1e30)
+                if bad.any():
+                    clean_arr = arr.copy()
+                    clean_arr[bad] = np.nan
+                    df_t[c] = clean_arr.astype(df_t[c].dtype)
 
     # константы и полностью пустые колонки
     for c in list(X.columns):
@@ -1053,23 +1089,24 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
             if len(per) != len(y):
                 raise ValueError("Text periods must align with target rows")
             total_chars = float(sa_s.str.len().sum())
-            big = len(sa_s) > 150_000 or total_chars > 1.5e8
+            big = len(sa_s) > 120_000 or total_chars > 5e7
+            use_char = len(sa_s) <= 40_000 and total_chars <= 6e6
             if task_type == "regression":
                 mk = lambda: Ridge(alpha=3.0)  # noqa: E731
                 k_out = 1
             else:
-                mk = lambda: LogisticRegression(C=4.0, max_iter=300 if len(sa_s) < 150_000 else 100, n_jobs=n_jobs)  # noqa: E731
+                mk = lambda: LogisticRegression(C=4.0, max_iter=150 if not big else 80, n_jobs=n_jobs)  # noqa: E731
                 k_out = 1 if n_classes == 2 else n_classes
             folds = [(np.flatnonzero(per < value), np.flatnonzero(per == value))
                      for value in np.sort(np.unique(per[np.isfinite(per)]))]
 
             def _fit_transform_pair(tr_texts, ev_texts):
                 w = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
-                                    max_features=200_000 if not big else 100_000, sublinear_tf=True, dtype=np.float32)
+                                    max_features=80_000 if not big else 50_000, sublinear_tf=True, dtype=np.float32)
                 tr_m = [w.fit_transform(tr_texts)]
                 ev_m = [w.transform(ev_texts)]
-                if not big:
-                    ch = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
+                if use_char:
+                    ch = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=3, max_features=60_000,
                                          sublinear_tf=True, dtype=np.float32)
                     tr_m.append(ch.fit_transform(tr_texts))
                     ev_m.append(ch.transform(ev_texts))
@@ -1105,25 +1142,32 @@ def op_text_oof(raw_text: dict, y, task_type: str, n_classes: int, n_jobs: int =
 
         both = pd.concat([sa_s, sb_s], ignore_index=True)
         total_chars = float(both.str.len().sum())
-        big = len(both) > 150_000 or total_chars > 1.5e8
-        word = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
-                               max_features=200_000 if not big else 100_000, sublinear_tf=True, dtype=np.float32)
-        mats = [word.fit_transform(both)]
-        if not big:
-            # символьные n-граммы ловят опечатки и морфологию, но дороги на больших корпусах
-            char = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, max_features=200_000,
-                                   sublinear_tf=True, dtype=np.float32)
-            mats.append(char.fit_transform(both))
+        big = len(both) > 120_000 or total_chars > 5e7
+        use_char = len(both) <= 40_000 and total_chars <= 6e6
+        k_out = 1 if (task_type == "regression" or n_classes == 2) else n_classes
+        try:
+            word = TfidfVectorizer(ngram_range=(1, 2), min_df=2 if not big else 5,
+                                   max_features=80_000 if not big else 50_000, sublinear_tf=True, dtype=np.float32)
+            mats = [word.fit_transform(both)]
+            if use_char:
+                # символьные n-граммы ловят опечатки и морфологию на коротких/средних текстах (<= 6M символов)
+                char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=3, max_features=60_000,
+                                       sublinear_tf=True, dtype=np.float32)
+                mats.append(char.fit_transform(both))
+        except ValueError:
+            fill_v = 0.0 if task_type == "regression" else 1.0 / n_classes
+            for j in range(k_out):
+                out_a[f"{name}__tfidf{j}"] = np.full(len(sa), fill_v, dtype="float32")
+                out_b[f"{name}__tfidf{j}"] = np.full(len(sb), fill_v, dtype="float32")
+            continue
         M = sparse.hstack(mats).tocsr()
         A, B = M[: len(sa)], M[len(sa):]
         if task_type == "regression":
             mk = lambda: Ridge(alpha=3.0)  # noqa: E731
             folds = KFold(5, shuffle=True, random_state=seed).split(A)
-            k_out = 1
         else:
-            mk = lambda: LogisticRegression(C=4.0, max_iter=300 if len(sa) < 150_000 else 100, n_jobs=n_jobs)  # noqa: E731
+            mk = lambda: LogisticRegression(C=4.0, max_iter=150 if not big else 80, n_jobs=n_jobs)  # noqa: E731
             folds = StratifiedKFold(5, shuffle=True, random_state=seed).split(A, y)
-            k_out = 1 if n_classes == 2 else n_classes
 
         def predict_from(tr, target):
             if not len(tr):

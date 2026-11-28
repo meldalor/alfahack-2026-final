@@ -1610,4 +1610,74 @@ class Pool5HarnessTests(unittest.TestCase):
         np.testing.assert_allclose(nc_te1.iloc[0].to_numpy(float), nc_te2.iloc[0].to_numpy(float),
                                    atol=1e-6, equal_nan=True)
 
+    def test_prepare_sanitizes_inf_and_overflow_for_xgboost(self):
+        import xgboost as xgb
+        from ag_features import prepare
+        tr = pd.DataFrame({
+            'id': [1, 2, 3, 4, 5],
+            'num_inf': [1.0, np.inf, -np.inf, 1e40, 2.5],
+            'dirty_inf': ['10,5%', 'inf', '-inf', 'N/A', '3,2'],
+            'j_col': ['{"a": 1.5}', '{"a": 2.0}', '{"a": 1e40}', '{"a": 3.0}', '{"a": 4.0}'],
+            'y': [0, 1, 0, 1, 0],
+        })
+        te = pd.DataFrame({
+            'id': [6, 7],
+            'num_inf': [-np.inf, 1e39],
+            'dirty_inf': ['inf', '7,5'],
+            'j_col': ['{"a": 5.0}', '{"a": 6.0}'],
+        })
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='binary', metric='roc_auc', classes=[0, 1])
+        prep = prepare(tr, te, spec)
+        for df_t in (prep.X, prep.Xt):
+            for c in df_t.columns:
+                if pd.api.types.is_numeric_dtype(df_t[c]):
+                    arr = df_t[c].to_numpy(dtype=np.float64)
+                    self.assertFalse(np.isinf(arr).any(), f'inf remained in {c}')
+                    self.assertTrue((np.abs(arr[np.isfinite(arr)]) <= 1e30).all(), f'overflow in {c}')
+        # Verify XGBoost DMatrix accepts the sanitized matrices without error
+        dm_tr = xgb.DMatrix(prep.X, label=prep.y, enable_categorical=True)
+        dm_te = xgb.DMatrix(prep.Xt, enable_categorical=True)
+        self.assertEqual(dm_tr.num_row(), 5)
+        self.assertEqual(dm_te.num_row(), 2)
+
+    def test_detect_task_type_dirty_string_regression_target(self):
+        from ag_features import prepare
+        from ag_task import build_spec
+        tr = pd.DataFrame({
+            'row_id': np.arange(50),
+            'x1': np.linspace(0, 10, 50),
+            'target': pd.Series(
+                ['N/A' if i == 0 else (f'{100.0 + i * 2.5:.3f}'.replace('.', ',') if i % 5 == 0 else f'{100.0 + i * 2.5:.4f}')
+                 for i in range(50)],
+                dtype='string',
+            ),
+        })
+        te = pd.DataFrame({'row_id': np.arange(50, 60), 'x1': np.linspace(10, 12, 10)})
+        sm = pd.DataFrame({'row_id': np.arange(50, 60), 'target': 0.0})
+        with tempfile.TemporaryDirectory() as d:
+            tp = Path(d) / 'task.md'
+            tp.write_text('ID: row_id. Target: target. Regression. Основная метрика: MAE.\n', encoding='utf-8')
+            spec = build_spec(tp, tr, te, sm, None, {})
+            self.assertEqual(spec.task_type, 'regression')
+            self.assertEqual(spec.metric, 'mae')
+            self.assertEqual(spec.output_kind, 'value')
+            prep = prepare(tr, te, spec)
+            self.assertEqual(len(prep.y), 49)  # N/A row dropped, comma-decimal rows parsed!
+            self.assertAlmostEqual(float(prep.y[4]), 112.5, places=3)
+
+    def test_op_text_oof_long_dirty_and_empty_text_safe(self):
+        from ag_features import op_text_oof
+        rng = np.random.default_rng(9)
+        y = rng.integers(0, 2, size=80)
+        # Include both normal text with dirty HTML/Cyrillic and an all-empty text column
+        sa = pd.Series(['<b>fraud</b> срочно ' + ('word ' * 10) if yi else 'normal job description here' for yi in y])
+        sb = pd.Series(['<b>fraud</b> срочно', 'normal job description'])
+        ea = pd.Series([''] * len(y))
+        eb = pd.Series(['', ''])
+        a, b = op_text_oof({'desc': (sa, sb), 'empty_txt': (ea, eb)}, y, 'binary', 2, n_jobs=2, seed=0)
+        self.assertIn('desc__tfidf0', a.columns)
+        self.assertIn('empty_txt__tfidf0', a.columns)
+        self.assertTrue(np.isfinite(a.to_numpy(dtype=float)).all())
+        self.assertTrue(np.isfinite(b.to_numpy(dtype=float)).all())
+
 if __name__=='__main__': unittest.main()

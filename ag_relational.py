@@ -693,74 +693,106 @@ def enrich(train, test, tables, skip_names=(), report=None, meta=None):
     def _rec(msg):
         if isinstance(report, list):
             report.append(msg)
-    # 0) Explicit PostgreSQL FOREIGN KEY joins (handles arbitrary column names and multi-role FKs like sender/receiver)
+    # 0) Explicit PostgreSQL FOREIGN KEY joins (multi-hop snowflake up to 3 hops + multi-role FKs like sender/receiver)
     fks = meta.get('foreign_keys', []) if isinstance(meta, dict) else []
     if fks:
-        dst_counts = {}
+        main_tables = set(skip) | {None, ''}
+        src_dst_counts = {}
         for fk in fks:
             dst_t = fk.get('dst_table')
+            src_k = '__main__' if (not fk.get('src_table') or fk.get('src_table') in main_tables) else fk.get('src_table')
             if dst_t in tables and dst_t not in skip:
-                dst_counts[dst_t] = dst_counts.get(dst_t, 0) + 1
+                src_dst_counts[(src_k, dst_t)] = src_dst_counts.get((src_k, dst_t), 0) + 1
         applied_fks = set()
         fk_joined_dsts = set()
-        for _ in range(3):
+        # Registry tracks renamed joined columns so 2-hop/3-hop snowflake FKs (e.g. orders->cards->accounts->regions)
+        # resolve even when intermediate FK columns were prefixed (cards__acct_ref -> accounts.acct_code).
+        col_registry: dict[tuple[str, str], list[tuple[str, str, tuple]]] = {}
+        for _hop in range(3):
             fk_prog = False
             for fk in fks:
+                if combined.shape[1] >= 1200:
+                    break
+                src_t = fk.get('src_table')
                 src_c = fk.get('src_col')
                 dst_t = fk.get('dst_table')
                 dst_c = fk.get('dst_col')
-                sig = (src_c, dst_t, dst_c)
-                if sig in applied_fks or dst_t not in tables or dst_t in skip:
+                if not src_c or not dst_c or dst_t not in tables or dst_t in skip or dst_c not in tables[dst_t].columns:
                     continue
-                if src_c not in combined.columns or src_c in targets or dst_c not in tables[dst_t].columns:
-                    continue
-                try:
-                    dim = tables[dst_t]
-                    # Skip interval tables unless referencing their own PK (handled cleanly below)
-                    _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
-                    _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
-                    if len(_st_c) == 1 and len(_en_c) == 1 and dim[dst_c].duplicated().any():
+                if not src_t or src_t in main_tables:
+                    if src_c not in combined.columns or src_c in targets:
                         continue
-                    dim_r = dim.rename(columns={dst_c: src_c}) if dst_c != src_c else dim
-                    keys, dim_clean, excluded = _keys(dim_r, [src_c])
-                    if not keys:
+                    sources = [(src_c, '', ())]
+                else:
+                    sources = list(col_registry.get((src_t, src_c), []))
+                for comb_col, pfx_chain, vis_tables in sources:
+                    if dst_t in vis_tables:
+                        continue  # prevent FK graph cycles
+                    sig = (comb_col, dst_t, dst_c)
+                    if sig in applied_fks or comb_col not in combined.columns or comb_col in targets:
                         continue
-                    multi_role = dst_counts.get(dst_t, 1) > 1
-                    role_tag = re.sub(r'_id$', '', str(src_c), flags=re.I) if multi_role else ''
-                    pfx = f'{role_tag}__{dst_t}' if (multi_role and role_tag and role_tag.lower() != dst_t.lower()) else dst_t
-                    rename = {}
-                    for c in dim_clean:
-                        if c in keys or c in targets or POST_FACTUM_RE.search(str(c)):
+                    try:
+                        dim = tables[dst_t]
+                        # Skip interval tables unless referencing their own unique PK (handled cleanly below)
+                        _st_c = [c for c in dim.columns if c.lower().startswith('start_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                        _en_c = [c for c in dim.columns if c.lower().startswith('end_') and any(t in c.lower() for t in ('time', 'date', 'ts', 'at'))]
+                        if len(_st_c) == 1 and len(_en_c) == 1 and dim[dst_c].duplicated().any():
+                            applied_fks.add(sig)
                             continue
-                        new_c = c if (not multi_role and c not in combined and c.endswith('_id')) else f'{pfx}__{c}'
-                        if new_c not in combined.columns:
-                            rename[c] = new_c
-                    if not rename:
+                        dim_r = dim.rename(columns={dst_c: comb_col}) if dst_c != comb_col else dim
+                        keys, dim_clean, excluded = _keys(dim_r, [comb_col])
+                        if not keys:
+                            applied_fks.add(sig)
+                            continue
+                        src_k_cur = '__main__' if (not src_t or src_t in main_tables) else src_t
+                        n_same_src = src_dst_counts.get((src_k_cur, dst_t), 1)
+                        multi_role = n_same_src > 1 or bool(pfx_chain)
+                        if pfx_chain:
+                            pfx = f'{pfx_chain}__{dst_t}' if dst_t in fk_joined_dsts or n_same_src > 1 else dst_t
+                        elif n_same_src > 1:
+                            role_tag = re.sub(r'_id$', '', str(comb_col), flags=re.I)
+                            pfx = f'{role_tag}__{dst_t}' if (role_tag and role_tag.lower() != dst_t.lower()) else dst_t
+                        else:
+                            pfx = dst_t
+                        rename = {}
+                        for c in dim_clean:
+                            if c in keys or c in targets or POST_FACTUM_RE.search(str(c)):
+                                continue
+                            new_c = c if (not multi_role and c not in combined and c.endswith('_id')) else f'{pfx}__{c}'
+                            if new_c not in combined.columns:
+                                rename[c] = new_c
+                        if not rename:
+                            applied_fks.add(sig)
+                            continue
+                        right = dim_clean[keys + list(rename)].rename(columns=rename)
+                        marker = f'{pfx}__matched'
+                        if marker in combined.columns:
+                            marker = f'{pfx}__{comb_col}__matched'
+                        right[marker] = 1.0
+                        before = len(combined)
+                        left_m, right_m = _align_key_dtypes(combined, right, keys)
+                        candidate = left_m.merge(right_m, on=keys, how='left', sort=False, validate='many_to_one')
+                        for k in keys:
+                            candidate[k] = combined[k].values
+                        cov = float(candidate[marker].notna().mean())
+                        if cov > 0.0:
+                            combined = candidate
+                            assert len(combined) == before
+                            combined[marker] = combined[marker].fillna(0)
+                            hop_tag = f' hop={_hop + 1}' if _hop > 0 else ''
+                            log(f'join {dst_t} (SQL FK{hop_tag} {comb_col}->{dst_c}, pfx={pfx}): coverage={cov:.3f}, features={len(rename)}')
+                            _rec(f'table {dst_t} ({len(dim)} rows): SQL FK{hop_tag} {comb_col}->{dst_c}, cov={cov:.3f}, +{len(rename)} feats')
+                            applied_fks.add(sig)
+                            fk_joined_dsts.add(dst_t)
+                            new_vis = vis_tables + (dst_t,)
+                            for orig_c, new_c in rename.items():
+                                col_registry.setdefault((dst_t, orig_c), []).append((new_c, pfx, new_vis))
+                            fk_prog = True
+                        else:
+                            applied_fks.add(sig)
+                    except Exception:
+                        log_exc(f'SQL FK join {dst_t}')
                         applied_fks.add(sig)
-                        continue
-                    right = dim_clean[keys + list(rename)].rename(columns=rename)
-                    marker = f'{pfx}__matched'
-                    if marker in combined.columns:
-                        marker = f'{pfx}__{src_c}__matched'
-                    right[marker] = 1.0
-                    before = len(combined)
-                    left_m, right_m = _align_key_dtypes(combined, right, keys)
-                    candidate = left_m.merge(right_m, on=keys, how='left', sort=False, validate='many_to_one')
-                    for k in keys:
-                        candidate[k] = combined[k].values
-                    cov = float(candidate[marker].notna().mean())
-                    if cov > 0.0:
-                        combined = candidate
-                        assert len(combined) == before
-                        combined[marker] = combined[marker].fillna(0)
-                        log(f'join {dst_t} (SQL FK {src_c}->{dst_c}, pfx={pfx}): coverage={cov:.3f}, features={len(rename)}')
-                        _rec(f'table {dst_t} ({len(dim)} rows): SQL FK {src_c}->{dst_c}, cov={cov:.3f}, +{len(rename)} feats')
-                        applied_fks.add(sig)
-                        fk_joined_dsts.add(dst_t)
-                        fk_prog = True
-                except Exception:
-                    log_exc(f'SQL FK join {dst_t}')
-                    applied_fks.add(sig)
             if not fk_prog:
                 break
         for dst_t in fk_joined_dsts:

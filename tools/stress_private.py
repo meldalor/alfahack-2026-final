@@ -13,7 +13,8 @@ import psutil
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = {'fraud': ('PR-AUC','ROC-AUC'), 'multiclass': ('LogLoss','F1-macro'),
-         'regression': ('RMSLE','MAPE'), 'text': ('PR-AUC',), 'large': ('MAE',)}
+         'regression': ('RMSLE','MAPE'), 'text': ('PR-AUC',), 'large': ('MAE',),
+         'snowflake_jsonb': ('MAE',), 'graph_comm': ('PR-AUC',), 'panel_30m': ('MAE',)}
 METRIC = dict(zip(('PR-AUC','ROC-AUC','LogLoss','F1-macro','RMSLE','MAPE','MAE'),
                   ('average_precision','roc_auc','logloss','f1_macro','rmsle','mape','mae')))
 
@@ -47,6 +48,59 @@ def generate(name, n=4000, seed=42):
         df['secondary']=r.normal(size=n).astype('float32'); df['group_id']=r.integers(1000,size=n,dtype='int32')
         aux['groups']=pd.DataFrame({'group_id':np.arange(1000,dtype='int32'),'offset':r.normal(size=1000).astype('float32')})
         y=(4*x+2*df.secondary.to_numpy()+aux['groups'].offset.to_numpy()[df.group_id]+r.normal(size=n)).astype('float32')
+    elif name=='snowflake_jsonb':
+        n_c,n_a,n_r=80,30,10
+        reg_gdp=r.normal(5.0,2.0,n_r)
+        acc_reg=r.integers(n_r,size=n_a); acc_lim=r.uniform(100,1000,n_a)
+        crd_acc=r.integers(n_a,size=n_c); crd_tier=r.integers(1,5,n_c)
+        c_idx=r.integers(n_c,size=n); a_idx=crd_acc[c_idx]; r_idx=acc_reg[a_idx]
+        scores_j=np.round(r.normal(0,2.0,n),3); tiers_j=r.choice(['gold','silver','bronze'],n); vips_j=r.random(n)<0.3
+        vocab=np.array(['tech','sports','music','food','travel','auto'])
+        u_tags,o_tags,ov_cnt=[],[],np.zeros(n,dtype='float32')
+        for i in range(n):
+            tu=r.choice(vocab,size=int(r.integers(1,4)),replace=False)
+            to=r.choice(vocab,size=int(r.integers(1,4)),replace=False)
+            u_tags.append('{'+','.join(tu)+'}'); o_tags.append(';'.join(to))
+            ov_cnt[i]=float(len(set(tu)&set(to)))
+        df['card_ref']=[f'C{i}' for i in c_idx]
+        df['meta_json']=[f'{{"score": {s}, "tier": "{t}", "vip": {str(bool(v)).lower()}}}' for s,t,v in zip(scores_j,tiers_j,vips_j)]
+        df['user_tags']=u_tags; df['offer_tags']=o_tags
+        aux['cards']=pd.DataFrame({'card_code':[f'C{i}' for i in range(n_c)],'acct_ref':[f'A{a}' for a in crd_acc],'card_tier':crd_tier})
+        aux['accounts']=pd.DataFrame({'acct_code':[f'A{i}' for i in range(n_a)],'reg_ref':[f'R{rg}' for rg in acc_reg],'credit_limit':acc_lim})
+        aux['regions']=pd.DataFrame({'reg_code':[f'R{i}' for i in range(n_r)],'gdp_idx':reg_gdp,'back_card':[f'C{i}' for i in range(n_r)]})
+        aux['__fks__']=[
+            {'src_table':'train','src_col':'card_ref','dst_table':'cards','dst_col':'card_code'},
+            {'src_table':'cards','src_col':'acct_ref','dst_table':'accounts','dst_col':'acct_code'},
+            {'src_table':'accounts','src_col':'reg_ref','dst_table':'regions','dst_col':'reg_code'},
+            {'src_table':'regions','src_col':'back_card','dst_table':'cards','dst_col':'card_code'},
+        ]
+        y=(3.0*reg_gdp[r_idx]+1.5*scores_j+2.0*ov_cnt+0.5*x+r.normal(0,0.4,n)).astype('float32')
+    elif name=='graph_comm':
+        n_u,n_m=max(80,min(300,n//10)),max(30,min(100,n//25))
+        u_comm=np.arange(n_u)%4; m_comm=np.arange(n_m)%4
+        u_arr=r.integers(n_u,size=n); is_anom=(r.random(n)<0.18).astype(int)
+        m_arr=np.empty(n,dtype=int)
+        for i in range(n):
+            cand=np.flatnonzero(m_comm!=u_comm[u_arr[i]]) if is_anom[i] else np.flatnonzero(m_comm==u_comm[u_arr[i]])
+            m_arr[i]=int(r.choice(cand))
+        df['user_id']=[f'U{i}' for i in u_arr]; df['merchant_id']=[f'M{i}' for i in m_arr]
+        y=is_anom
+    elif name=='panel_30m':
+        n_g=4; n_slots=max(48*45,n)
+        stamps=pd.date_range('2025-01-01 00:00:00',periods=n_slots,freq='30min')
+        t_idx=np.arange(n_slots); diurn=4.0*np.sin(2*np.pi*t_idx/48.0)
+        p_rows=[]; val_mat=np.zeros((n_g,n_slots),dtype='float32')
+        for g in range(n_g):
+            ar=np.zeros(n_slots,dtype='float64'); eps=r.normal(0,0.6,n_slots)
+            for s_i in range(1,n_slots): ar[s_i]=0.85*ar[s_i-1]+eps[s_i]
+            val_mat[g]=(diurn+ar+g*0.5).astype('float32')
+            p_rows.append(pd.DataFrame({'district_id':f'G{g}','timestamp':stamps,'val':val_mat[g],'load':(val_mat[g]*0.7+r.normal(0,0.3,n_slots)).astype('float32')}))
+        aux['sens']=pd.concat(p_rows,ignore_index=True)
+        ev_slots=np.linspace(48*10,n_slots-2,n).astype(int)
+        ev_g=r.integers(n_g,size=n); ev_min=r.integers(1,29,size=n)
+        df['district_id']=[f'G{g}' for g in ev_g]
+        df['timestamp']=stamps[ev_slots]+pd.to_timedelta(ev_min,unit='m')
+        y=(2.5*val_mat[ev_g,ev_slots]+0.6*x+r.normal(0,0.4,n)).astype('float32')
     else: raise ValueError(name)
     tr,te=df.iloc[:k].copy(),df.iloc[k:].copy(); tr['target']=y[:k]
     sample=pd.DataFrame({'row_id':r.permutation(te.row_id.to_numpy())})
@@ -59,11 +113,11 @@ def validate(pred,sample,te,truth,name):
     if list(pred)!=list(sample) or len(pred)!=len(sample) or not pred.row_id.is_unique or not pred.row_id.equals(sample.row_id): raise ValueError('wrong schema or ID order')
     p=pred.drop(columns='row_id').to_numpy(float); y=pd.Series(truth,index=te.row_id).loc[pred.row_id].to_numpy()
     if not np.isfinite(p).all(): raise ValueError('NaN/Inf predictions')
-    if name in ('fraud','text','multiclass') and ((p<0).any() or (p>1).any()): raise ValueError('invalid probabilities')
+    if name in ('fraud','text','multiclass','graph_comm') and ((p<0).any() or (p>1).any()): raise ValueError('invalid probabilities')
     if name=='multiclass':
         if not np.allclose(p.sum(1),1,atol=1e-6): raise ValueError('probabilities do not sum to 1')
         scores={'LogLoss':log_loss(y,p,labels=np.arange(12)),'F1-macro':f1_score(y,p.argmax(1),labels=np.arange(12),average='macro',zero_division=0)}
-    elif name in ('fraud','text'): scores={'PR-AUC':average_precision_score(y,p[:,0]),'ROC-AUC':roc_auc_score(y,p[:,0])}
+    elif name in ('fraud','text','graph_comm'): scores={'PR-AUC':average_precision_score(y,p[:,0]),'ROC-AUC':roc_auc_score(y,p[:,0])}
     elif name=='regression':
         if (p<0).any(): raise ValueError('negative predictions')
         scores={'RMSLE':np.sqrt(np.mean((np.log1p(y)-np.log1p(p[:,0]))**2)),'MAPE':np.mean(np.abs(y-p[:,0])/np.maximum(abs(y),1e-9))}
@@ -84,12 +138,14 @@ def worker(args):
     import ag_database,solution,importlib.util,gc
     d=args.out; name=args.scenario; metric=args.metric
     tr,te,aux,sample,y=generate(name,args.rows,args.seed)
-    task_type='Multiclass classification; probabilities class_0 through class_11' if name=='multiclass' else 'Binary classification; probability of class 1' if name in ('fraud','text') else 'Regression'
+    fks=aux.pop('__fks__',None)
+    task_type='Multiclass classification; probabilities class_0 through class_11' if name=='multiclass' else 'Binary classification; probability of class 1' if name in ('fraud','text','graph_comm') else 'Regression'
     (d/'task.md').write_text(f'ID: row_id. Target: target. {task_type}. Основная метрика: {metric}.\n',encoding='utf-8')
     issues=[]; checks={'issues':issues,'train_rows':len(tr),'test_rows':len(te)}
     def check(ok,msg):
         if not ok: issues.append(msg)
-    a,b=enrich(tr,te,aux)
+    rel_meta={'foreign_keys':list(fks)} if fks else {}
+    a,b=enrich(tr,te,aux,meta=rel_meta)
     check(a.row_id.equals(tr.row_id.reset_index(drop=True)) and b.row_id.equals(te.row_id.reset_index(drop=True)),'join changed rows/order')
     checks['enriched_columns']=len(b.columns)
     if name=='fraud':
@@ -98,6 +154,9 @@ def worker(args):
         if 'transactions__hist_count' in b:
             expected=((aux['transactions'].client_id==te.client_id.iloc[0])&(aux['transactions'].created_at<te.timestamp.iloc[0])).sum()
             check(b.transactions__hist_count.iloc[0]==expected,'child count differs from strict past oracle')
+    if name=='snowflake_jsonb':
+        for req_c in ('cards__card_tier','accounts__credit_limit','regions__gdp_idx'):
+            check(req_c in a,f'3-hop snowflake column missing: {req_c}')
     if name!='large':
         spec=build_spec(d/'task.md',a,b,sample,None,{})
         check(spec.metric==METRIC[metric],f'wrong metric parsed: {spec.metric}')
@@ -108,6 +167,29 @@ def worker(args):
         if name=='regression':
             check('dirty_rate' in prep.X and 'dirty_rate' not in prep.cat_cols,'dirty number not numeric')
             if 'dirty_rate' in prep.X: check(pd.isna(prep.X.dirty_rate.iloc[0]) and np.isclose(prep.X.dirty_rate.iloc[1],round(abs(tr.signal.iloc[1])*10,1)),'dirty number parsed incorrectly')
+        if name=='snowflake_jsonb':
+            check('meta_json__json__score' in prep.X,'flat JSONB key not unpacked')
+            check('user_tags__ov__offer_tags' in prep.X,'Postgres array / semicolon tag overlap missing')
+        if name=='graph_comm':
+            gnn_cols=[c for c in prep.X.columns if c.startswith('gnn__')]
+            checks['gnn_features']=len(gnn_cols)
+            check(len(gnn_cols)>=5,'2-fold OOF Zero-GNN did not activate on community graph')
+        if name=='panel_30m':
+            from ag_models import make_plan
+            from ag_nowcast import build_nowcast_features
+            tc=detect_time_split(prep.X,prep.Xt,prep.cat_cols); check(tc is not None,'30m panel time split not detected')
+            if tc:
+                pl=make_plan(prep.X,prep.y,'regression',time_col=tc)
+                nc_tr1,nc_te1=build_nowcast_features(rel_meta,prep.y,pl,'regression',n_jobs=args.threads,use_lgb_top=False,max_seconds=30.0)
+                check(nc_te1 is not None and 'nc__sens__val' in nc_te1,'30m nowcast did not fire')
+                if nc_te1 is not None:
+                    sens_p=aux['sens'].copy()
+                    t_cut=pd.to_datetime(te['timestamp']).dt.floor('30min').min()
+                    sens_p.loc[pd.to_datetime(sens_p['timestamp'])>=t_cut,'val']=99999.0
+                    rm2={}; enrich(tr,te,{'sens':sens_p},meta=rm2)
+                    _,nc_te2=build_nowcast_features(rm2,prep.y,pl,'regression',n_jobs=args.threads,use_lgb_top=False,max_seconds=30.0)
+                    delta=float(np.nanmax(np.abs(nc_te1.iloc[0].to_numpy(float)-nc_te2.iloc[0].to_numpy(float))))
+                    checks['future_panel_poison_delta']=delta; check(delta<1e-5,'30m nowcast leaked future panel')
         if name=='text':
             tc=detect_time_split(prep.X,prep.Xt,prep.cat_cols); check(tc is not None and bool(prep.raw_text),'time split/text not detected')
             if tc and prep.raw_text:
@@ -126,7 +208,11 @@ def worker(args):
     else:
         checks['input_mode']='mock_extract_parquet'; dump(d/'checks.json',checks); del a,b,y; gc.collect()
         os.environ['PGDATABASE']='synthetic_private'
-        with patch.object(ag_database,'extract',return_value={'train':tr,'test':te,'sample_submission':sample,**aux}): solution.run(d/'task.md')
+        def _mock_extract(out_dir, meta=None, **kw):
+            if isinstance(meta, dict) and fks:
+                meta['foreign_keys'] = list(fks)
+            return {'train':tr,'test':te,'sample_submission':sample,**aux}
+        with patch.object(ag_database,'extract',side_effect=_mock_extract): solution.run(d/'task.md')
 
 
 def run_case(args,name,metric):

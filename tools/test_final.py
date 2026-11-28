@@ -1458,4 +1458,156 @@ class Pool5HarnessTests(unittest.TestCase):
             out_tr = pd.read_pickle(dp / 'out_train.pkl')
             self.assertEqual(list(out_tr.columns), ['good'])
 
+    def test_multihop_snowflake_sql_fk_3_hops_and_cycle_guard(self):
+        # 3-hop snowflake with non-_id column names + intentional cycle regions -> cards
+        tr = pd.DataFrame({'event_id': [1, 2, 3], 'card_ref': ['C1', 'C2', 'C1'], 'y': [1.0, 2.0, 3.0]})
+        te = pd.DataFrame({'event_id': [4, 5], 'card_ref': ['C2', 'C3']})
+        cards = pd.DataFrame({'card_code': ['C1', 'C2', 'C3'], 'acct_ref': ['A1', 'A2', 'A1'], 'card_tier': [1, 2, 1]})
+        accounts = pd.DataFrame({'acct_code': ['A1', 'A2'], 'reg_ref': ['R1', 'R2'], 'credit_limit': [100.0, 500.0]})
+        regions = pd.DataFrame({'reg_code': ['R1', 'R2'], 'gdp_idx': [1.5, 2.5], 'back_card': ['C1', 'C2']})
+        meta = {'foreign_keys': [
+            {'src_table': 'train', 'src_col': 'card_ref', 'dst_table': 'cards', 'dst_col': 'card_code'},
+            {'src_table': 'cards', 'src_col': 'acct_ref', 'dst_table': 'accounts', 'dst_col': 'acct_code'},
+            {'src_table': 'accounts', 'src_col': 'reg_ref', 'dst_table': 'regions', 'dst_col': 'reg_code'},
+            {'src_table': 'regions', 'src_col': 'back_card', 'dst_table': 'cards', 'dst_col': 'card_code'},  # cycle!
+        ]}
+        a, b = enrich(tr, te, {'cards': cards, 'accounts': accounts, 'regions': regions}, meta=meta)
+        self.assertIn('cards__card_tier', a.columns)
+        self.assertIn('accounts__credit_limit', a.columns)
+        self.assertIn('regions__gdp_idx', a.columns)
+        self.assertAlmostEqual(float(a['regions__gdp_idx'].iloc[0]), 1.5)
+        self.assertAlmostEqual(float(b['regions__gdp_idx'].iloc[0]), 2.5)
+        self.assertAlmostEqual(float(b['accounts__credit_limit'].iloc[1]), 100.0)
+
+    def test_flat_jsonb_postgres_array_and_multidelim_tags(self):
+        from ag_features import prepare
+        n = 60
+        tr = pd.DataFrame({
+            'id': range(n),
+            'meta_json': [f'{{"score": {i * 0.5}, "tier": "{"gold" if i % 2 == 0 else "silver"}", "vip": {str(i % 3 == 0).lower()}}}' for i in range(n)],
+            'user_tags': ['{tech}' if i % 3 == 0 else ('{tech,sports,music}' if i % 3 == 1 else '{food,travel}') for i in range(n)],
+            'ad_tags': ['tech;music' if i % 2 == 0 else 'sports;food' for i in range(n)],
+            'y': np.arange(n, dtype=float),
+        })
+        te = pd.DataFrame({
+            'id': range(n, n + 10),
+            'meta_json': ['{"score": 9.5, "tier": "gold", "vip": true, "secret_test_key": 999}'] * 10,
+            'user_tags': ['{tech,music}'] * 10,
+            'ad_tags': ['tech;sports'] * 10,
+        })
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        prep = prepare(tr, te, spec)
+        self.assertIn('meta_json__json__score', prep.X.columns)
+        self.assertIn('meta_json__json__tier', prep.X.columns)
+        self.assertIn('meta_json__json__vip', prep.X.columns)
+        self.assertNotIn('meta_json__json__secret_test_key', prep.X.columns)  # strictly train schema!
+        self.assertAlmostEqual(float(prep.Xt['meta_json__json__score'].iloc[0]), 9.5, places=4)
+        self.assertIn('user_tags__n_tags', prep.X.columns)
+        self.assertIn('user_tags__ov__ad_tags', prep.X.columns)
+        self.assertEqual(float(prep.Xt['user_tags__ov__ad_tags'].iloc[0]), 1.0)  # {'tech'}
+
+    def test_zero_gnn_ppmi_svd_train_only_no_test_leakage(self):
+        from ag_features import prepare
+        rng = np.random.default_rng(77)
+        # Two tight bipartite communities: U0..U19 <-> M0..M9 and U20..U39 <-> M10..M19
+        rows_tr = []
+        for _ in range(600):
+            comm = int(rng.integers(0, 2))
+            u = f'U{comm * 20 + int(rng.integers(0, 20))}'
+            m = f'M{comm * 10 + int(rng.integers(0, 10))}'
+            rows_tr.append((u, m, float(comm)))
+        tr = pd.DataFrame({'id': range(600), 'user_id': [r[0] for r in rows_tr],
+                           'merchant_id': [r[1] for r in rows_tr], 'y': [r[2] for r in rows_tr]})
+        te1 = pd.DataFrame({'id': range(600, 604), 'user_id': ['U0', 'U0', 'U_NEW', 'U25'],
+                            'merchant_id': ['M0', 'M15', 'M0', 'M15']})
+        te2 = pd.DataFrame({'id': range(600, 604), 'user_id': ['U0', 'U0', 'U_NEW', 'U999'],
+                            'merchant_id': ['M0', 'M15', 'M999', 'M999']})
+        spec = TaskSpec('', '', id_col='id', target='y', task_type='regression', metric='mae')
+        p1 = prepare(tr, te1, spec)
+        p2 = prepare(tr, te2, spec)
+        cos_col = next((c for c in p1.X.columns if c.startswith('gnn__') and c.endswith('__cos')), None)
+        self.assertIsNotNone(cos_col)
+        # Same-community pair (U0, M0) has much higher spectral cosine than cross-community pair (U0, M15)
+        self.assertGreater(float(p1.Xt[cos_col].iloc[0]), float(p1.Xt[cos_col].iloc[1]) + 0.3)
+        # Unseen node -> 0.0, and mutating other test rows NEVER changes train or earlier test rows!
+        self.assertEqual(float(p1.Xt[cos_col].iloc[2]), 0.0)
+        np.testing.assert_allclose(p1.X[cos_col].values, p2.X[cos_col].values, atol=0.0)
+        self.assertEqual(float(p1.Xt[cos_col].iloc[0]), float(p2.Xt[cos_col].iloc[0]))
+        # Temporal split MUST skip Zero-GNN completely (zero future-train graph leakage!)
+        tr_t = tr.copy()
+        tr_t['timestamp'] = pd.date_range('2025-01-01', periods=600, freq='1h')
+        te_t = te1.copy()
+        te_t['timestamp'] = pd.date_range('2025-02-01', periods=4, freq='1h')
+        pt = prepare(tr_t, te_t, spec)
+        self.assertFalse(any(c.startswith('gnn__') for c in pt.X.columns))
+
+    def test_per_group_stream_exact_nanosecond_lexsort_no_subsecond_tie_leak(self):
+        from ag_features import causal_stream_features
+        # Exact sub-second timestamps with ties (old rounded-second span_pad would leak or collapse sub-second gaps!)
+        base = pd.Timestamp('2025-05-01 00:00:00', tz='UTC')
+        stamps = [base + pd.Timedelta(minutes=5 * i) for i in range(520)]
+        # Inject exact millisecond sub-second events for D0 at test indices 10, 11, 12 (same second, 200ms apart!)
+        t_tie = base + pd.Timedelta(minutes=5 * 500)
+        stamps[490] = t_tie
+        stamps[491] = t_tie
+        stamps[492] = t_tie + pd.Timedelta(milliseconds=250)
+        df = pd.DataFrame({
+            'event_id': np.arange(520),
+            'timestamp': stamps,
+            'district_id': ['D0' if i in (490, 491, 492) else f'D{i % 4}' for i in range(520)],
+        })
+        tr = df.iloc[:480].copy(); tr['y'] = 1.0
+        te = df.iloc[480:].reset_index(drop=True)
+        _, s_clean = causal_stream_features(tr, te, exclude={'y', 'event_id'})
+        # Rows 10 and 11 (exact same timestamp t_tie) must have identical cnt_1h (strictly < t_tie, no tie leak!)
+        self.assertEqual(float(s_clean['stream_grp__district_id__cnt_1h'].iloc[10]),
+                         float(s_clean['stream_grp__district_id__cnt_1h'].iloc[11]))
+        # Row 12 (t_tie + 250ms) MUST see both row 10 and row 11 (+2 events!) and exact 250ms gap (>0!)
+        self.assertEqual(float(s_clean['stream_grp__district_id__cnt_1h'].iloc[12]),
+                         float(s_clean['stream_grp__district_id__cnt_1h'].iloc[10]) + 2.0)
+        self.assertGreater(float(s_clean['stream_grp__district_id__gap_h'].iloc[12]), 0.0)
+        self.assertLess(float(s_clean['stream_grp__district_id__gap_h'].iloc[12]), 1e-3)
+
+    def test_nowcast_v3_nonhourly_30m_resboost_zero_leak(self):
+        from ag_features import detect_time_split, prepare
+        from ag_nowcast import build_nowcast_features
+        rng = np.random.default_rng(123)
+        # 30-minute regular panel across 4 groups (steps_day=48); target tracks sensor value strongly
+        n_slots = 48 * 25
+        stamps = pd.date_range('2025-01-01 00:00:00', periods=n_slots, freq='30min')
+        common = np.cumsum(rng.normal(0, 0.2, n_slots)) * 0.1 + np.sin(2 * np.pi * np.arange(n_slots) / 48.0) * 5.0
+        rows = []
+        for g in range(4):
+            sig = (common if g < 2 else -common) + rng.normal(0, 0.4, n_slots)
+            flg = (sig > 3.5).astype(float)
+            rows.append(pd.DataFrame({'district_id': f'G{g}', 'timestamp': stamps.astype(str), 'val': sig, 'flg': flg}))
+        panel = pd.concat(rows, ignore_index=True)
+        ev_tr = pd.date_range('2025-01-10 00:10:00', periods=500, freq='35min')
+        ev_te = pd.date_range('2025-01-24 00:15:00', periods=40, freq='30min')
+        tr = pd.DataFrame({'event_id': range(500), 'district_id': [f'G{i%4}' for i in range(500)],
+                           'timestamp': ev_tr.astype(str), 'y': 10.0 + rng.normal(0, 1.0, 500)})
+        te = pd.DataFrame({'event_id': range(500, 540), 'district_id': [f'G{i%4}' for i in range(40)],
+                           'timestamp': ev_te.astype(str)})
+        meta1, meta2 = {}, {}
+        a1, b1 = enrich(tr, te, {'sens': panel}, meta=meta1)
+        # Correlate y strongly with completed sensor lag1 so Residual-Boost LGBM triggers too!
+        tr['y'] = (2.0 * a1['sens__val'].fillna(0.0).to_numpy() + rng.normal(0, 0.3, 500)).astype(float)
+        a1['y'] = tr['y'].values
+        # Poison panel strictly from test start onward
+        panel_p = panel.copy()
+        panel_p.loc[pd.to_datetime(panel_p['timestamp']) >= pd.Timestamp('2025-01-24 00:00:00'), 'val'] = 99999.0
+        a2, b2 = enrich(tr, te, {'sens': panel_p}, meta=meta2)
+        spec = TaskSpec('', '', id_col='event_id', target='y', task_type='regression', metric='mae')
+        p1, p2 = prepare(a1, b1, spec), prepare(a2, b2, spec)
+        tcol = detect_time_split(p1.X, p1.Xt, p1.cat_cols)
+        plan = make_plan(p1.X, p1.y, 'regression', time_col=tcol)
+        nc_tr1, nc_te1 = build_nowcast_features(meta1, p1.y, plan, 'regression', n_jobs=2, use_lgb_top=True, max_seconds=80.0)
+        nc_tr2, nc_te2 = build_nowcast_features(meta2, p2.y, plan, 'regression', n_jobs=2, use_lgb_top=True, max_seconds=80.0)
+        self.assertIsNotNone(nc_te1)
+        self.assertIn('nc__sens__val', nc_te1.columns)
+        self.assertIn('nc_gb__sens__val', nc_te1.columns)
+        # First test row (00:15 -> slot 00:00, uses ONLY <= 23:30) MUST be bit-exact identical despite 00:00+ poison!
+        np.testing.assert_allclose(nc_te1.iloc[0].to_numpy(float), nc_te2.iloc[0].to_numpy(float),
+                                   atol=1e-6, equal_nan=True)
+
 if __name__=='__main__': unittest.main()

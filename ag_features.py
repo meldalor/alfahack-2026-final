@@ -1,5 +1,6 @@
 """Подготовка признаков и библиотека преобразований, из которых строятся гипотезы."""
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -125,6 +126,283 @@ def _expand_datetime(name: str, a: pd.Series, b: pd.Series):
     return a_out, b_out
 
 
+def _unpack_flat_json(name: str, sa: pd.Series, sb: pd.Series, max_keys: int = 8):
+    """Unpack flat JSON/JSONB object strings using strictly train-observed scalar keys (>20% valid rows, <=8 keys)."""
+    sample = sa.dropna().str.strip().head(500)
+    if len(sample) < 10:
+        return None
+    looks_json = (sample.str.startswith("{") & sample.str.endswith("}") & sample.str.contains(":", regex=False)).mean()
+    if looks_json < 0.20:
+        return None
+    key_counts = {}
+    n_valid = 0
+    for raw in sample.tolist():
+        if not raw or raw[0] != "{" or raw[-1] != "}":
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        n_valid += 1
+        for k, v in obj.items():
+            if v is None or isinstance(v, (bool, int, float, str)):
+                ks = str(k)
+                key_counts[ks] = key_counts.get(ks, 0) + 1
+    if n_valid < max(5, int(0.20 * len(sample))) or not key_counts:
+        return None
+    min_cnt = max(2, int(0.10 * n_valid))
+    picked = sorted(((-cnt, k) for k, cnt in key_counts.items() if cnt >= min_cnt))[:max_keys]
+    keys = [k for _, k in picked]
+    if not keys:
+        return None
+
+    def _extract(series: pd.Series):
+        cols_out = {k: [None] * len(series) for k in keys}
+        nkeys = np.zeros(len(series), dtype=np.float32)
+        for i, val in enumerate(series.tolist()):
+            if val is None or val is pd.NA:
+                continue
+            sv = str(val).strip()
+            if not sv or sv[0] != "{" or sv[-1] != "}":
+                continue
+            try:
+                obj = json.loads(sv)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            nkeys[i] = float(len(obj))
+            for k in keys:
+                v = obj.get(k)
+                if isinstance(v, bool):
+                    cols_out[k][i] = 1.0 if v else 0.0
+                elif isinstance(v, (int, float, str)):
+                    cols_out[k][i] = v
+        return cols_out, nkeys
+
+    a_map, a_nk = _extract(sa)
+    b_map, b_nk = _extract(sb)
+    a_df, b_df = {f"{name}__json_nkeys": a_nk}, {f"{name}__json_nkeys": b_nk}
+    new_cats = []
+    for k in keys:
+        col_nm = f"{name}__json__{k}"
+        s_a = pd.Series(a_map[k], dtype=object)
+        s_b = pd.Series(b_map[k], dtype=object)
+        num_a, nn_a = _parse_dirty_numeric(s_a)
+        if nn_a > 0 and num_a.notna().sum() >= 0.90 * nn_a:
+            num_b, _ = _parse_dirty_numeric(s_b)
+            a_df[col_nm] = num_a.astype("float32").to_numpy()
+            b_df[col_nm] = num_b.astype("float32").to_numpy()
+        else:
+            st_a = s_a.astype("string")
+            nu = int(st_a.nunique(dropna=True))
+            if 2 <= nu <= 500:
+                a_df[col_nm] = st_a
+                b_df[col_nm] = s_b.astype("string")
+                new_cats.append(col_nm)
+    return pd.DataFrame(a_df), pd.DataFrame(b_df), new_cats
+
+
+def _add_spectral_graph_features(X: pd.DataFrame, Xt: pd.DataFrame, cat_cols: list):
+    """Zero-GNN 2-fold OOF Procrustes-aligned spectral bipartite embeddings (PPMI+SVD) strictly on train rows.
+    Activated only on non-temporal dense community graphs (avg_deg>=3, spectral gap>=1.85); zero self-edge bias."""
+    from scipy import sparse
+    from scipy.sparse.linalg import svds
+
+    n_tr, n_te = len(X), len(Xt)
+    if n_tr < 200 or n_tr > 200_000 or X.shape[1] >= 900:
+        return X, Xt
+    g_cols = []
+    seen_gc = set()
+    # Include both categorical entity columns and raw integer *_id columns (e.g. user_id, merchant_id)
+    cand_pool = list(cat_cols) + [
+        c for c in X.columns
+        if c not in cat_cols and str(c).lower().endswith("_id") and "__" not in str(c)
+        and pd.api.types.is_numeric_dtype(X[c])
+    ]
+    for c in cand_pool:
+        if c in seen_gc:
+            continue
+        cs = str(c)
+        if "__json__" in cs or ("__" in cs and not cs.lower().endswith("_id")):
+            continue
+        nu = int(X[c].nunique(dropna=True))
+        if 10 <= nu <= 50_000 and nu <= 0.85 * n_tr:
+            g_cols.append((c, nu))
+            seen_gc.add(c)
+    if len(g_cols) < 2:
+        return X, Xt
+    # Rank true many-to-many entity pairs (prefer *_id columns, exclude 1:1 functional lookups)
+    pairs = []
+    str_cache = {}
+
+    def _codes_tr(col):
+        if col not in str_cache:
+            s_tr = X[col].astype("string")
+            codes, uniq = pd.factorize(s_tr, sort=False)
+            str_cache[col] = (codes.astype(np.int64), uniq)
+        return str_cache[col]
+
+    for i in range(len(g_cols)):
+        c1, nu1 = g_cols[i]
+        id1 = str(c1).lower().endswith("_id")
+        ca, _ = _codes_tr(c1)
+        for j in range(i + 1, len(g_cols)):
+            c2, nu2 = g_cols[j]
+            id2 = str(c2).lower().endswith("_id")
+            if not (id1 or id2):
+                continue
+            cb, _ = _codes_tr(c2)
+            ok = (ca >= 0) & (cb >= 0)
+            if int(ok.sum()) < 200:
+                continue
+            nb = nu2 + 1
+            ekeys = ca[ok] * nb + cb[ok]
+            n_edges = int(len(np.unique(ekeys)))
+            max_n = max(nu1, nu2)
+            # Require genuine dense many-to-many bipartite graph (not 1:1 functional attribute)
+            if n_edges <= int(1.25 * max_n) or n_edges < 60:
+                continue
+            avg_deg = min(n_edges / max(nu1, 1), n_edges / max(nu2, 1))
+            if avg_deg < 3.0:
+                continue
+            score_p = (2 if (id1 and id2) else 1, float(min(nu1, nu2)) * min(avg_deg, 20.0))
+            pairs.append((score_p, c1, c2, nu1, nu2))
+    if not pairs:
+        return X, Xt
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    tr_add, te_add = {}, {}
+    svd_done = set()
+    deg_done = set()
+    rng = np.random.default_rng(42)
+    half_id = rng.integers(0, 2, size=n_tr)
+
+    def _fit_ppmi_svd(r_idx, c_idx, n1, n2, k, v0):
+        C = sparse.coo_matrix((np.ones(len(r_idx), dtype=np.float64), (r_idx, c_idx)), shape=(n1, n2)).tocsr()
+        C.sum_duplicates()
+        total = float(C.data.sum())
+        if total <= 0 or C.nnz < 20:
+            return None
+        deg1 = np.asarray(C.sum(axis=1)).ravel()
+        deg2 = np.asarray(C.sum(axis=0)).ravel()
+        udeg1 = np.diff(C.indptr).astype(np.float32)
+        udeg2 = np.diff(C.tocsc().indptr).astype(np.float32)
+        coo = C.tocoo()
+        pmi = np.log((coo.data * total) / ((deg1[coo.row] + 1.0) * (deg2[coo.col] + 1.0)))
+        pos = pmi > 0.0
+        if int(pos.sum()) < max(15, k + 2):
+            return None
+        M = sparse.csr_matrix((pmi[pos].astype(np.float32), (coo.row[pos], coo.col[pos])), shape=(n1, n2))
+        U, S, Vt = svds(M.astype(np.float64), k=k, v0=v0, maxiter=120, tol=1e-3)
+        ord_s = np.argsort(S)[::-1]
+        S = np.maximum(S[ord_s], 0.0)
+        sq = np.sqrt(S)
+        E1 = (U[:, ord_s] * sq[None, :]).astype(np.float32)
+        E2 = (Vt[ord_s, :].T * sq[None, :]).astype(np.float32)
+        E1n = E1 / np.maximum(np.linalg.norm(E1, axis=1, keepdims=True), 1e-6)
+        E2n = E2 / np.maximum(np.linalg.norm(E2, axis=1, keepdims=True), 1e-6)
+        return E1n, E2n, S, udeg1, udeg2, max(len(r_idx), 1)
+
+    def _procrustes_align(E_sub: np.ndarray, E_ref: np.ndarray, active: np.ndarray) -> np.ndarray:
+        if int(active.sum()) < E_ref.shape[1]:
+            return E_sub
+        Up, _, Vtp = np.linalg.svd((E_sub[active].T @ E_ref[active]).astype(np.float64))
+        Q = (Up @ Vtp).astype(np.float32)
+        return E_sub @ Q
+
+    for _, c1, c2, nu1, nu2 in pairs[:2]:
+        try:
+            ca_tr, ua = _codes_tr(c1)
+            cb_tr, ub = _codes_tr(c2)
+            n1, n2 = len(ua), len(ub)
+            k = min(6, min(n1, n2) - 2)
+            if min(n1, n2) < 6 or k < 3:
+                continue
+            ok_tr = (ca_tr >= 0) & (cb_tr >= 0)
+            v0 = rng.normal(size=min(n1, n2))
+            full_fit = _fit_ppmi_svd(ca_tr[ok_tr], cb_tr[ok_tr], n1, n2, k, v0)
+            if full_fit is None:
+                continue
+            E1n_full, E2n_full, S_full, udeg1_full, udeg2_full, n_fit_full = full_fit
+            # Spectral-gap community gate: skip random unstructured bipartite graphs (flat Marchenko-Pastur spectrum)
+            if (S_full[0] / max(float(S_full[-1]), 1e-6)) < 1.85:
+                continue
+
+            # 2-fold OOF scoring on train (eliminates self-edge memorization bias on cos and embeddings!)
+            tr_cos = np.zeros(n_tr, dtype=np.float32)
+            tr_deg1 = np.zeros(n_tr, dtype=np.float32)
+            tr_deg2 = np.zeros(n_tr, dtype=np.float32)
+            n_svd = min(3, k)
+            tr_e1 = np.zeros((n_tr, n_svd), dtype=np.float32)
+            tr_e2 = np.zeros((n_tr, n_svd), dtype=np.float32)
+            oof_ok = True
+            for fold_v in (0, 1):
+                fit_m = ok_tr & (half_id != fold_v)
+                val_m = half_id == fold_v
+                sub_fit = _fit_ppmi_svd(ca_tr[fit_m], cb_tr[fit_m], n1, n2, k, v0)
+                if sub_fit is None:
+                    oof_ok = False
+                    break
+                E1n_s, E2n_s, _, ud1_s, ud2_s, n_fit_s = sub_fit
+                E1n_al = _procrustes_align(E1n_s, E1n_full, ud1_s > 0)
+                E2n_al = _procrustes_align(E2n_s, E2n_full, ud2_s > 0)
+                va_idx = np.flatnonzero(val_m)
+                ia, ib = ca_tr[va_idx], cb_tr[va_idx]
+                ok_pair = (ia >= 0) & (ib >= 0)
+                if ok_pair.any():
+                    tr_cos[va_idx[ok_pair]] = np.sum(E1n_s[ia[ok_pair]] * E2n_s[ib[ok_pair]], axis=1)
+                ok1, ok2 = ia >= 0, ib >= 0
+                if ok1.any():
+                    tr_deg1[va_idx[ok1]] = np.log1p(ud1_s[ia[ok1]] / float(n_fit_s) * 1000.0)
+                    tr_e1[va_idx[ok1]] = E1n_al[ia[ok1], :n_svd]
+                if ok2.any():
+                    tr_deg2[va_idx[ok2]] = np.log1p(ud2_s[ib[ok2]] / float(n_fit_s) * 1000.0)
+                    tr_e2[va_idx[ok2]] = E2n_al[ib[ok2], :n_svd]
+            if not oof_ok:
+                continue
+
+            map_a = {v: i for i, v in enumerate(ua)}
+            map_b = {v: i for i, v in enumerate(ub)}
+            ca_te = Xt[c1].astype("string").map(map_a).fillna(-1).astype(np.int64).to_numpy()
+            cb_te = Xt[c2].astype("string").map(map_b).fillna(-1).astype(np.int64).to_numpy()
+            te_cos = np.zeros(n_te, dtype=np.float32)
+            ok_te = (ca_te >= 0) & (cb_te >= 0)
+            if ok_te.any():
+                te_cos[ok_te] = np.sum(E1n_full[ca_te[ok_te]] * E2n_full[cb_te[ok_te]], axis=1)
+            tr_add[f"gnn__{c1}__{c2}__cos"] = tr_cos
+            te_add[f"gnn__{c1}__{c2}__cos"] = te_cos
+
+            for col_nm, tr_deg_v, tr_e_v, ia_te, udeg_f, E_f in (
+                (c1, tr_deg1, tr_e1, ca_te, udeg1_full, E1n_full),
+                (c2, tr_deg2, tr_e2, cb_te, udeg2_full, E2n_full),
+            ):
+                if col_nm not in deg_done:
+                    tr_add[f"gnn__{col_nm}__deg"] = tr_deg_v
+                    te_add[f"gnn__{col_nm}__deg"] = np.where(
+                        ia_te >= 0, np.log1p(udeg_f[np.maximum(ia_te, 0)] / float(n_fit_full) * 1000.0), 0.0
+                    ).astype("float32")
+                    deg_done.add(col_nm)
+                if col_nm not in svd_done:
+                    for d_i in range(n_svd):
+                        tr_add[f"gnn__{col_nm}__svd{d_i}"] = tr_e_v[:, d_i]
+                        te_add[f"gnn__{col_nm}__svd{d_i}"] = np.where(
+                            ia_te >= 0, E_f[np.maximum(ia_te, 0), d_i], 0.0
+                        ).astype("float32")
+                    svd_done.add(col_nm)
+        except Exception:
+            log_exc(f"spectral_graph {c1}x{c2}")
+            continue
+
+    if tr_add:
+        log(f"Zero-GNN OOF PPMI+SVD (строго train): +{len(tr_add)} графовых признаков")
+        X = pd.concat([X, pd.DataFrame(tr_add, index=X.index)], axis=1)
+        Xt = pd.concat([Xt, pd.DataFrame(te_add, index=Xt.index)], axis=1)
+    return X, Xt
+
+
 def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
     if spec.task_type == "regression":
         y_num, _ = _parse_dirty_numeric(train[spec.target])
@@ -149,6 +427,7 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
     X_parts, T_parts = [], []
     cat_cols, text_cols, raw_text, dropped = [], [], {}, []
     date_origins = {}
+    json_unpacked = 0
     cat_hint = set(spec.cat_hint or [])
     for c in feats:
         a, b = train[c], test[c]
@@ -203,6 +482,15 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 X_parts.append(xa)
                 T_parts.append(xb)
                 continue
+            if json_unpacked < 4:
+                j_res = _unpack_flat_json(name, sa, sb)
+                if j_res is not None:
+                    ja, jb, j_cats = j_res
+                    X_parts.append(ja)
+                    T_parts.append(jb)
+                    cat_cols.extend(j_cats)
+                    json_unpacked += 1
+                    continue
             lens = sa.dropna().str.len()
             words = sa.dropna().str.count(r"\s+") + 1
             is_text = len(lens) and words.mean() >= 3 and lens.mean() >= 15 and (
@@ -246,21 +534,41 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
                 X[dname] = ((X[main_ord].astype("float64") - X[oc].astype("float64")) + shift_days).astype("float32")
                 Xt[dname] = ((Xt[main_ord].astype("float64") - Xt[oc].astype("float64")) + shift_days).astype("float32")
 
-    # Кросс-табличный матчинг многозначных тег-колонок (списки через запятую): число тегов, пересечение и Жаккар
+    # Кросс-табличный матчинг многозначных тег-колонок (запятые, ';', '|', Postgres-массивы '{a,b}'): число тегов, пересечение и Жаккар
+    def _split_tag_tokens(val, delim: str):
+        sv = str(val).strip()
+        if len(sv) >= 2 and ((sv[0] == "{" and sv[-1] == "}") or (sv[0] == "[" and sv[-1] == "]")):
+            sv = sv[1:-1]
+        return [t.strip().strip("\"'").lower() for t in sv.split(delim) if t.strip().strip("\"'")]
+
     tag_vocab = {}
+    tag_delim = {}
     for c in cat_cols:
         sample_s = X[c].dropna().astype(str).head(2000)
-        if len(sample_s) < 20 or (sample_s.str.contains(",", regex=False)).mean() < 0.15:
+        if len(sample_s) < 20:
             continue
-        tok_lists = [[t.strip().lower() for t in s.split(",") if t.strip()] for s in sample_s]
+        is_pg_arr = (sample_s.str.strip().str.startswith("{") & sample_s.str.strip().str.endswith("}")).mean() >= 0.50
+        best_d, best_rate = None, 0.0
+        for d in (",", ";", "|"):
+            rate = float(sample_s.str.contains(d, regex=False).mean())
+            if rate > best_rate:
+                best_rate, best_d = rate, d
+        if best_d is None or (best_rate < 0.15 and not is_pg_arr):
+            if is_pg_arr:
+                best_d = ","
+            else:
+                continue
+        tok_lists = [_split_tag_tokens(s, best_d) for s in sample_s]
         avg_len = float(np.mean([len(tl) for tl in tok_lists]))
         vocab = {t for tl in tok_lists for t in tl}
         if 1.1 <= avg_len <= 10.0 and 3 <= len(vocab) <= 200:
             tag_vocab[c] = vocab
+            tag_delim[c] = best_d
             for df_t in (X, Xt):
                 s = df_t[c].astype("string")
-                cnt = s.str.count(",").astype("float32") + 1.0
-                cnt = cnt.where(s.notna() & (s.str.strip() != ""), 0.0)
+                stripped = s.str.strip().str.replace(r"^[\{\[]|[\}\]]$", "", regex=True).str.strip()
+                cnt = stripped.str.count(re.escape(best_d)).astype("float32") + 1.0
+                cnt = cnt.where(s.notna() & (stripped != ""), 0.0)
                 df_t[f"{c}__n_tags"] = cnt.astype("float32")
     tag_cols = list(tag_vocab)
     for i, c1 in enumerate(tag_cols):
@@ -269,11 +577,13 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
             if len(v1 & v2) < max(2, int(0.3 * min(len(v1), len(v2)))):
                 continue
 
+            d1, d2 = tag_delim[c1], tag_delim[c2]
+
             def _tag_pair(sa: pd.Series, sb: pd.Series):
                 ca, ua = pd.factorize(sa.astype("string"), sort=False)
                 cb, ub = pd.factorize(sb.astype("string"), sort=False)
-                sets_a = [frozenset(t.strip().lower() for t in str(u).split(",") if t.strip()) for u in ua]
-                sets_b = [frozenset(t.strip().lower() for t in str(u).split(",") if t.strip()) for u in ub]
+                sets_a = [frozenset(_split_tag_tokens(u, d1)) for u in ua]
+                sets_b = [frozenset(_split_tag_tokens(u, d2)) for u in ub]
                 n_row = len(sa)
                 ov = np.full(n_row, np.nan, dtype=np.float32)
                 jac = np.full(n_row, np.nan, dtype=np.float32)
@@ -352,6 +662,10 @@ def prepare(train: pd.DataFrame, test: pd.DataFrame, spec) -> Prepared:
         if eq_tr_dict:
             X = pd.concat([X, pd.DataFrame(eq_tr_dict, index=X.index)], axis=1)
             Xt = pd.concat([Xt, pd.DataFrame(eq_te_dict, index=Xt.index)], axis=1)
+
+    # Zero-GNN OOF спектральные графовые эмбеддинги (строго на non-temporal сплитах: нулевая временная утечка/сдвиг)
+    if detect_time_split(X, Xt, cat_cols) is None:
+        X, Xt = _add_spectral_graph_features(X, Xt, cat_cols)
 
     # категориальные: частоты/ранги высокой кардинальности строго по train (без утечки частот из test)
     final_cats = []
@@ -566,7 +880,7 @@ _DERIVED_SFX = ("__year", "__month", "__day", "__dow", "__doy", "__hour", "__min
                 "__sys_mean", "__sys_max", "__sys_dev", "__n_tags",
                 "__hist_nunique_1d", "__hist_nunique_7d", "__hist_nunique_30d",
                 "__hist_cnt_1h", "__hist_cnt_6h", "__hist_burst_1h_1d")
-_DERIVED_PFX = ("stream__", "stream_grp__", "nc__", "nc_d1__", "nc_prof__", "nc_gb__", "nc_gbd__")
+_DERIVED_PFX = ("stream__", "stream_grp__", "nc__", "nc_d1__", "nc_prof__", "nc_gb__", "nc_gbd__", "nc_interp__", "gnn__")
 
 
 def entity_lag_cols(X, y, key_cols, t_train, exclude=(), max_cols: int = 4, min_corr: float = 0.15):
@@ -1099,7 +1413,7 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
             out[f"stream__{c}_{tag}_cur_hr"] = _scatter(csum[j_end] - csum[j_hr])
             out[f"stream__{c}_{tag}_60m"] = _scatter(csum[j_end] - csum[j_60])
 
-    # Strictly-past per-group event intensity (< t) for up to 3 raw entity/high-card columns (avoid duplicating cat_cands)
+    # Strictly-past per-group event intensity (< t, exact int64 nanosecond lexsort: zero tie/precision leakage!)
     cat_set_done = set(cat_cands)
     grp_cands = []
     for c in raw_cols:
@@ -1111,45 +1425,69 @@ def causal_stream_features(train: pd.DataFrame, test: pd.DataFrame, exclude=()) 
             continue
         nu = int(train[c].nunique(dropna=True))
         if (is_id and 2 <= nu <= 50_000) or (not is_id and 9 <= nu <= 50_000):
-            grp_cands.append((1 if is_id else 0, -abs(np.log1p(nu) - np.log1p(50.0)), c))
+            grp_cands.append((1 if is_id else 0, -abs(np.log1p(nu) - np.log1p(50.0)), c, nu))
     grp_cands.sort(reverse=True)
-    ts_rel_v = np.round((ts_v.values.astype("int64") - ts_ns[0]) / 1e9).astype(np.int64)
-    span_pad = int(ts_rel_v.max()) + 2 * 86400 * 7 + 10_000 if len(ts_rel_v) else 1_000_000
-    hr_rel_v = np.round((ts_v.dt.floor("h").values.astype("int64") - ts_ns[0]) / 1e9).astype(np.int64)
-    for _, _, gc in grp_cands[:3]:
+    NS_SEC = 1_000_000_000
+    ts_ns_v = ts_v.values.astype("int64")
+    hr_ns_v = ts_v.dt.floor("h").values.astype("int64")
+    w1h = 3600 * NS_SEC
+    w24 = 86400 * NS_SEC
+    w7d = 7 * 86400 * NS_SEC
+
+    for _, _, gc, _ in grp_cands[:3]:
         if int(train[gc].notna().sum()) < 50:
             continue
         g_vals = comb[gc].iloc[v_idx].astype("string")
         codes_v, _ = pd.factorize(g_vals, sort=False)
         codes_v = codes_v.astype(np.int64)
-        ok_g = codes_v >= 0
-        g_idx = np.flatnonzero(ok_g)
-        keys = (codes_v[g_idx] + 1) * span_pad + ts_rel_v[g_idx]
-        g_ord = np.argsort(keys, kind="mergesort")
-        ks = keys[g_ord]
-        g_pos = v_idx[g_idx[g_ord]]
-        gj_cur = np.searchsorted(ks, ks, side="left")
-        gj_1h = np.searchsorted(ks, ks - 3600, side="left")
-        gj_24h = np.searchsorted(ks, ks - 86400, side="left")
-        gj_7d = np.searchsorted(ks, ks - 7 * 86400, side="left")
-        g_base = (codes_v[g_idx[g_ord]] + 1) * span_pad
-        gh_key = g_base + hr_rel_v[g_idx[g_ord]]
-        gj_h0 = np.searchsorted(ks, gh_key, side="left")
-        g_start = np.searchsorted(ks, g_base, side="left")
-        g_gap = np.full(len(ks), np.nan, dtype=np.float32)
-        has_gp = gj_cur > g_start
-        g_gap[has_gp] = (ks[has_gp] - ks[gj_cur[has_gp] - 1]) / 3600.0
+        g_idx = np.flatnonzero(codes_v >= 0)
+        if len(g_idx) == 0:
+            continue
+        # Exact int64 nanosecond lexsort per group (zero rounding, zero span_pad overflow)
+        g_ord = np.lexsort((ts_ns_v[g_idx], codes_v[g_idx]))
+        sel = g_idx[g_ord]
+        gs_c = codes_v[sel]
+        gs_t = ts_ns_v[sel]
+        gs_hr = hr_ns_v[sel]
+        g_pos = v_idx[sel]
+        n_gs = len(sel)
+
+        _, g_starts = np.unique(gs_c, return_index=True)
+        g_ends = np.r_[g_starts[1:], n_gs]
+
+        cnt_1h = np.zeros(n_gs, dtype=np.float32)
+        cnt_h0 = np.zeros(n_gs, dtype=np.float32)
+        cnt_24h = np.zeros(n_gs, dtype=np.float32)
+        cnt_7d = np.zeros(n_gs, dtype=np.float32)
+        g_gap_h = np.full(n_gs, np.nan, dtype=np.float32)
+
+        for s, e in zip(g_starts.tolist(), g_ends.tolist()):
+            gt = gs_t[s:e]
+            gh = gs_hr[s:e]
+            # STRICTLY < t to the exact nanosecond (excludes both future rows and simultaneous ties!)
+            jc = np.searchsorted(gt, gt, side="left")
+            j1h = np.searchsorted(gt, gt - w1h, side="left")
+            j24 = np.searchsorted(gt, gt - w24, side="left")
+            j7d = np.searchsorted(gt, gt - w7d, side="left")
+            jh0 = np.searchsorted(gt, gh, side="left")
+            cnt_1h[s:e] = (jc - j1h).astype(np.float32)
+            cnt_h0[s:e] = (jc - jh0).astype(np.float32)
+            cnt_24h[s:e] = (jc - j24).astype(np.float32)
+            cnt_7d[s:e] = (jc - j7d).astype(np.float32)
+            has_p = jc > 0
+            if has_p.any():
+                g_gap_h[s:e][has_p] = ((gt[has_p] - gt[jc[has_p] - 1]) / (3600.0 * NS_SEC)).astype(np.float32)
 
         def _scatter_g(arr_gs):
             arr = np.full(n_tot, np.nan, dtype="float32")
             arr[g_pos] = arr_gs.astype("float32")
             return arr
 
-        out[f"stream_grp__{gc}__cnt_1h"] = _scatter_g(gj_cur - gj_1h)
-        out[f"stream_grp__{gc}__cnt_since_h"] = _scatter_g(gj_cur - gj_h0)
-        out[f"stream_grp__{gc}__cnt_24h"] = _scatter_g(gj_cur - gj_24h)
-        out[f"stream_grp__{gc}__cnt_7d"] = _scatter_g(gj_cur - gj_7d)
-        out[f"stream_grp__{gc}__gap_h"] = _scatter_g(g_gap)
+        out[f"stream_grp__{gc}__cnt_1h"] = _scatter_g(cnt_1h)
+        out[f"stream_grp__{gc}__cnt_since_h"] = _scatter_g(cnt_h0)
+        out[f"stream_grp__{gc}__cnt_24h"] = _scatter_g(cnt_24h)
+        out[f"stream_grp__{gc}__cnt_7d"] = _scatter_g(cnt_7d)
+        out[f"stream_grp__{gc}__gap_h"] = _scatter_g(g_gap_h)
 
     df = pd.DataFrame(out)
     log(f"строго причинный поток событий ({tc}, строго < t): +{df.shape[1]} признаков")

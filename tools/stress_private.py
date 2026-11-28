@@ -257,9 +257,90 @@ def run_case(args,name,metric):
     res['status']='FAIL' if res['issues'] else 'PASS'; dump(d/'result.json',res); print(json.dumps(res,ensure_ascii=False),flush=True); return res
 
 
+HIGHER_IS_BETTER = {'PR-AUC', 'ROC-AUC', 'F1-macro'}
+# Constant/naive baselines for platform-style 0..100 standalone index:
+# S = 100 * max(0, (M - B)/(1 - B)) for higher-is-better, 100 * max(0, 1 - M/B) for lower-is-better.
+NAIVE_REF = {
+    ('fraud', 'PR-AUC'): 0.15, ('fraud', 'ROC-AUC'): 0.50,
+    ('multiclass', 'LogLoss'): 2.4849, ('multiclass', 'F1-macro'): 1.0 / 12.0,
+    ('regression', 'RMSLE'): 1.65, ('regression', 'MAPE'): 1.8e9,
+    ('text', 'PR-AUC'): 0.35, ('large', 'MAE'): 3.70,
+    ('snowflake_jsonb', 'MAE'): 5.50, ('graph_comm', 'PR-AUC'): 0.18, ('panel_30m', 'MAE'): 6.50,
+}
+
+
+def _norm_score(metric, val, ref, clip_zero=True):
+    if val is None or ref is None or not (np.isfinite(val) and np.isfinite(ref)):
+        return None
+    if metric in HIGHER_IS_BETTER:
+        s = 100.0 * (val - ref) / max(1.0 - ref, 1e-9)
+    else:
+        s = 100.0 * (1.0 - val / max(abs(ref), 1e-9))
+    return float(max(0.0, s)) if clip_zero else float(s)
+
+
+def build_scorecard(results, baseline_results=None):
+    base_map = {}
+    if baseline_results:
+        for r in baseline_results:
+            sc = (r.get('scores') or {}).get(r.get('metric'))
+            if sc is not None:
+                base_map[(r['scenario'], r['metric'])] = float(sc)
+    rows, scores_100, deltas = [], [], []
+    passed = 0
+    for r in results:
+        key = (r['scenario'], r['metric'])
+        ok = r.get('status') == 'PASS'
+        if ok:
+            passed += 1
+        val = (r.get('scores') or {}).get(r['metric'])
+        s100 = _norm_score(r['metric'], val, NAIVE_REF.get(key), clip_zero=True) if ok else 0.0
+        if s100 is not None:
+            scores_100.append(s100)
+        b_val = base_map.get(key)
+        d_pct = _norm_score(r['metric'], val, b_val, clip_zero=False) if (ok and b_val is not None) else None
+        if d_pct is not None:
+            deltas.append(d_pct)
+        rows.append({'scenario': r['scenario'], 'metric': r['metric'], 'status': r.get('status', 'FAIL'),
+                     'value': val, 'score_100': round(s100, 2) if s100 is not None else None,
+                     'baseline': b_val, 'delta_pct': round(d_pct, 2) if d_pct is not None else None,
+                     'seconds': r.get('seconds'), 'peak_rss_gib': r.get('peak_rss_gib')})
+    gate_ok = bool(results) and passed == len(results)
+    sc = {
+        'gate': 'PASS' if gate_ok else 'BLOCKED',
+        'passed': passed, 'total': len(results),
+        'composite_score': round(float(np.mean(scores_100)), 2) if (gate_ok and scores_100) else 0.0,
+        'raw_mean_score': round(float(np.mean(scores_100)), 2) if scores_100 else 0.0,
+        'worst_case_score': round(float(np.min(scores_100)), 2) if scores_100 else 0.0,
+        'mean_delta_pct': round(float(np.mean(deltas)), 2) if deltas else None,
+        'worst_delta_pct': round(float(np.min(deltas)), 2) if deltas else None,
+        'no_regression': (min(deltas) > -1.0) if deltas else None,
+        'rows': rows,
+    }
+    return sc
+
+
+def print_scorecard(sc):
+    print('\n=== RELEASE SCORECARD (platform-normalized 0..100) ===')
+    for row in sc['rows']:
+        v_str = f"{row['value']:.4g}" if row['value'] is not None else 'N/A'
+        s_str = f"{row['score_100']:6.2f}" if row['score_100'] is not None else '   N/A'
+        d_str = f" | d={row['delta_pct']:+6.2f}%" if row['delta_pct'] is not None else ''
+        print(f"  [{row['status']:4s}] {row['scenario']:16s} {row['metric']:8s} = {v_str:>10s} | S={s_str}/100{d_str}")
+    d_sum = ''
+    if sc['mean_delta_pct'] is not None:
+        d_sum = f" | Private-Proxy d={sc['mean_delta_pct']:+.2f}% | Worst d={sc['worst_delta_pct']:+.2f}% | NoReg={sc['no_regression']}"
+    print(f"GATE={sc['gate']} ({sc['passed']}/{sc['total']}) | Composite={sc['composite_score']:.2f}/100 | Worst={sc['worst_case_score']:.2f}/100{d_sum}", flush=True)
+
+
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,default=ROOT/'runs/private'); p.add_argument('--budget',type=float,default=90); p.add_argument('--grace',type=float,default=90,help='external timeout margin after budget'); p.add_argument('--hard-limit',type=float,help='agent watchdog seconds (default budget+20)'); p.add_argument('--threads',type=int,default=4); p.add_argument('--rows',type=int,default=4000); p.add_argument('--large-rows',type=int,default=2_000_000); p.add_argument('--seed',type=int,default=42); p.add_argument('--scenario',choices=CASES); p.add_argument('--metric'); p.add_argument('--primary-only',action='store_true'); p.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
-    a=p.parse_args(); a.out=a.out.resolve()
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('--out',type=Path,default=ROOT/'runs/private'); p.add_argument('--budget',type=float,default=90); p.add_argument('--grace',type=float,default=90,help='external timeout margin after budget'); p.add_argument('--hard-limit',type=float,help='agent watchdog seconds (default budget+20)'); p.add_argument('--threads',type=int,default=4); p.add_argument('--rows',type=int,default=4000); p.add_argument('--large-rows',type=int,default=2_000_000); p.add_argument('--seed',type=int,default=42); p.add_argument('--scenario',choices=CASES); p.add_argument('--metric'); p.add_argument('--primary-only',action='store_true'); p.add_argument('--baseline',type=Path,help='baseline summary.json for delta scorecard'); p.add_argument('--scorecard',type=Path,help='compute and print Release Scorecard from an existing summary.json'); p.add_argument('--worker',action='store_true',help=argparse.SUPPRESS)
+    a=p.parse_args()
+    if a.scorecard:
+        res = json.loads(a.scorecard.read_text(encoding='utf-8'))
+        base = json.loads(a.baseline.read_text(encoding='utf-8')) if a.baseline and a.baseline.exists() else None
+        sc = build_scorecard(res, base); print_scorecard(sc); sys.exit(0 if sc['gate']=='PASS' else 1)
+    a.out=a.out.resolve()
     if min(a.rows,a.large_rows)<500 or a.budget<=0 or a.threads<1 or a.grace<21: p.error('invalid resource limits')
     if a.hard_limit is not None and not a.budget<a.hard_limit<a.budget+a.grace: p.error('hard limit must lie between budget and external deadline')
     if a.metric and (not a.scenario or a.metric not in CASES[a.scenario]): p.error('metric requires matching scenario')
@@ -268,6 +349,8 @@ def main():
     for name in ([a.scenario] if a.scenario else CASES):
         for metric in ([a.metric] if a.metric else CASES[name][:1] if a.primary_only else CASES[name]):
             results.append(run_case(a,name,metric)); dump(a.out/'summary.json',results)
+    base = json.loads(a.baseline.read_text(encoding='utf-8')) if a.baseline and a.baseline.exists() else None
+    sc = build_scorecard(results, base); dump(a.out/'scorecard.json', sc); print_scorecard(sc)
     sys.exit(int(any(r['status']!='PASS' for r in results)))
 
 if __name__=='__main__': main()
